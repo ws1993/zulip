@@ -7,10 +7,10 @@ from django.contrib.staticfiles.views import serve as staticfiles_serve
 from django.http.request import HttpRequest
 from django.http.response import FileResponse
 from django.urls import path
-from django.views.generic import TemplateView
+from django.views.generic import RedirectView, TemplateView
 from django.views.static import serve
 
-from zerver.views.auth import config_error, login_page
+from zerver.views.auth import login_page
 from zerver.views.development.cache import remove_caches
 from zerver.views.development.camo import handle_camo_url
 from zerver.views.development.dev_login import (
@@ -31,6 +31,8 @@ from zerver.views.development.registration import (
     register_development_realm,
     register_development_user,
 )
+from zerver.views.development.showroom import showroom_component_banners, showroom_component_buttons
+from zerver.views.errors import config_error
 
 # These URLs are available only in the development environment
 
@@ -51,6 +53,7 @@ urls = [
             "show_indexes": True,
         },
     ),
+    path("docs/", RedirectView.as_view(url="/docs/index.html")),
     path(
         "docs/<path:path>",
         serve,
@@ -90,12 +93,14 @@ urls = [
         "devtools/integrations/send_all_webhook_fixture_messages", send_all_webhook_fixture_messages
     ),
     path("devtools/integrations/<integration_name>/fixtures", get_fixtures),
-    path("config-error/<error_category_name>", config_error, name="config_error"),
-    path("config-error/remoteuser/<error_category_name>", config_error),
+    path("config-error/<error_name>", config_error, name="config_error"),
     # Special endpoint to remove all the server-side caches.
     path("flush_caches", remove_caches),
     # Redirect camo URLs for development
     path("external_content/<digest>/<received_url>", handle_camo_url),
+    # Endpoints for Showroom components.
+    path("devtools/buttons/", showroom_component_buttons),
+    path("devtools/banners/", showroom_component_banners),
 ]
 
 v1_api_mobile_patterns = [
@@ -109,13 +114,14 @@ if use_prod_static:
     urls += [
         path("static/<path:path>", serve, {"document_root": settings.STATIC_ROOT}),
     ]
-else:
+else:  # nocoverage
 
     def serve_static(request: HttpRequest, path: str) -> FileResponse:
         response = staticfiles_serve(request, path)
         response["Access-Control-Allow-Origin"] = "*"
         return response
 
+    assert settings.STATIC_URL is not None
     urls += static(urlsplit(settings.STATIC_URL).path, view=serve_static)
 
 i18n_urls = [
@@ -123,12 +129,3 @@ i18n_urls = [
     path("confirmation_key/", confirmation_key),
 ]
 urls += i18n_urls
-
-# On a production instance, these files would be served by nginx.
-if settings.LOCAL_UPLOADS_DIR is not None:
-    avatars_url = path(
-        "user_avatars/<path:path>",
-        serve,
-        {"document_root": os.path.join(settings.LOCAL_UPLOADS_DIR, "avatars")},
-    )
-    urls += [avatars_url]

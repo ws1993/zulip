@@ -3,14 +3,14 @@
 Use informal Spanish for translation:
 
 - Informal "you" (_tú_) instead of formal form _usted_. Many top software
-  companies (e.g. Google) use the informal one, because it's much more common in
+  companies (e.g., Google) use the informal one, because it's much more common in
   the daily language and avoids making translations look like they were written
   by machines.
 
-- Imperative, active, and continuous verbs, e.g. _manage streams_ -
+- Imperative, active, and continuous verbs, e.g., _manage streams_ -
   _gestionar canales_, not _gestión de canales_.
 
-- Not using reflexive _se_ e.g. _log out_ should be _salir_, not _salirse_,
+- Not using reflexive _se_ e.g., _log out_ should be _salir_, not _salirse_,
   whenever the infinitive form is possible without making the translation
   awkward.
 
@@ -20,7 +20,7 @@ Use informal Spanish for translation:
 
 - Balance common verbs and nouns with specific IT-related translations
   of English terms - this can be tricky, try to check how other
-  resources were translated (e.g. Gmail, Microsoft websites, Facebook)
+  resources were translated (e.g., Gmail, Microsoft websites, Facebook)
   to decide what wouldn't sound awkward / rude in Spanish.
 
 - Latest RAE rule ("solo" should
@@ -34,11 +34,10 @@ Zulip friendly and usable.
 ## Términos
 
 - Message - **Mensaje**
-- Private message (PM) - **Mensaje privado (MP)**
-- Group PM - **mensaje privado grupal**: even though "MP grupal" is the most
-  precise translation, preferably don't use that one. Many users may not
-  associate "MP" with _private message_ in a group context. Better use it
-  without abbreviations.
+- Direct message (DM) - **Mensaje directo (MD)**
+- Group DM - **Mensaje directo grupal**: many users may not associate "MD" with
+  _direct message_ in a group context, so it's better to use the unabbreviated
+  form rather than "MD grupal".
 - Stream - **Canal**: the use of the literal Spanish word for stream
   "Flujo" is very confusing and not the correct metaphor for Spanish
   speaking people. The correct term would be "canal" (_channel_).
@@ -65,8 +64,11 @@ Zulip friendly and usable.
 ## Frases
 
 - Subscribe/Unsubscribe to a stream - **Suscribir a/Desuscribir de un canal**
-- Narrow to - **Filtrar solo**: this is _filter only_, because there's no other
-  word that's common enough in Spanish for _to narrow_ except for "filtrar".
+- Narrow to - **Buscar solo**: this translates to _search only_. We use this
+  term because there's no other word that's common enough in Spanish for
+  _to narrow_ except for "filtrar", but this word can be incorrectly
+  interpreted as _filter out_. We should stick to a term that we can use
+  unambiguously and consistently for all instances of _Narrow to_.
 - Mute/Unmute - **Silenciar/No silenciar**
 - Deactivate/Reactivate - **Desactivar/Reactivar**
 - Search - **Buscar**

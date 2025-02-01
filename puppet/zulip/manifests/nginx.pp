@@ -4,16 +4,16 @@ class zulip::nginx {
     $zulip::common::nginx,
     'ca-certificates',
   ]
-  package { $web_packages: ensure => 'installed' }
+  package { $web_packages: ensure => installed }
 
-  if $::osfamily == 'redhat' {
+  if $facts['os']['family'] == 'RedHat' {
     file { '/etc/nginx/sites-available':
-      ensure => 'directory',
+      ensure => directory,
       owner  => 'root',
       group  => 'root',
     }
     file { '/etc/nginx/sites-enabled':
-      ensure => 'directory',
+      ensure => directory,
       owner  => 'root',
       group  => 'root',
     }
@@ -29,47 +29,6 @@ class zulip::nginx {
     notify  => Service['nginx'],
   }
 
-  # Configuration for how uploaded files and profile pictures are
-  # served.  The default is to serve uploads using using the `nginx`
-  # `internal` feature via django-sendfile2, which basically does an
-  # internal redirect and returns the file content from nginx in an
-  # HttpResponse that would otherwise have been a redirect.  Profile
-  # pictures are served directly off disk.
-  #
-  # For installations using S3 to serve uploaded files, we want Django
-  # to handle the /serve_uploads and /user_avatars routes, so that it
-  # can serve a redirect (after doing authentication, for uploads).
-  $no_serve_uploads = zulipconf('application_server', 'no_serve_uploads', '')
-  if $no_serve_uploads == '' {
-    file { '/etc/nginx/zulip-include/app.d/uploads-internal.conf':
-      ensure  => file,
-      require => Package[$zulip::common::nginx],
-      owner   => 'root',
-      group   => 'root',
-      mode    => '0644',
-      notify  => Service['nginx'],
-      source  => 'puppet:///modules/zulip/nginx/zulip-include-maybe/uploads-internal.conf',
-    }
-  } else {
-    file { '/etc/nginx/zulip-include/app.d/uploads-internal.conf':
-      ensure  => absent,
-    }
-  }
-
-  # TODO/compatibility: Removed 2021-04 in Zulip 4.0; these lines can
-  # be removed once one must have upgraded through Zulip 4.0 or higher
-  # to get to the next release.
-  file { '/etc/nginx/zulip-include/uploads.route':
-    ensure  => absent,
-  }
-
-  # TODO/compatibility: Removed 2021-05 in Zulip 4.0; these lines can
-  # be removed once one must have upgraded through Zulip 4.0 or higher
-  # to get to the next release.
-  file { '/etc/nginx/zulip-include/app.d/thumbor.conf':
-    ensure  => absent,
-  }
-
   file { '/etc/nginx/dhparam.pem':
     ensure  => file,
     require => Package[$zulip::common::nginx],
@@ -80,11 +39,12 @@ class zulip::nginx {
     source  => 'puppet:///modules/zulip/nginx/dhparam.pem',
   }
 
-  if $::osfamily == 'debian' {
+  if $facts['os']['family'] == 'Debian' {
       $ca_crt = '/etc/ssl/certs/ca-certificates.crt'
   } else {
       $ca_crt = '/etc/pki/tls/certs/ca-bundle.crt'
   }
+  $worker_connections = zulipconf('application_server', 'nginx_worker_connections', 10000)
   file { '/etc/nginx/nginx.conf':
     ensure  => file,
     require => Package[$zulip::common::nginx, 'ca-certificates'],
@@ -93,6 +53,18 @@ class zulip::nginx {
     mode    => '0644',
     notify  => Service['nginx'],
     content => template('zulip/nginx.conf.template.erb'),
+  }
+
+  $loadbalancers = split(zulipconf('loadbalancer', 'ips', ''), ',')
+  $lb_rejects_http_requests = zulipconf('loadbalancer', 'rejects_http_requests', false)
+  file { '/etc/nginx/zulip-include/trusted-proto':
+    ensure  => file,
+    require => Package[$zulip::common::nginx],
+    owner   => 'root',
+    group   => 'root',
+    mode    => '0644',
+    notify  => Service['nginx'],
+    content => template('zulip/nginx/trusted-proto.template.erb'),
   }
 
   file { '/etc/nginx/uwsgi_params':
@@ -111,30 +83,31 @@ class zulip::nginx {
   }
 
   file { '/var/log/nginx':
-    ensure => 'directory',
+    ensure => directory,
     owner  => 'zulip',
     group  => 'adm',
-    mode   => '0650',
+    mode   => '0750',
   }
+  $access_log_retention_days = zulipconf('application_server','access_log_retention_days', 14)
   file { '/etc/logrotate.d/nginx':
     ensure  => file,
     require => Package[$zulip::common::nginx],
     owner   => 'root',
     group   => 'root',
     mode    => '0644',
-    source  => 'puppet:///modules/zulip/logrotate/nginx',
+    content => template('zulip/logrotate/nginx.template.erb'),
   }
   package { 'certbot':
-    ensure => 'installed',
+    ensure => installed,
   }
   file { ['/var/lib/zulip', '/var/lib/zulip/certbot-webroot']:
-    ensure => 'directory',
+    ensure => directory,
     owner  => 'zulip',
     group  => 'adm',
-    mode   => '0660',
+    mode   => '0770',
   }
 
   service { 'nginx':
-    ensure     => running,
+    ensure => running,
   }
 }

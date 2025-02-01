@@ -1,13 +1,17 @@
 import time
-from typing import List
 from unittest.mock import patch
 
 from bs4 import BeautifulSoup
+from django.http import HttpResponse
 
 from zerver.lib.realm_icon import get_realm_icon_url
+from zerver.lib.request import RequestNotes
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.middleware import is_slow_query, write_log_line
-from zerver.models import get_realm
+from zerver.lib.test_helpers import HostRequestMock
+from zerver.lib.utils import assert_is_not_none
+from zerver.middleware import LogRequests, is_slow_query, write_log_line
+from zerver.models.realms import get_realm
+from zilencer.models import RemoteZulipServer
 
 
 class SlowQueryTest(ZulipTestCase):
@@ -26,8 +30,6 @@ class SlowQueryTest(ZulipTestCase):
         self.assertTrue(is_slow_query(2, "/some/random/url"))
         self.assertTrue(is_slow_query(5.1, "/activity"))
         self.assertFalse(is_slow_query(2, "/activity"))
-        self.assertFalse(is_slow_query(2, "/json/report/error"))
-        self.assertFalse(is_slow_query(2, "/api/v1/deployments/report_error"))
         self.assertFalse(is_slow_query(2, "/realm_activity/whatever"))
         self.assertFalse(is_slow_query(2, "/user_activity/whatever"))
         self.assertFalse(is_slow_query(9, "/accounts/webathena_kerberos_login/"))
@@ -35,18 +37,16 @@ class SlowQueryTest(ZulipTestCase):
 
     def test_slow_query_log(self) -> None:
         self.log_data["time_started"] = time.time() - self.SLOW_QUERY_TIME
-        with self.assertLogs(
-            "zulip.slow_queries", level="INFO"
-        ) as slow_query_logger, self.assertLogs(
-            "zulip.requests", level="INFO"
-        ) as middleware_normal_logger:
-
+        with (
+            self.assertLogs("zulip.slow_queries", level="INFO") as slow_query_logger,
+            self.assertLogs("zulip.requests", level="INFO") as middleware_normal_logger,
+        ):
             write_log_line(
                 self.log_data,
                 path="/some/endpoint/",
                 method="GET",
                 remote_ip="123.456.789.012",
-                requestor_for_logs="unknown",
+                requester_for_logs="unknown",
                 client_name="?",
             )
             self.assert_length(middleware_normal_logger.output, 1)
@@ -63,17 +63,22 @@ class OpenGraphTest(ZulipTestCase):
         self,
         path: str,
         title: str,
-        in_description: List[str],
-        not_in_description: List[str],
+        in_description: list[str],
+        not_in_description: list[str],
         status_code: int = 200,
     ) -> None:
         response = self.client_get(path)
         self.assertEqual(response.status_code, status_code)
         bs = BeautifulSoup(response.content, features="lxml")
-        open_graph_title = bs.select_one('meta[property="og:title"]').get("content")
+        open_graph_title = assert_is_not_none(bs.select_one('meta[property="og:title"]')).get(
+            "content"
+        )
         self.assertEqual(open_graph_title, title)
 
-        open_graph_description = bs.select_one('meta[property="og:description"]').get("content")
+        open_graph_description = assert_is_not_none(
+            bs.select_one('meta[property="og:description"]')
+        ).get("content")
+        assert isinstance(open_graph_description, str)
         for substring in in_description:
             self.assertIn(substring, open_graph_description)
         for substring in not_in_description:
@@ -84,10 +89,9 @@ class OpenGraphTest(ZulipTestCase):
         # in the first paragraph.
         self.check_title_and_description(
             "/help/disable-message-edit-history",
-            "Disable message edit history (Zulip Help Center)",
+            "Disable message edit history | Zulip help center",
             [
-                "By default, Zulip displays messages",
-                "users can view the edit history of a message. | To remove the",
+                "In Zulip, users can view the edit history of a message. | To remove the",
                 "best to delete the message entirely. ",
             ],
             [
@@ -102,20 +106,23 @@ class OpenGraphTest(ZulipTestCase):
         # deactivate-your-account starts with {settings_tab|account-and-privacy}
         self.check_title_and_description(
             "/help/deactivate-your-account",
-            "Deactivate your account (Zulip Help Center)",
-            ["Any bots that you maintain will be disabled. | Deactivating "],
-            ["Confirm by clicking", "  ", "\n"],
+            "Deactivate your account | Zulip help center",
+            [
+                "Deactivating your Zulip account in one organization will have no effect "
+                "on any other Zulip accounts you may have. | Once you deactivate your account"
+            ],
+            ["Approve by clicking", "  ", "\n"],
         )
 
     def test_tabs(self) -> None:
         # logging-out starts with {start_tabs}
         self.check_title_and_description(
             "/help/logging-out",
-            "Logging out (Zulip Help Center)",
+            "Logging out | Zulip help center",
             # Ideally we'd do something better here
             [
-                "We're here to help! Email us at desdemona+admin@zulip.com with questions, feedback, or "
-                + "feature requests."
+                "Your feedback helps us make Zulip better for everyone! Please contact us with"
+                " questions, suggestions, and feature requests."
             ],
             ["Click on the gear"],
         )
@@ -123,8 +130,8 @@ class OpenGraphTest(ZulipTestCase):
     def test_index_pages(self) -> None:
         self.check_title_and_description(
             "/help/",
-            "Zulip Help Center",
-            [("Welcome to the Zulip")],
+            "Zulip help center",
+            ["Welcome to the Zulip"],
             [],
         )
 
@@ -144,10 +151,10 @@ class OpenGraphTest(ZulipTestCase):
         self.check_title_and_description(
             "/help/not-a-real-page",
             # Probably we should make this "Zulip Help Center"
-            "No such article. (Zulip Help Center)",
+            "No such article. | Zulip help center",
             [
-                "No such article. | We're here to help!",
-                "Email us at desdemona+admin@zulip.com with questions, feedback, or feature requests.",
+                "No such article.",
+                "Your feedback helps us make Zulip better for everyone! Please contact us",
             ],
             [],
             # Test that our open graph logic doesn't throw a 500
@@ -195,8 +202,10 @@ class OpenGraphTest(ZulipTestCase):
         self.assertEqual(response.status_code, 200)
 
         bs = BeautifulSoup(response.content, features="lxml")
-        open_graph_image = bs.select_one('meta[property="og:image"]').get("content")
-        self.assertEqual(open_graph_image, f"{realm.uri}{realm_icon}")
+        open_graph_image = assert_is_not_none(bs.select_one('meta[property="og:image"]')).get(
+            "content"
+        )
+        self.assertEqual(open_graph_image, f"{realm.url}{realm_icon}")
 
     def test_login_page_realm_icon_absolute_url(self) -> None:
         realm = get_realm("zulip")
@@ -210,7 +219,9 @@ class OpenGraphTest(ZulipTestCase):
         self.assertEqual(response.status_code, 200)
 
         bs = BeautifulSoup(response.content, features="lxml")
-        open_graph_image = bs.select_one('meta[property="og:image"]').get("content")
+        open_graph_image = assert_is_not_none(bs.select_one('meta[property="og:image"]')).get(
+            "content"
+        )
         self.assertEqual(open_graph_image, icon_url)
 
     def test_no_realm_api_page_og_url(self) -> None:
@@ -218,6 +229,38 @@ class OpenGraphTest(ZulipTestCase):
         self.assertEqual(response.status_code, 200)
 
         bs = BeautifulSoup(response.content, features="lxml")
-        open_graph_url = bs.select_one('meta[property="og:url"]').get("content")
+        open_graph_url = assert_is_not_none(bs.select_one('meta[property="og:url"]')).get("content")
 
+        assert isinstance(open_graph_url, str)
         self.assertTrue(open_graph_url.endswith("/api/"))
+
+
+class LogRequestsTest(ZulipTestCase):
+    meta_data = {"REMOTE_ADDR": "127.0.0.1"}
+
+    def test_requester_for_logs_as_user(self) -> None:
+        hamlet = self.example_user("hamlet")
+        request = HostRequestMock(user_profile=hamlet, meta_data=self.meta_data)
+        RequestNotes.get_notes(request).log_data = None
+
+        with self.assertLogs("zulip.requests", level="INFO") as m:
+            LogRequests(lambda _: HttpResponse())(request)
+            self.assertIn(hamlet.format_requester_for_logs(), m.output[0])
+
+    def test_requester_for_logs_as_remote_server(self) -> None:
+        remote_server = RemoteZulipServer()
+        request = HostRequestMock(remote_server=remote_server, meta_data=self.meta_data)
+        RequestNotes.get_notes(request).log_data = None
+
+        with self.assertLogs("zulip.requests", level="INFO") as m:
+            LogRequests(lambda _: HttpResponse())(request)
+            self.assertIn(remote_server.format_requester_for_logs(), m.output[0])
+
+    def test_requester_for_logs_unauthenticated(self) -> None:
+        request = HostRequestMock(meta_data=self.meta_data)
+        RequestNotes.get_notes(request).log_data = None
+
+        expected_requester = "unauth@root"
+        with self.assertLogs("zulip.requests", level="INFO") as m:
+            LogRequests(lambda _: HttpResponse())(request)
+            self.assertIn(expected_requester, m.output[0])

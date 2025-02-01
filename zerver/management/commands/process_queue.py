@@ -4,15 +4,18 @@ import signal
 import sys
 import threading
 from argparse import ArgumentParser
+from collections.abc import Iterator
 from contextlib import contextmanager
 from types import FrameType
-from typing import Any, Iterator, List
+from typing import Any
 
+import sentry_sdk
 from django.conf import settings
-from django.core.management.base import BaseCommand, CommandError
+from django.core.management.base import CommandError
 from django.utils import autoreload
-from sentry_sdk import configure_scope
+from typing_extensions import override
 
+from zerver.lib.management import ZulipBaseCommand
 from zerver.worker.queue_processors import get_active_worker_queues, get_worker
 
 
@@ -32,7 +35,8 @@ def log_and_exit_if_exception(
             sys.exit(1)
 
 
-class Command(BaseCommand):
+class Command(ZulipBaseCommand):
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument("--queue_name", metavar="<queue name>", help="queue to process")
         parser.add_argument(
@@ -49,11 +53,12 @@ class Command(BaseCommand):
 
     help = "Runs a queue processing worker"
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         logging.basicConfig()
         logger = logging.getLogger("process_queue")
 
-        def exit_with_three(signal: int, frame: FrameType) -> None:
+        def exit_with_three(signal: int, frame: FrameType | None) -> None:
             """
             This process is watched by Django's autoreload, so exiting
             with status code 3 will cause this process to restart.
@@ -69,11 +74,11 @@ class Command(BaseCommand):
                 logger.error("Cannot run a queue processor when USING_RABBITMQ is False!")
             raise CommandError
 
-        def run_threaded_workers(queues: List[str], logger: logging.Logger) -> None:
+        def run_threaded_workers(queues: list[str], logger: logging.Logger) -> None:
             cnt = 0
             for queue_name in queues:
                 if not settings.DEVELOPMENT:
-                    logger.info("launching queue worker thread " + queue_name)
+                    logger.info("launching queue worker thread %s", queue_name)
                 cnt += 1
                 td = ThreadedWorker(queue_name, logger)
                 td.start()
@@ -91,15 +96,15 @@ class Command(BaseCommand):
             queue_name = options["queue_name"]
             worker_num = options["worker_num"]
 
-            def signal_handler(signal: int, frame: FrameType) -> None:
+            def signal_handler(signal: int, frame: FrameType | None) -> None:
                 logger.info("Worker %d disconnecting from queue %s", worker_num, queue_name)
                 worker.stop()
                 sys.exit(0)
 
             logger.info("Worker %d connecting to queue %s", worker_num, queue_name)
             with log_and_exit_if_exception(logger, queue_name, threaded=False):
-                worker = get_worker(queue_name)
-                with configure_scope() as scope:
+                worker = get_worker(queue_name, worker_num=worker_num)
+                with sentry_sdk.isolation_scope() as scope:
                     scope.set_tag("queue_worker", queue_name)
                     scope.set_tag("worker_num", worker_num)
 
@@ -107,7 +112,6 @@ class Command(BaseCommand):
                     signal.signal(signal.SIGTERM, signal_handler)
                     signal.signal(signal.SIGINT, signal_handler)
                     signal.signal(signal.SIGUSR1, signal_handler)
-                    worker.ENABLE_TIMEOUTS = True
                     worker.start()
 
 
@@ -117,14 +121,14 @@ class ThreadedWorker(threading.Thread):
         self.logger = logger
         self.queue_name = queue_name
 
-        with log_and_exit_if_exception(logger, queue_name, threaded=True):
-            self.worker = get_worker(queue_name)
-
+    @override
     def run(self) -> None:
-        with configure_scope() as scope, log_and_exit_if_exception(
-            self.logger, self.queue_name, threaded=True
+        with (
+            sentry_sdk.isolation_scope() as scope,
+            log_and_exit_if_exception(self.logger, self.queue_name, threaded=True),
         ):
-            scope.set_tag("queue_worker", self.worker.queue_name)
-            self.worker.setup()
-            logging.debug("starting consuming " + self.worker.queue_name)
-            self.worker.start()
+            scope.set_tag("queue_worker", self.queue_name)
+            worker = get_worker(self.queue_name, threaded=True)
+            worker.setup()
+            logging.debug("starting consuming %s", self.queue_name)
+            worker.start()

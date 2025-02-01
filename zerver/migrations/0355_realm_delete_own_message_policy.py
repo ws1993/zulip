@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("zerver", "0354_alter_realm_message_content_delete_limit_seconds"),
     ]
@@ -13,6 +12,6 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="realm",
             name="delete_own_message_policy",
-            field=models.PositiveSmallIntegerField(default=2),
+            field=models.PositiveSmallIntegerField(default=5),
         ),
     ]

@@ -2,8 +2,8 @@ import logging
 import os
 import random
 import secrets
-import subprocess
-from typing import Any, Dict, List, Set, Tuple
+import uuid
+from typing import Any
 
 import bson
 from django.conf import settings
@@ -13,8 +13,8 @@ from zerver.data_import.import_util import (
     SubscriberHandler,
     ZerverFieldsT,
     build_attachment,
-    build_huddle,
-    build_huddle_subscriptions,
+    build_direct_message_group,
+    build_direct_message_group_subscriptions,
     build_message,
     build_personal_subscriptions,
     build_realm,
@@ -31,14 +31,17 @@ from zerver.data_import.import_util import (
 from zerver.data_import.sequencer import NEXT_ID, IdMapper
 from zerver.data_import.user_handler import UserHandler
 from zerver.lib.emoji import name_to_codepoint
+from zerver.lib.export import do_common_export_processes
 from zerver.lib.markdown import IMAGE_EXTENSIONS
 from zerver.lib.upload import sanitize_name
 from zerver.lib.utils import process_list_in_batches
 from zerver.models import Reaction, RealmEmoji, Recipient, UserProfile
 
+bson_codec_options = bson.DEFAULT_CODEC_OPTIONS.with_options(tz_aware=True)
+
 
 def make_realm(
-    realm_id: int, realm_subdomain: str, domain_name: str, rc_instance: Dict[str, Any]
+    realm_id: int, realm_subdomain: str, domain_name: str, rc_instance: dict[str, Any]
 ) -> ZerverFieldsT:
     created_at = float(rc_instance["_createdAt"].timestamp())
 
@@ -52,17 +55,16 @@ def make_realm(
 
 
 def process_users(
-    user_id_to_user_map: Dict[str, Dict[str, Any]],
+    user_id_to_user_map: dict[str, dict[str, Any]],
     realm_id: int,
     domain_name: str,
     user_handler: UserHandler,
-    user_id_mapper: IdMapper,
+    user_id_mapper: IdMapper[str],
 ) -> None:
-    realm_owners: List[int] = []
-    bots: List[int] = []
+    realm_owners: list[int] = []
+    bots: list[int] = []
 
-    for rc_user_id in user_id_to_user_map:
-        user_dict = user_id_to_user_map[rc_user_id]
+    for rc_user_id, user_dict in user_id_to_user_map.items():
         is_mirror_dummy = False
         is_bot = False
         is_active = True
@@ -79,14 +81,14 @@ def process_users(
             else:
                 is_mirror_dummy = True
 
-            if not user_dict.get("emails"):
-                user_dict["emails"] = [
-                    {
-                        "address": "{}-{}@{}".format(
-                            user_dict["username"], user_dict["type"], domain_name
-                        )
-                    }
-                ]
+        if user_dict.get("emails") is None:
+            user_dict["emails"] = [
+                {
+                    "address": "{}-{}@{}".format(
+                        user_dict["username"], user_dict["type"], domain_name
+                    )
+                }
+            ]
 
         # TODO: Change this to use actual exported avatar
         avatar_source = "G"
@@ -104,6 +106,8 @@ def process_users(
             realm_owners.append(id)
         elif "guest" in user_dict["roles"]:
             role = UserProfile.ROLE_GUEST
+        elif "bot" in user_dict["roles"]:
+            is_bot = True
 
         if is_bot:
             bots.append(id)
@@ -126,6 +130,7 @@ def process_users(
         )
         user_handler.add_user(user)
 
+    user_handler.validate_user_emails()
     # Set the first realm_owner as the owner of
     # all the bots.
     if realm_owners:
@@ -134,24 +139,33 @@ def process_users(
             bot_user["bot_owner"] = realm_owners[0]
 
 
-def get_stream_name(rc_channel: Dict[str, Any]) -> str:
+def truncate_name(name: str, name_id: int, max_length: int = 60) -> str:
+    if len(name) > max_length:
+        name_id_suffix = f" [{name_id}]"
+        name = name[0 : max_length - len(name_id_suffix)] + name_id_suffix
+    return name
+
+
+def get_stream_name(rc_channel: dict[str, Any]) -> str:
     if rc_channel.get("teamMain"):
-        return f'[TEAM] {rc_channel["name"]}'
+        stream_name = f"[TEAM] {rc_channel['name']}"
     else:
-        return rc_channel["name"]
+        stream_name = rc_channel["name"]
+
+    stream_name = truncate_name(stream_name, rc_channel["_id"])
+
+    return stream_name
 
 
 def convert_channel_data(
-    room_id_to_room_map: Dict[str, Dict[str, Any]],
-    team_id_to_team_map: Dict[str, Dict[str, Any]],
-    stream_id_mapper: IdMapper,
+    room_id_to_room_map: dict[str, dict[str, Any]],
+    team_id_to_team_map: dict[str, dict[str, Any]],
+    stream_id_mapper: IdMapper[str],
     realm_id: int,
-) -> List[ZerverFieldsT]:
+) -> list[ZerverFieldsT]:
     streams = []
 
-    for rc_room_id in room_id_to_room_map:
-        channel_dict = room_id_to_room_map[rc_room_id]
-
+    for rc_room_id, channel_dict in room_id_to_room_map.items():
         date_created = float(channel_dict["ts"].timestamp())
         stream_id = stream_id_mapper.get(rc_room_id)
         invite_only = channel_dict["t"] == "p"
@@ -166,9 +180,9 @@ def convert_channel_data(
 
         # If the channel is read-only, then only admins and moderators
         # should be allowed to post in the converted Zulip stream.
-        # For more details: https://zulip.com/help/stream-sending-policy
+        # For more details: https://zulip.com/help/channel-posting-policy
         #
-        # See `Stream` model in `zerver/models.py` to know about what each
+        # See `Stream` model in `zerver/models/streams.py` to know about what each
         # number represent.
         stream_post_policy = 4 if channel_dict.get("ro", False) else 1
 
@@ -188,18 +202,16 @@ def convert_channel_data(
 
 
 def convert_stream_subscription_data(
-    user_id_to_user_map: Dict[str, Dict[str, Any]],
-    dsc_id_to_dsc_map: Dict[str, Dict[str, Any]],
-    zerver_stream: List[ZerverFieldsT],
-    stream_id_mapper: IdMapper,
-    user_id_mapper: IdMapper,
+    user_id_to_user_map: dict[str, dict[str, Any]],
+    dsc_id_to_dsc_map: dict[str, dict[str, Any]],
+    zerver_stream: list[ZerverFieldsT],
+    stream_id_mapper: IdMapper[str],
+    user_id_mapper: IdMapper[str],
     subscriber_handler: SubscriberHandler,
 ) -> None:
-    stream_members_map: Dict[int, Set[int]] = {}
+    stream_members_map: dict[int, set[int]] = {}
 
-    for rc_user_id in user_id_to_user_map:
-        user_dict = user_id_to_user_map[rc_user_id]
-
+    for rc_user_id, user_dict in user_id_to_user_map.items():
         if not user_dict.get("__rooms"):
             continue
 
@@ -224,41 +236,45 @@ def convert_stream_subscription_data(
         subscriber_handler.set_info(users=users, stream_id=stream["id"])
 
 
-def convert_huddle_data(
-    huddle_id_to_huddle_map: Dict[str, Dict[str, Any]],
-    huddle_id_mapper: IdMapper,
-    user_id_mapper: IdMapper,
+def convert_direct_message_group_data(
+    direct_message_group_id_to_direct_message_group_map: dict[str, dict[str, Any]],
+    direct_message_group_id_mapper: IdMapper[str],
+    user_id_mapper: IdMapper[str],
     subscriber_handler: SubscriberHandler,
-) -> List[ZerverFieldsT]:
-    zerver_huddle: List[ZerverFieldsT] = []
+) -> list[ZerverFieldsT]:
+    zerver_direct_message_group: list[ZerverFieldsT] = []
 
-    for rc_huddle_id in huddle_id_to_huddle_map:
-        huddle_id = huddle_id_mapper.get(rc_huddle_id)
-        huddle = build_huddle(huddle_id)
-        zerver_huddle.append(huddle)
+    for (
+        rc_direct_message_group_id,
+        direct_message_group_dict,
+    ) in direct_message_group_id_to_direct_message_group_map.items():
+        direct_message_group_id = direct_message_group_id_mapper.get(rc_direct_message_group_id)
+        direct_message_group = build_direct_message_group(
+            direct_message_group_id, len(direct_message_group_dict["uids"])
+        )
+        zerver_direct_message_group.append(direct_message_group)
 
-        huddle_dict = huddle_id_to_huddle_map[rc_huddle_id]
-        huddle_user_ids = set()
-        for rc_user_id in huddle_dict["uids"]:
-            huddle_user_ids.add(user_id_mapper.get(rc_user_id))
+        direct_message_group_user_ids = {
+            user_id_mapper.get(rc_user_id) for rc_user_id in direct_message_group_dict["uids"]
+        }
         subscriber_handler.set_info(
-            users=huddle_user_ids,
-            huddle_id=huddle_id,
+            users=direct_message_group_user_ids,
+            direct_message_group_id=direct_message_group_id,
         )
 
-    return zerver_huddle
+    return zerver_direct_message_group
 
 
 def build_custom_emoji(
-    realm_id: int, custom_emoji_data: Dict[str, List[Dict[str, Any]]], output_dir: str
-) -> List[ZerverFieldsT]:
+    realm_id: int, custom_emoji_data: dict[str, list[dict[str, Any]]], output_dir: str
+) -> list[ZerverFieldsT]:
     logging.info("Starting to process custom emoji")
 
     emoji_folder = os.path.join(output_dir, "emoji")
     os.makedirs(emoji_folder, exist_ok=True)
 
-    zerver_realmemoji: List[ZerverFieldsT] = []
-    emoji_records: List[ZerverFieldsT] = []
+    zerver_realmemoji: list[ZerverFieldsT] = []
+    emoji_records: list[ZerverFieldsT] = []
 
     # Map emoji file_id to emoji file data
     emoji_file_data = {}
@@ -270,7 +286,7 @@ def build_custom_emoji(
     # Build custom emoji
     for rc_emoji in custom_emoji_data["emoji"]:
         # Subject to change with changes in database
-        emoji_file_id = ".".join([rc_emoji["name"], rc_emoji["extension"]])
+        emoji_file_id = f"{rc_emoji['name']}.{rc_emoji['extension']}"
 
         emoji_file_info = emoji_file_data[emoji_file_id]
 
@@ -315,10 +331,10 @@ def build_custom_emoji(
 
 
 def build_reactions(
-    total_reactions: List[ZerverFieldsT],
-    reactions: List[Dict[str, Any]],
+    total_reactions: list[ZerverFieldsT],
+    reactions: list[dict[str, Any]],
     message_id: int,
-    zerver_realmemoji: List[ZerverFieldsT],
+    zerver_realmemoji: list[ZerverFieldsT],
 ) -> None:
     realmemoji = {}
     for emoji in zerver_realmemoji:
@@ -326,9 +342,9 @@ def build_reactions(
 
     # For the Unicode emoji codes, we use equivalent of
     # function 'emoji_name_to_emoji_code' in 'zerver/lib/emoji' here
-    for reaction in reactions:
-        emoji_name = reaction["name"]
-        user_id = reaction["user_id"]
+    for reaction_dict in reactions:
+        emoji_name = reaction_dict["name"]
+        user_id = reaction_dict["user_id"]
         # Check in realm emoji
         if emoji_name in realmemoji:
             emoji_code = realmemoji[emoji_name]
@@ -355,30 +371,48 @@ def build_reactions(
 
 
 def process_message_attachment(
-    upload: Dict[str, Any],
+    upload: dict[str, Any],
     realm_id: int,
     message_id: int,
     user_id: int,
     user_handler: UserHandler,
-    zerver_attachment: List[ZerverFieldsT],
-    uploads_list: List[ZerverFieldsT],
-    upload_id_to_upload_data_map: Dict[str, Dict[str, Any]],
+    zerver_attachment: list[ZerverFieldsT],
+    uploads_list: list[ZerverFieldsT],
+    upload_id_to_upload_data_map: dict[str, dict[str, Any]],
     output_dir: str,
-) -> Tuple[str, bool]:
+) -> tuple[str, bool]:
+    if upload["_id"] not in upload_id_to_upload_data_map:  # nocoverage
+        logging.info("Skipping unknown attachment of message_id: %s", message_id)
+        return "", False
+
+    if "type" not in upload:  # nocoverage
+        logging.info("Skipping attachment without type of message_id: %s", message_id)
+        return "", False
+
     upload_file_data = upload_id_to_upload_data_map[upload["_id"]]
     file_name = upload["name"]
-    file_ext = f'.{upload["type"].split("/")[-1]}'
+    file_ext = f".{upload['type'].split('/')[-1]}"
 
     has_image = False
     if file_ext.lower() in IMAGE_EXTENSIONS:
         has_image = True
+
+    try:
+        sanitized_name = sanitize_name(file_name)
+    except AssertionError:  # nocoverage
+        logging.info("Replacing invalid attachment name with random uuid: %s", file_name)
+        sanitized_name = uuid.uuid4().hex
+
+    if len(sanitized_name.encode("utf-8")) >= 255:  # nocoverage
+        logging.info("Replacing too long attachment name with random uuid: %s", file_name)
+        sanitized_name = uuid.uuid4().hex
 
     s3_path = "/".join(
         [
             str(realm_id),
             format(random.randint(0, 255), "x"),
             secrets.token_urlsafe(18),
-            sanitize_name(file_name),
+            sanitized_name,
         ]
     )
 
@@ -389,7 +423,7 @@ def process_message_attachment(
         upload_file.write(b"".join(upload_file_data["chunk"]))
 
     attachment_content = (
-        f'{upload_file_data.get("description", "")}\n\n[{file_name}](/user_uploads/{s3_path})'
+        f"{upload_file_data.get('description', '')}\n\n[{file_name}](/user_uploads/{s3_path})"
     )
 
     fileinfo = {
@@ -424,19 +458,19 @@ def process_message_attachment(
 
 def process_raw_message_batch(
     realm_id: int,
-    raw_messages: List[Dict[str, Any]],
-    subscriber_map: Dict[int, Set[int]],
+    raw_messages: list[dict[str, Any]],
+    subscriber_map: dict[int, set[int]],
     user_handler: UserHandler,
     is_pm_data: bool,
     output_dir: str,
-    zerver_realmemoji: List[ZerverFieldsT],
-    total_reactions: List[ZerverFieldsT],
-    uploads_list: List[ZerverFieldsT],
-    zerver_attachment: List[ZerverFieldsT],
-    upload_id_to_upload_data_map: Dict[str, Dict[str, Any]],
+    zerver_realmemoji: list[ZerverFieldsT],
+    total_reactions: list[ZerverFieldsT],
+    uploads_list: list[ZerverFieldsT],
+    zerver_attachment: list[ZerverFieldsT],
+    upload_id_to_upload_data_map: dict[str, dict[str, Any]],
 ) -> None:
     def fix_mentions(
-        content: str, mention_user_ids: Set[int], rc_channel_mention_data: List[Dict[str, str]]
+        content: str, mention_user_ids: set[int], rc_channel_mention_data: list[dict[str, str]]
     ) -> str:
         # Fix user mentions
         for user_id in mention_user_ids:
@@ -458,9 +492,9 @@ def process_raw_message_batch(
 
         return content
 
-    user_mention_map: Dict[int, Set[int]] = {}
-    wildcard_mention_map: Dict[int, bool] = {}
-    zerver_message: List[ZerverFieldsT] = []
+    user_mention_map: dict[int, set[int]] = {}
+    wildcard_mention_map: dict[int, bool] = {}
+    zerver_message: list[ZerverFieldsT] = []
 
     for raw_message in raw_messages:
         message_id = NEXT_ID("message")
@@ -473,10 +507,6 @@ def process_raw_message_batch(
             mention_user_ids=mention_user_ids,
             rc_channel_mention_data=raw_message["rc_channel_mention_data"],
         )
-
-        if len(content) > 10000:  # nocoverage
-            logging.info("skipping too-long message of length %s", len(content))
-            continue
 
         date_sent = raw_message["date_sent"]
         sender_user_id = raw_message["sender_id"]
@@ -513,6 +543,7 @@ def process_raw_message_batch(
             message_id=message_id,
             date_sent=date_sent,
             recipient_id=recipient_id,
+            realm_id=realm_id,
             rendered_content=rendered_content,
             topic_name=topic_name,
             user_id=sender_user_id,
@@ -547,24 +578,24 @@ def process_raw_message_batch(
 
 
 def get_topic_name(
-    message: Dict[str, Any],
-    dsc_id_to_dsc_map: Dict[str, Dict[str, Any]],
-    thread_id_mapper: IdMapper,
+    message: dict[str, Any],
+    dsc_id_to_dsc_map: dict[str, dict[str, Any]],
+    thread_id_mapper: IdMapper[str],
     is_pm_data: bool = False,
 ) -> str:
     if is_pm_data:
         return ""
     elif message["rid"] in dsc_id_to_dsc_map:
         dsc_channel_name = dsc_id_to_dsc_map[message["rid"]]["fname"]
-        return f"{dsc_channel_name} (Imported from Rocket.Chat)"
+        return truncate_name(f"{dsc_channel_name} (Imported from Rocket.Chat)", message["rid"])
     elif message.get("replies"):
         # Message is the start of a thread
         thread_id = thread_id_mapper.get(message["_id"])
-        return f"Thread {thread_id} (Imported from Rocket.Chat)"
+        return truncate_name(f"Thread {thread_id} (Imported from Rocket.Chat)", message["_id"])
     elif message.get("tmid"):
         # Message is a part of a thread
         thread_id = thread_id_mapper.get(message["tmid"])
-        return f"Thread {thread_id} (Imported from Rocket.Chat)"
+        return truncate_name(f"Thread {thread_id} (Imported from Rocket.Chat)", message["tmid"])
     else:
         # Normal channel message
         return "Imported from Rocket.Chat"
@@ -572,48 +603,61 @@ def get_topic_name(
 
 def process_messages(
     realm_id: int,
-    messages: List[Dict[str, Any]],
-    subscriber_map: Dict[int, Set[int]],
+    messages: list[dict[str, Any]],
+    subscriber_map: dict[int, set[int]],
     is_pm_data: bool,
-    username_to_user_id_map: Dict[str, str],
-    user_id_mapper: IdMapper,
+    username_to_user_id_map: dict[str, str],
+    user_id_mapper: IdMapper[str],
     user_handler: UserHandler,
-    user_id_to_recipient_id: Dict[int, int],
-    stream_id_mapper: IdMapper,
-    stream_id_to_recipient_id: Dict[int, int],
-    huddle_id_mapper: IdMapper,
-    huddle_id_to_recipient_id: Dict[int, int],
-    thread_id_mapper: IdMapper,
-    room_id_to_room_map: Dict[str, Dict[str, Any]],
-    dsc_id_to_dsc_map: Dict[str, Dict[str, Any]],
-    direct_id_to_direct_map: Dict[str, Dict[str, Any]],
-    huddle_id_to_huddle_map: Dict[str, Dict[str, Any]],
-    zerver_realmemoji: List[ZerverFieldsT],
-    total_reactions: List[ZerverFieldsT],
-    uploads_list: List[ZerverFieldsT],
-    zerver_attachment: List[ZerverFieldsT],
-    upload_id_to_upload_data_map: Dict[str, Dict[str, Any]],
+    user_id_to_recipient_id: dict[int, int],
+    stream_id_mapper: IdMapper[str],
+    stream_id_to_recipient_id: dict[int, int],
+    direct_message_group_id_mapper: IdMapper[str],
+    direct_message_group_id_to_recipient_id: dict[int, int],
+    thread_id_mapper: IdMapper[str],
+    room_id_to_room_map: dict[str, dict[str, Any]],
+    dsc_id_to_dsc_map: dict[str, dict[str, Any]],
+    direct_id_to_direct_map: dict[str, dict[str, Any]],
+    direct_message_group_id_to_direct_message_group_map: dict[str, dict[str, Any]],
+    zerver_realmemoji: list[ZerverFieldsT],
+    total_reactions: list[ZerverFieldsT],
+    uploads_list: list[ZerverFieldsT],
+    zerver_attachment: list[ZerverFieldsT],
+    upload_id_to_upload_data_map: dict[str, dict[str, Any]],
     output_dir: str,
 ) -> None:
-    def list_reactions(reactions: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def list_reactions(reactions: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
         # List of dictionaries of form:
         # {"name": "smile", "user_id": 2}
-        reactions_list: List[Dict[str, Any]] = []
+        reactions_list: list[dict[str, Any]] = []
         for react_code in reactions:
             name = react_code.split(":")[1]
             usernames = reactions[react_code]["usernames"]
 
             for username in usernames:
+                if username not in username_to_user_id_map:  # nocoverage
+                    # This can happen with production data when old user names no longer exist. We cannot do
+                    # much about it here so we just ignore the unknown user name.
+                    continue
+
                 rc_user_id = username_to_user_id_map[username]
                 user_id = user_id_mapper.get(rc_user_id)
                 reactions_list.append({"name": name, "user_id": user_id})
 
         return reactions_list
 
-    def message_to_dict(message: Dict[str, Any]) -> Dict[str, Any]:
+    def message_to_dict(message: dict[str, Any]) -> dict[str, Any]:
         rc_sender_id = message["u"]["_id"]
         sender_id = user_id_mapper.get(rc_sender_id)
-        content = message["msg"]
+        if "msg" in message:
+            content = message["msg"]
+        else:  # nocoverage
+            content = "This message imported from Rocket.Chat had no body in the data export."
+            logging.info(
+                "Message %s contains no message content: %s",
+                message["_id"],
+                message,
+            )
 
         if message.get("reactions"):
             reactions = list_reactions(message["reactions"])
@@ -625,18 +669,24 @@ def process_messages(
             content=content,
             date_sent=int(message["ts"].timestamp()),
             reactions=reactions,
-            has_link=True if message.get("urls") else False,
+            has_link=bool(message.get("urls")),
         )
 
         # Add recipient_id to message_dict
         if is_pm_data:
-            # Message is in a PM or a huddle.
+            # Message is in a 1:1 or group direct message.
             rc_channel_id = message["rid"]
-            if rc_channel_id in huddle_id_to_huddle_map:
-                huddle_id = huddle_id_mapper.get(rc_channel_id)
-                message_dict["recipient_id"] = huddle_id_to_recipient_id[huddle_id]
+            if rc_channel_id in direct_message_group_id_to_direct_message_group_map:
+                direct_message_group_id = direct_message_group_id_mapper.get(rc_channel_id)
+                message_dict["recipient_id"] = direct_message_group_id_to_recipient_id[
+                    direct_message_group_id
+                ]
             else:
                 rc_member_ids = direct_id_to_direct_map[rc_channel_id]["uids"]
+
+                if len(rc_member_ids) == 1:  # nocoverage
+                    # direct messages to yourself only have one user.
+                    rc_member_ids.append(rc_member_ids[0])
                 if rc_sender_id == rc_member_ids[0]:
                     zulip_member_id = user_id_mapper.get(rc_member_ids[1])
                     message_dict["recipient_id"] = user_id_to_recipient_id[zulip_member_id]
@@ -666,13 +716,22 @@ def process_messages(
             if mention_id in ["all", "here"]:
                 wildcard_mention = True
                 continue
-            user_id = user_id_mapper.get(mention_id)
-            mention_user_ids.add(user_id)
+            if user_id_mapper.has(mention_id):
+                user_id = user_id_mapper.get(mention_id)
+                mention_user_ids.add(user_id)
+            else:  # nocoverage
+                logging.info(
+                    "Message %s contains mention of unknown user %s: %s",
+                    message["_id"],
+                    mention_id,
+                    mention,
+                )
+
         message_dict["mention_user_ids"] = mention_user_ids
         message_dict["wildcard_mention"] = wildcard_mention
 
         # Add channel mentions to message_dict
-        rc_channel_mention_data: List[Dict[str, str]] = []
+        rc_channel_mention_data: list[dict[str, str]] = []
         for mention in message.get("channels", []):
             mention_rc_channel_id = mention["_id"]
             mention_rc_channel_name = mention["name"]
@@ -690,7 +749,7 @@ def process_messages(
                 parent_channel_id = dsc_channel["prid"]
                 if (
                     parent_channel_id in direct_id_to_direct_map
-                    or parent_channel_id in huddle_id_to_huddle_map
+                    or parent_channel_id in direct_message_group_id_to_direct_message_group_map
                 ):
                     # Discussion belongs to a direct channel and thus, should not be
                     # linked.
@@ -713,6 +772,9 @@ def process_messages(
                 parent_stream_name = get_stream_name(parent_rc_channel)
 
                 zulip_mention = f"#**{parent_stream_name}>{converted_topic_name}**"
+            else:  # nocoverage
+                logging.info("Failed to map mention '%s' to zulip syntax.", mention)
+                continue
 
             mention_data = {"rc_mention": rc_mention, "zulip_mention": zulip_mention}
             rc_channel_mention_data.append(mention_data)
@@ -724,7 +786,7 @@ def process_messages(
 
         return message_dict
 
-    raw_messages: List[Dict[str, Any]] = []
+    raw_messages: list[dict[str, Any]] = []
     for message in messages:
         if message.get("t") is not None:
             # Messages with a type are system notifications like user_joined
@@ -732,7 +794,7 @@ def process_messages(
             continue
         raw_messages.append(message_to_dict(message))
 
-    def process_batch(lst: List[Dict[str, Any]]) -> None:
+    def process_batch(lst: list[dict[str, Any]]) -> None:
         process_raw_message_batch(
             realm_id=realm_id,
             raw_messages=lst,
@@ -757,32 +819,40 @@ def process_messages(
 
 
 def map_upload_id_to_upload_data(
-    upload_data: Dict[str, List[Dict[str, Any]]],
-) -> Dict[str, Dict[str, Any]]:
-    upload_id_to_upload_data_map: Dict[str, Dict[str, Any]] = {}
+    upload_data: dict[str, list[dict[str, Any]]],
+) -> dict[str, dict[str, Any]]:
+    upload_id_to_upload_data_map: dict[str, dict[str, Any]] = {}
 
     for upload in upload_data["upload"]:
         upload_id_to_upload_data_map[upload["_id"]] = {**upload, "chunk": []}
 
     for chunk in upload_data["chunk"]:
+        if chunk["files_id"] not in upload_id_to_upload_data_map:  # nocoverage
+            logging.info("Skipping chunk %s without metadata", chunk["files_id"])
+            # It's unclear why this apparent data corruption in the
+            # Rocket.Chat database is possible, but empirically, some
+            # chunks don't have any associated metadata.
+            continue
+
         upload_id_to_upload_data_map[chunk["files_id"]]["chunk"].append(chunk["data"])
 
     return upload_id_to_upload_data_map
 
 
 def separate_channel_private_and_livechat_messages(
-    messages: List[Dict[str, Any]],
-    dsc_id_to_dsc_map: Dict[str, Dict[str, Any]],
-    direct_id_to_direct_map: Dict[str, Dict[str, Any]],
-    huddle_id_to_huddle_map: Dict[str, Dict[str, Any]],
-    livechat_id_to_livechat_map: Dict[str, Dict[str, Any]],
-    channel_messages: List[Dict[str, Any]],
-    private_messages: List[Dict[str, Any]],
-    livechat_messages: List[Dict[str, Any]],
+    messages: list[dict[str, Any]],
+    dsc_id_to_dsc_map: dict[str, dict[str, Any]],
+    direct_id_to_direct_map: dict[str, dict[str, Any]],
+    direct_message_group_id_to_direct_message_group_map: dict[str, dict[str, Any]],
+    livechat_id_to_livechat_map: dict[str, dict[str, Any]],
+    channel_messages: list[dict[str, Any]],
+    private_messages: list[dict[str, Any]],
+    livechat_messages: list[dict[str, Any]],
 ) -> None:
-    private_channels_list = list(direct_id_to_direct_map.keys()) + list(
-        huddle_id_to_huddle_map.keys()
-    )
+    private_channels_list = [
+        *direct_id_to_direct_map,
+        *direct_message_group_id_to_direct_message_group_map,
+    ]
     for message in messages:
         if not message.get("rid"):
             # Message does not belong to any channel (might be
@@ -804,36 +874,76 @@ def separate_channel_private_and_livechat_messages(
 
 
 def map_receiver_id_to_recipient_id(
-    zerver_recipient: List[ZerverFieldsT],
-    stream_id_to_recipient_id: Dict[int, int],
-    huddle_id_to_recipient_id: Dict[int, int],
-    user_id_to_recipient_id: Dict[int, int],
+    zerver_recipient: list[ZerverFieldsT],
+    stream_id_to_recipient_id: dict[int, int],
+    direct_message_group_id_to_recipient_id: dict[int, int],
+    user_id_to_recipient_id: dict[int, int],
 ) -> None:
-    # receiver_id represents stream_id/huddle_id/user_id
+    # receiver_id represents stream_id/direct_message_group_id/user_id
     for recipient in zerver_recipient:
         if recipient["type"] == Recipient.STREAM:
             stream_id_to_recipient_id[recipient["type_id"]] = recipient["id"]
-        elif recipient["type"] == Recipient.HUDDLE:
-            huddle_id_to_recipient_id[recipient["type_id"]] = recipient["id"]
+        elif recipient["type"] == Recipient.DIRECT_MESSAGE_GROUP:
+            direct_message_group_id_to_recipient_id[recipient["type_id"]] = recipient["id"]
         elif recipient["type"] == Recipient.PERSONAL:
             user_id_to_recipient_id[recipient["type_id"]] = recipient["id"]
 
 
 def categorize_channels_and_map_with_id(
-    channel_data: List[Dict[str, Any]],
-    room_id_to_room_map: Dict[str, Dict[str, Any]],
-    team_id_to_team_map: Dict[str, Dict[str, Any]],
-    dsc_id_to_dsc_map: Dict[str, Dict[str, Any]],
-    direct_id_to_direct_map: Dict[str, Dict[str, Any]],
-    huddle_id_to_huddle_map: Dict[str, Dict[str, Any]],
-    livechat_id_to_livechat_map: Dict[str, Dict[str, Any]],
+    channel_data: list[dict[str, Any]],
+    room_id_to_room_map: dict[str, dict[str, Any]],
+    team_id_to_team_map: dict[str, dict[str, Any]],
+    dsc_id_to_dsc_map: dict[str, dict[str, Any]],
+    direct_id_to_direct_map: dict[str, dict[str, Any]],
+    direct_message_group_id_to_direct_message_group_map: dict[str, dict[str, Any]],
+    livechat_id_to_livechat_map: dict[str, dict[str, Any]],
 ) -> None:
+    direct_message_group_hashed_channels: dict[frozenset[str], Any] = {}
     for channel in channel_data:
         if channel.get("prid"):
             dsc_id_to_dsc_map[channel["_id"]] = channel
         elif channel["t"] == "d":
             if len(channel["uids"]) > 2:
-                huddle_id_to_huddle_map[channel["_id"]] = channel
+                direct_message_group_members = frozenset(channel["uids"])
+                logging.info("Direct message group channel found. UIDs: %r", channel["uids"])
+
+                if channel["msgs"] == 0:  # nocoverage
+                    # Rocket.Chat exports in the wild sometimes
+                    # contain duplicates of real direct message
+                    # groups, with no messages in the duplicate.
+                    # We ignore these minor database corruptions
+                    # in the Rocket.Chat export. Doing so is safe,
+                    # because a direct message group with no message
+                    # history has no value in Zulip's data model.
+                    logging.debug("Skipping direct message group with 0 messages: %s", channel)
+                elif (
+                    direct_message_group_members in direct_message_group_hashed_channels
+                ):  # nocoverage
+                    logging.info(
+                        "Mapping direct message group %r to existing channel: %s",
+                        direct_message_group_members,
+                        direct_message_group_hashed_channels[direct_message_group_members],
+                    )
+                    direct_message_group_id_to_direct_message_group_map[channel["_id"]] = (
+                        direct_message_group_hashed_channels[direct_message_group_members]
+                    )
+
+                    # Ideally, we'd merge the duplicate direct message
+                    # groups. Doing so correctly requires special
+                    # handling in convert_direct_message_group_data()
+                    # and on the message import side as well, since
+                    # those appear to be mapped via rocketchat channel
+                    # IDs and not all of that information is resolved
+                    # via the direct_message_group_id_to_direct_message_group_map.
+                    #
+                    # For now, just throw an exception here rather
+                    # than during the import process.
+                    raise NotImplementedError(
+                        "Mapping multiple direct message groups with messages to one is not fully implemented yet"
+                    )
+                else:
+                    direct_message_group_id_to_direct_message_group_map[channel["_id"]] = channel
+                    direct_message_group_hashed_channels[direct_message_group_members] = channel
             else:
                 direct_id_to_direct_map[channel["_id"]] = channel
         elif channel["t"] == "l":
@@ -844,110 +954,141 @@ def categorize_channels_and_map_with_id(
                 team_id_to_team_map[channel["teamId"]] = channel
 
 
-def map_username_to_user_id(user_id_to_user_map: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
-    username_to_user_id_map: Dict[str, str] = {}
+def map_username_to_user_id(user_id_to_user_map: dict[str, dict[str, Any]]) -> dict[str, str]:
+    username_to_user_id_map: dict[str, str] = {}
     for user_id, user_dict in user_id_to_user_map.items():
         username_to_user_id_map[user_dict["username"]] = user_id
     return username_to_user_id_map
 
 
-def map_user_id_to_user(user_data_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def map_user_id_to_user(user_data_list: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     user_id_to_user_map = {}
     for user in user_data_list:
         user_id_to_user_map[user["_id"]] = user
     return user_id_to_user_map
 
 
-def rocketchat_data_to_dict(rocketchat_data_dir: str) -> Dict[str, Any]:
-    rocketchat_data: Dict[str, Any] = {}
-    rocketchat_data["instance"] = []
-    rocketchat_data["user"] = []
-    rocketchat_data["avatar"] = {"avatar": [], "file": [], "chunk": []}
-    rocketchat_data["room"] = []
-    rocketchat_data["message"] = []
-    rocketchat_data["custom_emoji"] = {"emoji": [], "file": [], "chunk": []}
-    rocketchat_data["upload"] = {"upload": [], "file": [], "chunk": []}
+def rocketchat_data_to_dict(
+    rocketchat_data_dir: str, sections: list[str] | None = None
+) -> dict[str, Any]:
+    """Reads Rocket.Chat data from its BSON files for the requested sections of the
+    export. Defaults to fetching everything, which is convenient for tests, but
+    we prefer to fetch only those sections that are needed for a given stage to
+    provide a faster debug cycle for metadata data corruption issues.
 
-    # Get instance
-    with open(os.path.join(rocketchat_data_dir, "instances.bson"), "rb") as fcache:
-        rocketchat_data["instance"] = bson.decode_all(fcache.read())
+    TODO: Ideally, we'd read the big data sets, like messages and
+    uploads, with a streaming BSON parser, or pre-paginate the data.
+    """
+    rocketchat_data: dict[str, Any] = {}
 
-    # Get user
-    with open(os.path.join(rocketchat_data_dir, "users.bson"), "rb") as fcache:
-        rocketchat_data["user"] = bson.decode_all(fcache.read())
+    if sections is None or "instance" in sections:
+        rocketchat_data["instance"] = []
+        with open(os.path.join(rocketchat_data_dir, "instances.bson"), "rb") as fcache:
+            rocketchat_data["instance"] = bson.decode_all(fcache.read(), bson_codec_options)
 
-    # Get avatar
-    with open(os.path.join(rocketchat_data_dir, "rocketchat_avatars.bson"), "rb") as fcache:
-        rocketchat_data["avatar"]["avatar"] = bson.decode_all(fcache.read())
+    if sections is None or "user" in sections:
+        rocketchat_data["user"] = []
+        with open(os.path.join(rocketchat_data_dir, "users.bson"), "rb") as fcache:
+            rocketchat_data["user"] = bson.decode_all(fcache.read(), bson_codec_options)
 
-    if rocketchat_data["avatar"]["avatar"]:
+    if sections is None or "avatar" in sections:
+        rocketchat_data["avatar"] = {"avatar": [], "file": [], "chunk": []}
+        with open(os.path.join(rocketchat_data_dir, "rocketchat_avatars.bson"), "rb") as fcache:
+            rocketchat_data["avatar"]["avatar"] = bson.decode_all(fcache.read(), bson_codec_options)
+
+        if rocketchat_data["avatar"]["avatar"]:
+            with open(
+                os.path.join(rocketchat_data_dir, "rocketchat_avatars.files.bson"), "rb"
+            ) as fcache:
+                rocketchat_data["avatar"]["file"] = bson.decode_all(
+                    fcache.read(), bson_codec_options
+                )
+
+            with open(
+                os.path.join(rocketchat_data_dir, "rocketchat_avatars.chunks.bson"), "rb"
+            ) as fcache:
+                rocketchat_data["avatar"]["chunk"] = bson.decode_all(
+                    fcache.read(), bson_codec_options
+                )
+
+    if sections is None or "room" in sections:
+        rocketchat_data["room"] = []
+        with open(os.path.join(rocketchat_data_dir, "rocketchat_room.bson"), "rb") as fcache:
+            rocketchat_data["room"] = bson.decode_all(fcache.read(), bson_codec_options)
+
+    if sections is None or "message" in sections:
+        rocketchat_data["message"] = []
+        with open(os.path.join(rocketchat_data_dir, "rocketchat_message.bson"), "rb") as fcache:
+            rocketchat_data["message"] = bson.decode_all(fcache.read(), bson_codec_options)
+
+    if sections is None or "custom_emoji" in sections:
+        rocketchat_data["custom_emoji"] = {"emoji": [], "file": [], "chunk": []}
         with open(
-            os.path.join(rocketchat_data_dir, "rocketchat_avatars.files.bson"), "rb"
+            os.path.join(rocketchat_data_dir, "rocketchat_custom_emoji.bson"), "rb"
         ) as fcache:
-            rocketchat_data["avatar"]["file"] = bson.decode_all(fcache.read())
+            rocketchat_data["custom_emoji"]["emoji"] = bson.decode_all(
+                fcache.read(), bson_codec_options
+            )
 
-        with open(
-            os.path.join(rocketchat_data_dir, "rocketchat_avatars.chunks.bson"), "rb"
-        ) as fcache:
-            rocketchat_data["avatar"]["chunk"] = bson.decode_all(fcache.read())
+        if rocketchat_data["custom_emoji"]["emoji"]:
+            with open(os.path.join(rocketchat_data_dir, "custom_emoji.files.bson"), "rb") as fcache:
+                rocketchat_data["custom_emoji"]["file"] = bson.decode_all(
+                    fcache.read(), bson_codec_options
+                )
 
-    # Get room
-    with open(os.path.join(rocketchat_data_dir, "rocketchat_room.bson"), "rb") as fcache:
-        rocketchat_data["room"] = bson.decode_all(fcache.read())
+            with open(
+                os.path.join(rocketchat_data_dir, "custom_emoji.chunks.bson"), "rb"
+            ) as fcache:
+                rocketchat_data["custom_emoji"]["chunk"] = bson.decode_all(
+                    fcache.read(), bson_codec_options
+                )
 
-    # Get messages
-    with open(os.path.join(rocketchat_data_dir, "rocketchat_message.bson"), "rb") as fcache:
-        rocketchat_data["message"] = bson.decode_all(fcache.read())
+    if sections is None or "upload" in sections:
+        rocketchat_data["upload"] = {"upload": [], "file": [], "chunk": []}
+        with open(os.path.join(rocketchat_data_dir, "rocketchat_uploads.bson"), "rb") as fcache:
+            rocketchat_data["upload"]["upload"] = bson.decode_all(fcache.read(), bson_codec_options)
 
-    # Get custom emoji
-    with open(os.path.join(rocketchat_data_dir, "rocketchat_custom_emoji.bson"), "rb") as fcache:
-        rocketchat_data["custom_emoji"]["emoji"] = bson.decode_all(fcache.read())
+        if rocketchat_data["upload"]["upload"]:
+            with open(
+                os.path.join(rocketchat_data_dir, "rocketchat_uploads.files.bson"), "rb"
+            ) as fcache:
+                rocketchat_data["upload"]["file"] = bson.decode_all(
+                    fcache.read(), bson_codec_options
+                )
 
-    if rocketchat_data["custom_emoji"]["emoji"]:
-        with open(os.path.join(rocketchat_data_dir, "custom_emoji.files.bson"), "rb") as fcache:
-            rocketchat_data["custom_emoji"]["file"] = bson.decode_all(fcache.read())
-
-        with open(os.path.join(rocketchat_data_dir, "custom_emoji.chunks.bson"), "rb") as fcache:
-            rocketchat_data["custom_emoji"]["chunk"] = bson.decode_all(fcache.read())
-
-    # Get uploads
-    with open(os.path.join(rocketchat_data_dir, "rocketchat_uploads.bson"), "rb") as fcache:
-        rocketchat_data["upload"]["upload"] = bson.decode_all(fcache.read())
-
-    if rocketchat_data["upload"]["upload"]:
-        with open(
-            os.path.join(rocketchat_data_dir, "rocketchat_uploads.files.bson"), "rb"
-        ) as fcache:
-            rocketchat_data["upload"]["file"] = bson.decode_all(fcache.read())
-
-        with open(
-            os.path.join(rocketchat_data_dir, "rocketchat_uploads.chunks.bson"), "rb"
-        ) as fcache:
-            rocketchat_data["upload"]["chunk"] = bson.decode_all(fcache.read())
+            with open(
+                os.path.join(rocketchat_data_dir, "rocketchat_uploads.chunks.bson"), "rb"
+            ) as fcache:
+                rocketchat_data["upload"]["chunk"] = bson.decode_all(
+                    fcache.read(), bson_codec_options
+                )
 
     return rocketchat_data
 
 
 def do_convert_data(rocketchat_data_dir: str, output_dir: str) -> None:
     # Get all required exported data in a dictionary
-    rocketchat_data = rocketchat_data_to_dict(rocketchat_data_dir)
 
     # Subdomain is set by the user while running the import command
     realm_subdomain = ""
     realm_id = 0
     domain_name = settings.EXTERNAL_HOST
 
-    realm = make_realm(realm_id, realm_subdomain, domain_name, rocketchat_data["instance"][0])
+    rocketchat_instance_data = rocketchat_data_to_dict(rocketchat_data_dir, ["instance"])[
+        "instance"
+    ][0]
+    realm = make_realm(realm_id, realm_subdomain, domain_name, rocketchat_instance_data)
 
-    user_id_to_user_map: Dict[str, Dict[str, Any]] = map_user_id_to_user(rocketchat_data["user"])
-    username_to_user_id_map: Dict[str, str] = map_username_to_user_id(user_id_to_user_map)
+    rocketchat_user_data = rocketchat_data_to_dict(rocketchat_data_dir, ["user"])["user"]
+    user_id_to_user_map: dict[str, dict[str, Any]] = map_user_id_to_user(rocketchat_user_data)
+    username_to_user_id_map: dict[str, str] = map_username_to_user_id(user_id_to_user_map)
 
     user_handler = UserHandler()
     subscriber_handler = SubscriberHandler()
-    user_id_mapper = IdMapper()
-    stream_id_mapper = IdMapper()
-    huddle_id_mapper = IdMapper()
-    thread_id_mapper = IdMapper()
+    user_id_mapper = IdMapper[str]()
+    stream_id_mapper = IdMapper[str]()
+    direct_message_group_id_mapper = IdMapper[str]()
+    thread_id_mapper = IdMapper[str]()
 
     process_users(
         user_id_to_user_map=user_id_to_user_map,
@@ -957,20 +1098,31 @@ def do_convert_data(rocketchat_data_dir: str, output_dir: str) -> None:
         user_id_mapper=user_id_mapper,
     )
 
-    room_id_to_room_map: Dict[str, Dict[str, Any]] = {}
-    team_id_to_team_map: Dict[str, Dict[str, Any]] = {}
-    dsc_id_to_dsc_map: Dict[str, Dict[str, Any]] = {}
-    direct_id_to_direct_map: Dict[str, Dict[str, Any]] = {}
-    huddle_id_to_huddle_map: Dict[str, Dict[str, Any]] = {}
-    livechat_id_to_livechat_map: Dict[str, Dict[str, Any]] = {}
+    rocketchat_emoji_data = rocketchat_data_to_dict(rocketchat_data_dir, ["custom_emoji"])[
+        "custom_emoji"
+    ]
+    zerver_realmemoji = build_custom_emoji(
+        realm_id=realm_id,
+        custom_emoji_data=rocketchat_emoji_data,
+        output_dir=output_dir,
+    )
+    realm["zerver_realmemoji"] = zerver_realmemoji
 
+    room_id_to_room_map: dict[str, dict[str, Any]] = {}
+    team_id_to_team_map: dict[str, dict[str, Any]] = {}
+    dsc_id_to_dsc_map: dict[str, dict[str, Any]] = {}
+    direct_id_to_direct_map: dict[str, dict[str, Any]] = {}
+    direct_message_group_id_to_direct_message_group_map: dict[str, dict[str, Any]] = {}
+    livechat_id_to_livechat_map: dict[str, dict[str, Any]] = {}
+
+    rocketchat_room_data = rocketchat_data_to_dict(rocketchat_data_dir, ["room"])["room"]
     categorize_channels_and_map_with_id(
-        channel_data=rocketchat_data["room"],
+        channel_data=rocketchat_room_data,
         room_id_to_room_map=room_id_to_room_map,
         team_id_to_team_map=team_id_to_team_map,
         dsc_id_to_dsc_map=dsc_id_to_dsc_map,
         direct_id_to_direct_map=direct_id_to_direct_map,
-        huddle_id_to_huddle_map=huddle_id_to_huddle_map,
+        direct_message_group_id_to_direct_message_group_map=direct_message_group_id_to_direct_message_group_map,
         livechat_id_to_livechat_map=livechat_id_to_livechat_map,
     )
 
@@ -992,20 +1144,20 @@ def do_convert_data(rocketchat_data_dir: str, output_dir: str) -> None:
         subscriber_handler=subscriber_handler,
     )
 
-    zerver_huddle = convert_huddle_data(
-        huddle_id_to_huddle_map=huddle_id_to_huddle_map,
-        huddle_id_mapper=huddle_id_mapper,
+    zerver_direct_message_group = convert_direct_message_group_data(
+        direct_message_group_id_to_direct_message_group_map=direct_message_group_id_to_direct_message_group_map,
+        direct_message_group_id_mapper=direct_message_group_id_mapper,
         user_id_mapper=user_id_mapper,
         subscriber_handler=subscriber_handler,
     )
-    realm["zerver_huddle"] = zerver_huddle
+    realm["zerver_huddle"] = zerver_direct_message_group
 
     all_users = user_handler.get_all_users()
 
     zerver_recipient = build_recipients(
         zerver_userprofile=all_users,
         zerver_stream=zerver_stream,
-        zerver_huddle=zerver_huddle,
+        zerver_direct_message_group=zerver_direct_message_group,
     )
     realm["zerver_recipient"] = zerver_recipient
 
@@ -1015,61 +1167,60 @@ def do_convert_data(rocketchat_data_dir: str, output_dir: str) -> None:
         zerver_stream=zerver_stream,
     )
 
-    huddle_subscriptions = build_huddle_subscriptions(
+    direct_message_group_subscriptions = build_direct_message_group_subscriptions(
         get_users=subscriber_handler.get_users,
         zerver_recipient=zerver_recipient,
-        zerver_huddle=zerver_huddle,
+        zerver_direct_message_group=zerver_direct_message_group,
     )
 
     personal_subscriptions = build_personal_subscriptions(
         zerver_recipient=zerver_recipient,
     )
 
-    zerver_subscription = personal_subscriptions + stream_subscriptions + huddle_subscriptions
-    realm["zerver_subscription"] = zerver_subscription
-
-    zerver_realmemoji = build_custom_emoji(
-        realm_id=realm_id,
-        custom_emoji_data=rocketchat_data["custom_emoji"],
-        output_dir=output_dir,
+    zerver_subscription = (
+        personal_subscriptions + stream_subscriptions + direct_message_group_subscriptions
     )
-    realm["zerver_realmemoji"] = zerver_realmemoji
+    realm["zerver_subscription"] = zerver_subscription
 
     subscriber_map = make_subscriber_map(
         zerver_subscription=zerver_subscription,
     )
 
-    stream_id_to_recipient_id: Dict[int, int] = {}
-    huddle_id_to_recipient_id: Dict[int, int] = {}
-    user_id_to_recipient_id: Dict[int, int] = {}
+    stream_id_to_recipient_id: dict[int, int] = {}
+    direct_message_group_id_to_recipient_id: dict[int, int] = {}
+    user_id_to_recipient_id: dict[int, int] = {}
 
     map_receiver_id_to_recipient_id(
         zerver_recipient=zerver_recipient,
         stream_id_to_recipient_id=stream_id_to_recipient_id,
-        huddle_id_to_recipient_id=huddle_id_to_recipient_id,
+        direct_message_group_id_to_recipient_id=direct_message_group_id_to_recipient_id,
         user_id_to_recipient_id=user_id_to_recipient_id,
     )
 
-    channel_messages: List[Dict[str, Any]] = []
-    private_messages: List[Dict[str, Any]] = []
-    livechat_messages: List[Dict[str, Any]] = []
+    channel_messages: list[dict[str, Any]] = []
+    private_messages: list[dict[str, Any]] = []
+    livechat_messages: list[dict[str, Any]] = []
 
+    rocketchat_message_data = rocketchat_data_to_dict(rocketchat_data_dir, ["message"])["message"]
     separate_channel_private_and_livechat_messages(
-        messages=rocketchat_data["message"],
+        messages=rocketchat_message_data,
         dsc_id_to_dsc_map=dsc_id_to_dsc_map,
         direct_id_to_direct_map=direct_id_to_direct_map,
-        huddle_id_to_huddle_map=huddle_id_to_huddle_map,
+        direct_message_group_id_to_direct_message_group_map=direct_message_group_id_to_direct_message_group_map,
         livechat_id_to_livechat_map=livechat_id_to_livechat_map,
         channel_messages=channel_messages,
         private_messages=private_messages,
         livechat_messages=livechat_messages,
     )
+    # Hint we can free the memory, now that we're done processing this.
+    rocketchat_message_data = []
 
-    total_reactions: List[ZerverFieldsT] = []
-    uploads_list: List[ZerverFieldsT] = []
-    zerver_attachment: List[ZerverFieldsT] = []
+    total_reactions: list[ZerverFieldsT] = []
+    uploads_list: list[ZerverFieldsT] = []
+    zerver_attachment: list[ZerverFieldsT] = []
 
-    upload_id_to_upload_data_map = map_upload_id_to_upload_data(rocketchat_data["upload"])
+    rocketchat_upload_data = rocketchat_data_to_dict(rocketchat_data_dir, ["upload"])["upload"]
+    upload_id_to_upload_data_map = map_upload_id_to_upload_data(rocketchat_upload_data)
 
     # Process channel messages
     process_messages(
@@ -1083,13 +1234,13 @@ def do_convert_data(rocketchat_data_dir: str, output_dir: str) -> None:
         user_id_to_recipient_id=user_id_to_recipient_id,
         stream_id_mapper=stream_id_mapper,
         stream_id_to_recipient_id=stream_id_to_recipient_id,
-        huddle_id_mapper=huddle_id_mapper,
-        huddle_id_to_recipient_id=huddle_id_to_recipient_id,
+        direct_message_group_id_mapper=direct_message_group_id_mapper,
+        direct_message_group_id_to_recipient_id=direct_message_group_id_to_recipient_id,
         thread_id_mapper=thread_id_mapper,
         room_id_to_room_map=room_id_to_room_map,
         dsc_id_to_dsc_map=dsc_id_to_dsc_map,
         direct_id_to_direct_map=direct_id_to_direct_map,
-        huddle_id_to_huddle_map=huddle_id_to_huddle_map,
+        direct_message_group_id_to_direct_message_group_map=direct_message_group_id_to_direct_message_group_map,
         zerver_realmemoji=zerver_realmemoji,
         total_reactions=total_reactions,
         uploads_list=uploads_list,
@@ -1097,7 +1248,7 @@ def do_convert_data(rocketchat_data_dir: str, output_dir: str) -> None:
         upload_id_to_upload_data_map=upload_id_to_upload_data_map,
         output_dir=output_dir,
     )
-    # Process private messages
+    # Process direct messages
     process_messages(
         realm_id=realm_id,
         messages=private_messages,
@@ -1109,13 +1260,13 @@ def do_convert_data(rocketchat_data_dir: str, output_dir: str) -> None:
         user_id_to_recipient_id=user_id_to_recipient_id,
         stream_id_mapper=stream_id_mapper,
         stream_id_to_recipient_id=stream_id_to_recipient_id,
-        huddle_id_mapper=huddle_id_mapper,
-        huddle_id_to_recipient_id=huddle_id_to_recipient_id,
+        direct_message_group_id_mapper=direct_message_group_id_mapper,
+        direct_message_group_id_to_recipient_id=direct_message_group_id_to_recipient_id,
         thread_id_mapper=thread_id_mapper,
         room_id_to_room_map=room_id_to_room_map,
         dsc_id_to_dsc_map=dsc_id_to_dsc_map,
         direct_id_to_direct_map=direct_id_to_direct_map,
-        huddle_id_to_huddle_map=huddle_id_to_huddle_map,
+        direct_message_group_id_to_direct_message_group_map=direct_message_group_id_to_direct_message_group_map,
         zerver_realmemoji=zerver_realmemoji,
         total_reactions=total_reactions,
         uploads_list=uploads_list,
@@ -1132,10 +1283,8 @@ def do_convert_data(rocketchat_data_dir: str, output_dir: str) -> None:
     create_converted_data_files([], output_dir, "/avatars/records.json")
 
     # Import attachments
-    attachment: Dict[str, List[Any]] = {"zerver_attachment": zerver_attachment}
+    attachment: dict[str, list[Any]] = {"zerver_attachment": zerver_attachment}
     create_converted_data_files(attachment, output_dir, "/attachment.json")
     create_converted_data_files(uploads_list, output_dir, "/uploads/records.json")
 
-    logging.info("Start making tarball")
-    subprocess.check_call(["tar", "-czf", output_dir + ".tar.gz", output_dir, "-P"])
-    logging.info("Done making tarball")
+    do_common_export_processes(output_dir)

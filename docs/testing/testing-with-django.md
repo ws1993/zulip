@@ -4,8 +4,8 @@
 
 Zulip uses the Django framework for its Python backend. We
 use the testing framework from
-[django.test](https://docs.djangoproject.com/en/3.2/topics/testing/)
-to test our code. We have over a thousand automated tests that verify that
+[django.test](https://docs.djangoproject.com/en/5.0/topics/testing/)
+to test our code. We have thousands of automated tests that verify that
 our backend works as expected.
 
 All changes to the Zulip backend code should be supported by tests. We
@@ -102,10 +102,11 @@ Shakesepeare characters, and they are part of the "zulip.com" realm.
 Generally, you will also do some explicit data setup of your own. Here
 are a couple useful methods in ZulipTestCase:
 
-- common_subscribe_to_streams
-- send_message
 - make_stream
-- subscribe_to_stream
+- subscribe
+- unsubscribe
+- send_stream_message
+- send_personal_message
 
 More typically, you will use methods directly from the backend code.
 (This ensures more end-to-end testing, and avoids false positives from
@@ -121,7 +122,7 @@ Here are some example action methods that tests may use for data setup:
 
 ### Testing code that accesses the filesystem
 
-Some tests need to access the filesystem (e.g. `test_upload.py` tests
+Some tests need to access the filesystem (e.g., `test_upload.py` tests
 for `LocalUploadBackend` and the data import tests). Doing
 this correctly requires care to avoid problems like:
 
@@ -142,7 +143,7 @@ To avoid these problems, you can do the following:
   avoid conflicts with other tests run later by the same test process.
 
 Our common testing infrastructure handles some of this for you,
-e.g. it replaces `settings.LOCAL_UPLOADS_DIR` for each test process
+e.g., it replaces `settings.LOCAL_UPLOADS_DIR` for each test process
 with a unique path under `/var/<uuid>/test-backend`. And
 `UploadSerializeMixin` manages some of the cleanup work for
 `test_upload.py`.
@@ -252,7 +253,7 @@ foo.qux = 42
 ```
 
 is _not_ going to throw any errors. Our mock silently accepts all these calls and records them.
-`Mock` also implements methods for us to access and assert its records, e.g.
+`Mock` also implements methods for us to access and assert its records, e.g.,
 
 ```python
 foo.bar.assert_called_with('quux')
@@ -330,7 +331,7 @@ with self.settings(RATE_LIMITING=True):
 self.assertTrue(rate_limit_mock.called)
 ```
 
-Follow [this link](../subsystems/settings.html#testing-non-default-settings) for more
+Follow [this link](../subsystems/settings.md#testing-non-default-settings) for more
 information on the "settings" context manager.
 
 Zulip has several features, like outgoing webhooks or social
@@ -338,7 +339,7 @@ authentication, that made outgoing HTTP requests to external
 servers. We test those features using the excellent
 [responses](https://pypi.org/project/responses/) library, which has a
 nice interface for mocking `requests` calls to return whatever HTTP
-response from the exteranl server we need for the test. you can find
+response from the external server we need for the test. you can find
 examples with `git grep responses.add`. Zulip's own `HostRequestMock`
 class should be used only for low-level tests for code that expects to
 receive Django HttpRequest object.
@@ -411,7 +412,7 @@ We use mocks and stubs for all the typical reasons:
 - to stub out calls to third-party services
 - to make it so that you can [run the Zulip tests on the airplane without wifi][no-internet]
 
-[no-internet]: testing.html#internet-access-inside-test-suites
+[no-internet]: testing.md#internet-access-inside-test-suites
 
 A detailed description of mocks, along with useful coded snippets, can be found in the section
 [Testing with mocks](#testing-with-mocks).
@@ -435,8 +436,8 @@ requires a more subtle restructuring of the code.)
 We try to prevent these bugs in our tests by using a context manager
 called `queries_captured()` that captures the SQL queries used by
 the backend during a particular operation. We make assertions about
-those queries, often simply asserting that the number of queries is
-below some threshold.
+those queries, often simply by using the `assert_database_query_count`
+that checks the number of queries.
 
 ### Event-based tests
 
@@ -449,7 +450,7 @@ the same data structure as performing an action that generates said event.
 
 This is a bit esoteric, but if you read the tests, you will see some of
 the patterns. You can also learn more about our event system in the
-[new feature tutorial](../tutorials/new-feature-tutorial.html#handle-database-interactions).
+[new feature tutorial](../tutorials/new-feature-tutorial.md#handle-database-interactions).
 
 ### Negative tests
 
@@ -480,6 +481,10 @@ Here are some things to consider when writing new tests:
   code and edge cases. It will generate a nice HTML report that you can
   view right from your browser (the tool prints the URL where the report
   is exposed in your development environment).
+
+  The HTML report also displays which tests executed each line, which
+  can be handy for finding existing tests for a code path you're
+  working on.
 
 - **Console output** A properly written test should print nothing to
   the console; use `with self.assertLogs` to capture and verify any

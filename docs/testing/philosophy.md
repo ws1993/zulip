@@ -160,7 +160,7 @@ So, to summarize our approach to integration vs. unit testing:
   HTTP response and the internal state of the server following the request
   are both correct.
 - Following the end-to-end principle in system design, where possible
-  we write tests that execute a complete flow (e.g. registering a new
+  we write tests that execute a complete flow (e.g., registering a new
   Zulip account) rather than testing the implementations of individual
   functions.
 - We invest in the performance of Zulip in part to give users a great
@@ -181,7 +181,7 @@ functions like `access_stream_by_id` that we test carefully, and then
 use linting and other coding conventions to require that all access to
 data from code paths that might share that data with users be mediated
 through those functions. So rather than having each view function do
-it own security checks for whether the user can access a given stream,
+it own security checks for whether the user can access a given channel,
 and needing to test each of those copies of the logic, we only need to
 do that work once for each major type of data structure and level of
 access.
@@ -190,12 +190,12 @@ These `access_*_by_*` functions are written in a special style, with each
 conditional on its own line (so our test coverage tooling helps verify
 that every case is tested), detailed comments, and carefully
 considered error-handling to avoid leaking information such as whether
-the stream ID requested exists or not.
+the channel ID requested exists or not.
 
 We will typically also write tests for a given view verifying that it
 provides the appropriate errors when improper access is attempted, but
 these tests are defense in depth; the main way we prevent invalid
-access to streams is not offering developers a way to get a Stream
+access to channels is not offering developers a way to get a `Stream`
 object in server code except as mediated through these security check
 functions.
 
@@ -214,7 +214,7 @@ test conditions.
 The benefit of this strategy is that you guarantee that the test setup
 only differs as intended: Done well, it helps avoid the otherwise
 extremely common failure mode where a `test_foo_failure` test passes
-for the wrong reason. (E.g. the action fails not because of the
+for the wrong reason. (e.g., the action fails not because of the
 permission check, but because a required HTTP parameter was only added
 to an adjacent `test_foo_success`).
 

@@ -2,12 +2,7 @@
 import configparser
 import os
 import sys
-from typing import Dict, List, Optional
-
-if sys.version_info <= (3, 0):
-    print("Error: Zulip is a Python 3 project, and cannot be run with Python 2.")
-    print("Use e.g. `/path/to/manage.py` not `python /path/to/manage.py`.")
-    sys.exit(1)
+from collections import defaultdict
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
@@ -15,15 +10,14 @@ from scripts.lib.setup_path import setup_path
 
 setup_path()
 
-from collections import defaultdict
-
 from django.core.management import ManagementUtility, get_commands
 from django.core.management.color import color_style
+from typing_extensions import override
 
 from scripts.lib.zulip_tools import assert_not_running_as_root
 
 
-def get_filtered_commands() -> Dict[str, str]:
+def get_filtered_commands() -> dict[str, str]:
     """Because Zulip uses management commands in production, `manage.py
     help` is a form of documentation for users. Here we exclude from
     that documentation built-in commands that are not constructive for
@@ -64,9 +58,8 @@ def get_filtered_commands() -> Dict[str, str]:
     for command, app in all_commands.items():
         if app not in documented_apps:
             continue
-        if app in documented_command_subsets:
-            if command not in documented_command_subsets[app]:
-                continue
+        if app in documented_command_subsets and command not in documented_command_subsets[app]:
+            continue
 
         documented_commands[command] = app
     return documented_commands
@@ -80,6 +73,7 @@ class FilteredManagementUtility(ManagementUtility):
     All other change are just code style differences to pass the Zulip linter.
     """
 
+    @override
     def main_help_text(self, commands_only: bool = False) -> str:
         """Return the script's main help text, as a string."""
         if commands_only:
@@ -91,7 +85,7 @@ class FilteredManagementUtility(ManagementUtility):
                 "",
                 "Available subcommands:",
             ]
-            commands_dict = defaultdict(lambda: [])
+            commands_dict = defaultdict(list)
             for name, app in get_filtered_commands().items():
                 if app == "django.core":
                     app = "django"
@@ -102,8 +96,7 @@ class FilteredManagementUtility(ManagementUtility):
             for app in sorted(commands_dict):
                 usage.append("")
                 usage.append(style.NOTICE(f"[{app}]"))
-                for name in sorted(commands_dict[app]):
-                    usage.append(f"    {name}")
+                usage.extend(f"    {name}" for name in sorted(commands_dict[app]))
             # Output an extra note if settings are not properly configured
             if self.settings_exception is not None:
                 usage.append(
@@ -116,7 +109,7 @@ class FilteredManagementUtility(ManagementUtility):
         return "\n".join(usage)
 
 
-def execute_from_command_line(argv: Optional[List[str]] = None) -> None:
+def execute_from_command_line(argv: list[str] | None = None) -> None:
     """Run a FilteredManagementUtility."""
     utility = FilteredManagementUtility(argv)
     utility.execute()

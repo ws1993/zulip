@@ -1,4 +1,6 @@
-from typing import Any, Dict, List
+from typing import Any
+
+from zerver.data_import.import_util import validate_user_emails_for_import
 
 
 class UserHandler:
@@ -12,16 +14,20 @@ class UserHandler:
     """
 
     def __init__(self) -> None:
-        self.id_to_user_map: Dict[int, Dict[str, Any]] = {}
+        self.id_to_user_map: dict[int, dict[str, Any]] = {}
 
-    def add_user(self, user: Dict[str, Any]) -> None:
+    def add_user(self, user: dict[str, Any]) -> None:
         user_id = user["id"]
         self.id_to_user_map[user_id] = user
 
-    def get_user(self, user_id: int) -> Dict[str, Any]:
+    def get_user(self, user_id: int) -> dict[str, Any]:
         user = self.id_to_user_map[user_id]
         return user
 
-    def get_all_users(self) -> List[Dict[str, Any]]:
+    def get_all_users(self) -> list[dict[str, Any]]:
         users = list(self.id_to_user_map.values())
         return users
+
+    def validate_user_emails(self) -> None:
+        all_users = self.get_all_users()
+        validate_user_emails_for_import([user["delivery_email"] for user in all_users])

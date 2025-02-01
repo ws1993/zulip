@@ -7,17 +7,22 @@ from django.conf import settings
 from django.core.mail import mail_admins, mail_managers, send_mail
 from django.core.management import CommandError
 from django.core.management.commands import sendtestemail
+from typing_extensions import override
 
-from zerver.lib.send_email import FromAddress
+from zerver.lib.send_email import FromAddress, log_email_config_errors
 
 
 class Command(sendtestemail.Command):
+    @override
     def handle(self, *args: Any, **kwargs: str) -> None:
         if settings.WARN_NO_EMAIL:
             raise CommandError(
                 "Outgoing email not yet configured, see\n  "
                 "https://zulip.readthedocs.io/en/latest/production/email.html"
             )
+
+        log_email_config_errors()
+
         if len(kwargs["email"]) == 0:
             raise CommandError(
                 "Usage: /home/zulip/deployments/current/manage.py "

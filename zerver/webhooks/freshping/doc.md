@@ -1,18 +1,28 @@
+# Zulip Freshping integration
+
 Receive Freshping notifications in Zulip!
 
-1. {!create-stream.md!}
+{start_tabs}
 
-1. {!create-bot-construct-url-indented.md!}
+1. {!create-an-incoming-webhook.md!}
 
-1. Go to your **Freshping** dashboard and click **Settings**.
-   Click **Integrations** and then click **Create Integration**
-   under **Webhooks**.
+1. {!generate-webhook-url-basic.md!}
 
-1. Set **Domain URL** to the URL create above. Click **Create**.
+1. Go to your **Freshping** dashboard, and select **Settings**. Click
+   **Integrations**, and select **Create Integration** under **Webhooks**.
 
-1. You can test the webhook by clicking **Test** to ensure it is
-   configured correctly.
+1. Set **Domain URL** to the URL generated above, and click **Create**.
+   Once you've created the webhook, you can see if it's configured
+   correctly by clicking **Test**.
+
+{end_tabs}
 
 {!congrats.md!}
 
 ![](/static/images/integrations/freshping/001.png)
+
+{!event-filtering-additional-feature.md!}
+
+### Related documentation
+
+{!webhooks-url-specification.md!}

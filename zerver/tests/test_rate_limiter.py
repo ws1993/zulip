@@ -1,7 +1,9 @@
 import secrets
 import time
-from typing import Dict, List, Tuple, Type
+from abc import ABC, abstractmethod
 from unittest import mock
+
+from typing_extensions import override
 
 from zerver.lib.rate_limiter import (
     RateLimitedIPAddr,
@@ -10,37 +12,40 @@ from zerver.lib.rate_limiter import (
     RateLimiterBackend,
     RedisRateLimiterBackend,
     TornadoInMemoryRateLimiterBackend,
-    add_ratelimit_rule,
-    remove_ratelimit_rule,
 )
 from zerver.lib.test_classes import ZulipTestCase
+from zerver.lib.test_helpers import ratelimit_rule
 
 RANDOM_KEY_PREFIX = secrets.token_hex(16)
 
 
 class RateLimitedTestObject(RateLimitedObject):
     def __init__(
-        self, name: str, rules: List[Tuple[int, int]], backend: Type[RateLimiterBackend]
+        self, name: str, rules: list[tuple[int, int]], backend: type[RateLimiterBackend]
     ) -> None:
         self.name = name
         self._rules = rules
         self._rules.sort(key=lambda x: x[0])
         super().__init__(backend)
 
+    @override
     def key(self) -> str:
         return RANDOM_KEY_PREFIX + self.name
 
-    def rules(self) -> List[Tuple[int, int]]:
+    @override
+    def rules(self) -> list[tuple[int, int]]:
         return self._rules
 
 
-class RateLimiterBackendBase(ZulipTestCase):
-    __unittest_skip__ = True
+class RateLimiterBackendBase(ZulipTestCase, ABC):
+    backend: type[RateLimiterBackend]
 
+    @override
     def setUp(self) -> None:
-        self.requests_record: Dict[str, List[float]] = {}
+        super().setUp()
+        self.requests_record: dict[str, list[float]] = {}
 
-    def create_object(self, name: str, rules: List[Tuple[int, int]]) -> RateLimitedTestObject:
+    def create_object(self, name: str, rules: list[tuple[int, int]]) -> RateLimitedTestObject:
         obj = RateLimitedTestObject(name, rules, self.backend)
         obj.clear_history()
 
@@ -74,7 +79,7 @@ class RateLimiterBackendBase(ZulipTestCase):
         self.assertEqual(expected_calls_remaining, calls_remaining)
         self.assertEqual(expected_time_till_reset, time_till_reset)
 
-    def expected_api_calls_left(self, obj: RateLimitedTestObject, now: float) -> Tuple[int, float]:
+    def expected_api_calls_left(self, obj: RateLimitedTestObject, now: float) -> tuple[int, float]:
         longest_rule = obj.get_rules()[-1]
         max_window, max_calls = longest_rule
         history = self.requests_record.get(obj.key())
@@ -84,41 +89,42 @@ class RateLimiterBackendBase(ZulipTestCase):
 
         return self.api_calls_left_from_history(history, max_window, max_calls, now)
 
+    @abstractmethod
     def api_calls_left_from_history(
-        self, history: List[float], max_window: int, max_calls: int, now: float
-    ) -> Tuple[int, float]:
+        self, history: list[float], max_window: int, max_calls: int, now: float
+    ) -> tuple[int, float]:
         """
         This depends on the algorithm used in the backend, and should be defined by the test class.
         """
-        raise NotImplementedError()
+        raise NotImplementedError
 
     def test_hit_ratelimits(self) -> None:
         obj = self.create_object("test", [(2, 3)])
 
         start_time = time.time()
         for i in range(3):
-            with mock.patch("time.time", return_value=(start_time + i * 0.1)):
+            with mock.patch("time.time", return_value=start_time + i * 0.1):
                 self.make_request(obj, expect_ratelimited=False)
 
-        with mock.patch("time.time", return_value=(start_time + 0.4)):
+        with mock.patch("time.time", return_value=start_time + 0.4):
             self.make_request(obj, expect_ratelimited=True)
 
-        with mock.patch("time.time", return_value=(start_time + 2.01)):
+        with mock.patch("time.time", return_value=start_time + 2.01):
             self.make_request(obj, expect_ratelimited=False)
 
     def test_clear_history(self) -> None:
         obj = self.create_object("test", [(2, 3)])
         start_time = time.time()
         for i in range(3):
-            with mock.patch("time.time", return_value=(start_time + i * 0.1)):
+            with mock.patch("time.time", return_value=start_time + i * 0.1):
                 self.make_request(obj, expect_ratelimited=False)
-        with mock.patch("time.time", return_value=(start_time + 0.4)):
+        with mock.patch("time.time", return_value=start_time + 0.4):
             self.make_request(obj, expect_ratelimited=True)
 
         obj.clear_history()
         self.requests_record[obj.key()] = []
         for i in range(3):
-            with mock.patch("time.time", return_value=(start_time + i * 0.1)):
+            with mock.patch("time.time", return_value=start_time + i * 0.1):
                 self.make_request(obj, expect_ratelimited=False)
 
     def test_block_unblock_access(self) -> None:
@@ -126,11 +132,11 @@ class RateLimiterBackendBase(ZulipTestCase):
         start_time = time.time()
 
         obj.block_access(1)
-        with mock.patch("time.time", return_value=(start_time)):
+        with mock.patch("time.time", return_value=start_time):
             self.make_request(obj, expect_ratelimited=True, verify_api_calls_left=False)
 
         obj.unblock_access()
-        with mock.patch("time.time", return_value=(start_time)):
+        with mock.patch("time.time", return_value=start_time):
             self.make_request(obj, expect_ratelimited=False, verify_api_calls_left=False)
 
     def test_api_calls_left(self) -> None:
@@ -138,27 +144,27 @@ class RateLimiterBackendBase(ZulipTestCase):
         start_time = time.time()
 
         # Check the edge case when no requests have been made yet.
-        with mock.patch("time.time", return_value=(start_time)):
+        with mock.patch("time.time", return_value=start_time):
             self.verify_api_calls_left(obj)
 
-        with mock.patch("time.time", return_value=(start_time)):
+        with mock.patch("time.time", return_value=start_time):
             self.make_request(obj)
 
         # Check the correct default values again, after the reset has happened on the first rule,
         # but not the other.
-        with mock.patch("time.time", return_value=(start_time + 2.1)):
+        with mock.patch("time.time", return_value=start_time + 2.1):
             self.make_request(obj)
 
 
 class RedisRateLimiterBackendTest(RateLimiterBackendBase):
-    __unittest_skip__ = False
     backend = RedisRateLimiterBackend
 
+    @override
     def api_calls_left_from_history(
-        self, history: List[float], max_window: int, max_calls: int, now: float
-    ) -> Tuple[int, float]:
+        self, history: list[float], max_window: int, max_calls: int, now: float
+    ) -> tuple[int, float]:
         latest_timestamp = history[-1]
-        relevant_requests = [t for t in history if (t >= now - max_window)]
+        relevant_requests = [t for t in history if t >= now - max_window]
         relevant_requests_amount = len(relevant_requests)
 
         return max_calls - relevant_requests_amount, latest_timestamp + max_window - now
@@ -177,12 +183,12 @@ class RedisRateLimiterBackendTest(RateLimiterBackendBase):
 
 
 class TornadoInMemoryRateLimiterBackendTest(RateLimiterBackendBase):
-    __unittest_skip__ = False
     backend = TornadoInMemoryRateLimiterBackend
 
+    @override
     def api_calls_left_from_history(
-        self, history: List[float], max_window: int, max_calls: int, now: float
-    ) -> Tuple[int, float]:
+        self, history: list[float], max_window: int, max_calls: int, now: float
+    ) -> tuple[int, float]:
         reset_time = 0.0
         for timestamp in history:
             reset_time = max(reset_time, timestamp) + (max_window / max_calls)
@@ -212,10 +218,10 @@ class TornadoInMemoryRateLimiterBackendTest(RateLimiterBackendBase):
         start_time = time.time()
 
         obj.block_access(1)
-        with mock.patch("time.time", return_value=(start_time)):
+        with mock.patch("time.time", return_value=start_time):
             self.make_request(obj, expect_ratelimited=True, verify_api_calls_left=False)
 
-        with mock.patch("time.time", return_value=(start_time + 1.01)):
+        with mock.patch("time.time", return_value=start_time + 1.01):
             self.make_request(obj, expect_ratelimited=False, verify_api_calls_left=False)
 
 
@@ -227,20 +233,22 @@ class RateLimitedObjectsTest(ZulipTestCase):
 
         self.assertEqual(obj.get_rules(), [(1, 3), (2, 4)])
 
-    def test_add_remove_rule(self) -> None:
+    def test_ratelimit_rule(self) -> None:
         user_profile = self.example_user("hamlet")
-        add_ratelimit_rule(1, 2)
-        add_ratelimit_rule(4, 5, domain="some_new_domain")
-        add_ratelimit_rule(10, 100, domain="some_new_domain")
-        obj = RateLimitedUser(user_profile)
+        with ratelimit_rule(1, 2), ratelimit_rule(4, 5, domain="some_new_domain"):
+            with ratelimit_rule(10, 100, domain="some_new_domain"):
+                obj = RateLimitedUser(user_profile)
 
-        self.assertEqual(obj.get_rules(), [(1, 2)])
-        obj.domain = "some_new_domain"
-        self.assertEqual(obj.get_rules(), [(4, 5), (10, 100)])
+                self.assertEqual(obj.get_rules(), [(1, 2)])
+                obj.domain = "some_new_domain"
+                self.assertEqual(obj.get_rules(), [(4, 5), (10, 100)])
 
-        remove_ratelimit_rule(10, 100, domain="some_new_domain")
-        self.assertEqual(obj.get_rules(), [(4, 5)])
+            self.assertEqual(obj.get_rules(), [(4, 5)])
 
     def test_empty_rules_edge_case(self) -> None:
         obj = RateLimitedTestObject("test", rules=[], backend=RedisRateLimiterBackend)
         self.assertEqual(obj.get_rules(), [(1, 9999)])
+
+
+# Don't load the base class as a test: https://bugs.python.org/issue17519.
+del RateLimiterBackendBase

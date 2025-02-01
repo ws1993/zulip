@@ -1,12 +1,14 @@
 from django.conf import settings
+from typing_extensions import override
 
-from zerver.lib.actions import internal_send_private_message
+from zerver.actions.message_send import internal_send_private_message
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import message_stream_count, most_recent_message
-from zerver.models import UserProfile, get_system_bot
+from zerver.models.users import get_system_bot
 
 
 class TutorialTests(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         # This emulates the welcome message sent by the welcome bot to hamlet@zulip.com
@@ -15,22 +17,15 @@ class TutorialTests(ZulipTestCase):
         user = self.example_user("hamlet")
         welcome_bot = get_system_bot(settings.WELCOME_BOT, user.realm_id)
         content = "Shortened welcome message."
-        internal_send_private_message(welcome_bot, user, content)
-
-    def test_tutorial_status(self) -> None:
-        user = self.example_user("hamlet")
-        self.login_user(user)
-
-        cases = [
-            ("started", UserProfile.TUTORIAL_STARTED),
-            ("finished", UserProfile.TUTORIAL_FINISHED),
-        ]
-        for incoming_status, expected_db_status in cases:
-            params = dict(status=incoming_status)
-            result = self.client_post("/json/users/me/tutorial_status", params)
-            self.assert_json_success(result)
-            user = self.example_user("hamlet")
-            self.assertEqual(user.tutorial_status, expected_db_status)
+        internal_send_private_message(
+            welcome_bot,
+            user,
+            content,
+            # disable_external_notifications set to False will still lead
+            # the tests to pass. Setting this to True, because we contextually
+            # set this to true for welcome_bot in the codebase.
+            disable_external_notifications=True,
+        )
 
     def test_response_to_pm_for_app(self) -> None:
         user = self.example_user("hamlet")
@@ -40,7 +35,7 @@ class TutorialTests(ZulipTestCase):
         for content in messages:
             self.send_personal_message(user, bot, content)
             expected_response = (
-                "You can [download](/apps) the [mobile and desktop apps](/apps). "
+                "You can [download](/apps/) the [mobile and desktop apps](/apps/). "
                 "Zulip also works great in a browser."
             )
             self.assertEqual(most_recent_message(user).content, expected_response)
@@ -67,10 +62,10 @@ class TutorialTests(ZulipTestCase):
         for content in messages:
             self.send_personal_message(user, bot, content)
             expected_response = (
-                "Go to [Display settings](#settings/display-settings) "
-                "to [switch between the light and dark themes](/help/dark-theme), "
-                "[pick your favorite emoji theme](/help/emoji-and-emoticons#change-your-emoji-set), "
-                "[change your language](/help/change-your-language), and make other tweaks to your Zulip experience."
+                "You can switch between [light and dark theme](/help/dark-theme), "
+                "[pick your favorite emoji set](/help/emoji-and-emoticons#change-your-emoji-set), "
+                "[change your language](/help/change-your-language), and otherwise customize "
+                "your Zulip experience in your [Preferences](#settings/preferences)."
             )
             self.assertEqual(most_recent_message(user).content, expected_response)
 
@@ -82,9 +77,9 @@ class TutorialTests(ZulipTestCase):
         for content in messages:
             self.send_personal_message(user, bot, content)
             expected_response = (
-                "In Zulip, streams [determine who gets a message](/help/streams-and-topics). "
-                "They are similar to channels in other chat apps.\n\n"
-                "[Browse and subscribe to streams](#streams/all)."
+                "Channels organize conversations based on who needs to see them. "
+                "For example, it's common to have a channel for each team in an organization.\n\n"
+                "[Browse and subscribe to channels](#channels/all)."
             )
             self.assertEqual(most_recent_message(user).content, expected_response)
 
@@ -96,10 +91,12 @@ class TutorialTests(ZulipTestCase):
         for content in messages:
             self.send_personal_message(user, bot, content)
             expected_response = (
-                "In Zulip, topics [tell you what a message is about](/help/streams-and-topics). "
-                "They are light-weight subjects, very similar to the subject line of an email.\n\n"
-                "Check out [Recent topics](#recent_topics) to see what's happening! "
-                'You can return to this conversation by clicking "Private messages" in the upper left.'
+                "[Topics](/help/introduction-to-topics) summarize what each conversation in Zulip "
+                "is about. You can read Zulip one topic at a time, seeing each message in context, "
+                "no matter how many other conversations are going on.\n\n"
+                "When you start a conversation, label it with a new topic. For a good topic name, "
+                "think about finishing the sentence: “Hey, can we chat about…?”\n\n"
+                "Check out [Recent conversations](#recent) for a list of topics that are being discussed."
             )
             self.assertEqual(most_recent_message(user).content, expected_response)
 
@@ -125,11 +122,10 @@ class TutorialTests(ZulipTestCase):
         for content in messages:
             self.send_personal_message(user, bot, content)
             expected_response = (
-                "Zulip uses [Markdown](/help/format-your-message-using-markdown), "
-                "an intuitive format for **bold**, *italics*, bulleted lists, and more. "
-                "Click [here](#message-formatting) for a cheat sheet.\n\n"
-                "Check out our [messaging tips](/help/messaging-tips) to learn about emoji reactions, "
-                "code blocks and much more!"
+                "You can **format** *your* `message` using the handy formatting "
+                "buttons, or by typing your formatting with Markdown.\n\n"
+                "Check out the [cheat sheet](#message-formatting) to learn about "
+                "spoilers, global times, and more."
             )
             self.assertEqual(most_recent_message(user).content, expected_response)
 
@@ -143,7 +139,7 @@ class TutorialTests(ZulipTestCase):
             expected_response = (
                 "Here are a few messages I understand: "
                 "`apps`, `profile`, `theme`, "
-                "`streams`, `topics`, `message formatting`, `keyboard shortcuts`.\n\n"
+                "`channels`, `topics`, `message formatting`, `keyboard shortcuts`.\n\n"
                 "Check out our [Getting started guide](/help/getting-started-with-zulip), "
                 "or browse the [Help center](/help/) to learn more!"
             )
@@ -154,14 +150,27 @@ class TutorialTests(ZulipTestCase):
         bot = get_system_bot(settings.WELCOME_BOT, user.realm_id)
         messages = ["Hello", "HAHAHA", "OKOK", "LalulaLapas"]
         self.login_user(user)
+        # First undefined message sent.
+        self.send_personal_message(user, bot, "Hello")
+        expected_response = (
+            "You can chat with me as much as you like! To get help, try one of the following messages: "
+            "`apps`, `profile`, `theme`, `channels`, "
+            "`topics`, `message formatting`, `keyboard shortcuts`, `help`."
+        )
+        self.assertEqual(most_recent_message(user).content, expected_response)
+
+        # For future undefined messages, welcome bot won't send a reply.
         for content in messages:
             self.send_personal_message(user, bot, content)
-            expected_response = (
-                "I’m sorry, I did not understand your message. Please try one of the following commands: "
-                "`apps`, `profile`, `theme`, `streams`, "
-                "`topics`, `message formatting`, `keyboard shortcuts`, `help`."
-            )
-            self.assertEqual(most_recent_message(user).content, expected_response)
+            self.assertEqual(most_recent_message(user).content, content)
+
+        # Check if Welcome bot still replies for bot commands
+        self.send_personal_message(user, bot, "apps")
+        expected_response = (
+            "You can [download](/apps/) the [mobile and desktop apps](/apps/). "
+            "Zulip also works great in a browser."
+        )
+        self.assertEqual(most_recent_message(user).content, expected_response)
 
     def test_no_response_to_group_pm(self) -> None:
         user1 = self.example_user("hamlet")
@@ -169,9 +178,10 @@ class TutorialTests(ZulipTestCase):
         bot = get_system_bot(settings.WELCOME_BOT, user1.realm_id)
         content = "whatever"
         self.login_user(user1)
-        self.send_huddle_message(user1, [bot, user2], content)
+        self.send_group_direct_message(user1, [bot, user2], content)
         user1_messages = message_stream_count(user1)
         self.assertEqual(most_recent_message(user1).content, content)
-        # Welcome bot should still respond to initial PM after group PM.
+        # Welcome bot should still respond to initial direct message
+        # after group direct message.
         self.send_personal_message(user1, bot, content)
         self.assertEqual(message_stream_count(user1), user1_messages + 2)

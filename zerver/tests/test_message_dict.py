@@ -1,28 +1,21 @@
-from typing import Any, Dict, List, Union
+from typing import Any
 from unittest import mock
 
 from django.utils.timezone import now as timezone_now
 
 from zerver.lib.cache import cache_delete, to_dict_cache_key_id
+from zerver.lib.display_recipient import get_display_recipient
 from zerver.lib.markdown import version as markdown_version
-from zerver.lib.message import MessageDict, messages_for_ids, sew_messages_and_reactions
+from zerver.lib.message import messages_for_ids
+from zerver.lib.message_cache import MessageDict, sew_messages_and_reactions
+from zerver.lib.per_request_cache import flush_per_request_caches
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.test_helpers import make_client, queries_captured
+from zerver.lib.test_helpers import make_client
 from zerver.lib.topic import TOPIC_LINKS
 from zerver.lib.types import DisplayRecipientT, UserDisplayRecipient
-from zerver.models import (
-    Message,
-    Reaction,
-    Realm,
-    RealmFilter,
-    Recipient,
-    Stream,
-    UserProfile,
-    flush_per_request_caches,
-    get_display_recipient,
-    get_realm,
-    get_stream,
-)
+from zerver.models import Message, Reaction, Realm, RealmFilter, Recipient, Stream, UserProfile
+from zerver.models.realms import get_realm
+from zerver.models.streams import get_stream
 
 
 class MessageDictTest(ZulipTestCase):
@@ -78,8 +71,8 @@ class MessageDictTest(ZulipTestCase):
             return msg
 
         def get_send_message_payload(
-            msg_id: int, apply_markdown: bool, client_gravatar: bool
-        ) -> Dict[str, Any]:
+            msg_id: int, *, apply_markdown: bool, client_gravatar: bool
+        ) -> dict[str, Any]:
             msg = reload_message(msg_id)
             wide_dict = MessageDict.wide_dict(msg)
 
@@ -87,20 +80,27 @@ class MessageDictTest(ZulipTestCase):
                 wide_dict,
                 apply_markdown=apply_markdown,
                 client_gravatar=client_gravatar,
+                allow_empty_topic_name=True,
+                can_access_sender=True,
+                realm_host=get_realm("zulip").host,
+                is_incoming_1_to_1=False,
             )
             return narrow_dict
 
         def get_fetch_payload(
-            msg_id: int, apply_markdown: bool, client_gravatar: bool
-        ) -> Dict[str, Any]:
+            msg_id: int, *, apply_markdown: bool, client_gravatar: bool
+        ) -> dict[str, Any]:
             msg = reload_message(msg_id)
-            unhydrated_dict = MessageDict.to_dict_uncached_helper([msg])[0]
+            unhydrated_dict = MessageDict.messages_to_encoded_cache_helper([msg])[0]
             # The next step mutates the dict in place
             # for performance reasons.
             MessageDict.post_process_dicts(
                 [unhydrated_dict],
                 apply_markdown=apply_markdown,
                 client_gravatar=client_gravatar,
+                allow_empty_topic_name=True,
+                realm=get_realm("zulip"),
+                user_recipient_id=None,
             )
             final_dict = unhydrated_dict
             return final_dict
@@ -125,7 +125,7 @@ class MessageDictTest(ZulipTestCase):
 
         msg_id = test_message_id()
 
-        for (apply_markdown, client_gravatar) in flag_setups:
+        for apply_markdown, client_gravatar in flag_setups:
             send_message_payload = get_send_message_payload(
                 msg_id,
                 apply_markdown=apply_markdown,
@@ -143,6 +143,7 @@ class MessageDictTest(ZulipTestCase):
     def test_bulk_message_fetching(self) -> None:
         sender = self.example_user("othello")
         receiver = self.example_user("hamlet")
+        realm = get_realm("zulip")
         pm_recipient = Recipient.objects.get(type_id=receiver.id, type=Recipient.PERSONAL)
         stream_name = "Çiğdem"
         stream = self.make_stream(stream_name)
@@ -155,6 +156,7 @@ class MessageDictTest(ZulipTestCase):
                 message = Message(
                     sender=sender,
                     recipient=recipient,
+                    realm=realm,
                     content=f"whatever {i}",
                     rendered_content="DOES NOT MATTER",
                     rendered_content_version=markdown_version,
@@ -174,15 +176,18 @@ class MessageDictTest(ZulipTestCase):
         num_ids = len(ids)
         self.assertTrue(num_ids >= 600)
 
-        flush_per_request_caches()
-        with queries_captured() as queries:
-            rows = list(MessageDict.get_raw_db_rows(ids))
+        with self.assert_database_query_count(7):
+            objs = MessageDict.ids_to_dict(ids)
+            MessageDict.post_process_dicts(
+                objs,
+                apply_markdown=False,
+                client_gravatar=False,
+                allow_empty_topic_name=True,
+                realm=realm,
+                user_recipient_id=None,
+            )
 
-            objs = [MessageDict.build_dict_from_raw_db_row(row) for row in rows]
-            MessageDict.post_process_dicts(objs, apply_markdown=False, client_gravatar=False)
-
-        self.assert_length(queries, 7)
-        self.assert_length(rows, num_ids)
+        self.assert_length(objs, num_ids)
 
     def test_applying_markdown(self) -> None:
         sender = self.example_user("othello")
@@ -192,6 +197,7 @@ class MessageDictTest(ZulipTestCase):
         message = Message(
             sender=sender,
             recipient=recipient,
+            realm=receiver.realm,
             content="hello **world**",
             date_sent=timezone_now(),
             sending_client=sending_client,
@@ -203,15 +209,14 @@ class MessageDictTest(ZulipTestCase):
 
         # An important part of this test is to get the message through this exact code path,
         # because there is an ugly hack we need to cover.  So don't just say "row = message".
-        row = MessageDict.get_raw_db_rows([message.id])[0]
-        dct = MessageDict.build_dict_from_raw_db_row(row)
+        dct = MessageDict.ids_to_dict([message.id])[0]
         expected_content = "<p>hello <strong>world</strong></p>"
         self.assertEqual(dct["rendered_content"], expected_content)
         message = Message.objects.get(id=message.id)
         self.assertEqual(message.rendered_content, expected_content)
         self.assertEqual(message.rendered_content_version, markdown_version)
 
-    @mock.patch("zerver.lib.message.markdown_convert")
+    @mock.patch("zerver.lib.message_cache.render_message_markdown")
     def test_applying_markdown_invalid_format(self, convert_mock: Any) -> None:
         # pretend the converter returned an invalid message without raising an exception
         convert_mock.return_value = None
@@ -222,6 +227,7 @@ class MessageDictTest(ZulipTestCase):
         message = Message(
             sender=sender,
             recipient=recipient,
+            realm=receiver.realm,
             content="hello **world**",
             date_sent=timezone_now(),
             sending_client=sending_client,
@@ -233,8 +239,7 @@ class MessageDictTest(ZulipTestCase):
 
         # An important part of this test is to get the message through this exact code path,
         # because there is an ugly hack we need to cover.  So don't just say "row = message".
-        row = MessageDict.get_raw_db_rows([message.id])[0]
-        dct = MessageDict.build_dict_from_raw_db_row(row)
+        dct = MessageDict.ids_to_dict([message.id])[0]
         error_content = (
             "<p>[Zulip note: Sorry, we could not understand the formatting of your message]</p>"
         )
@@ -246,16 +251,16 @@ class MessageDictTest(ZulipTestCase):
         # and not linkified when sent to a stream in 'lear'.
         zulip_realm = get_realm("zulip")
         lear_realm = get_realm("lear")
-        url_format_string = r"https://trac.example.com/ticket/%(id)s"
+        url_template = r"https://trac.example.com/ticket/{id}"
         links = {"url": "https://trac.example.com/ticket/123", "text": "#123"}
         topic_name = "test #123"
 
         linkifier = RealmFilter(
-            realm=zulip_realm, pattern=r"#(?P<id>[0-9]{2,8})", url_format_string=url_format_string
+            realm=zulip_realm, pattern=r"#(?P<id>[0-9]{2,8})", url_template=url_template
         )
         self.assertEqual(
-            linkifier.__str__(),
-            "<RealmFilter(zulip): #(?P<id>[0-9]{2,8}) https://trac.example.com/ticket/%(id)s>",
+            repr(linkifier),
+            "<RealmFilter: zulip: #(?P<id>[0-9]{2,8}) https://trac.example.com/ticket/{id}>",
         )
 
         def get_message(sender: UserProfile, realm: Realm) -> Message:
@@ -266,8 +271,8 @@ class MessageDictTest(ZulipTestCase):
             msg_id = self.send_stream_message(sender, "Denmark", "hello world", topic_name, realm)
             return Message.objects.get(id=msg_id)
 
-        def assert_topic_links(links: List[Dict[str, str]], msg: Message) -> None:
-            dct = MessageDict.to_dict_uncached_helper([msg])[0]
+        def assert_topic_links(links: list[dict[str, str]], msg: Message) -> None:
+            dct = MessageDict.messages_to_encoded_cache_helper([msg])[0]
             self.assertEqual(dct[TOPIC_LINKS], links)
 
         # Send messages before and after saving the realm filter from each user.
@@ -287,6 +292,7 @@ class MessageDictTest(ZulipTestCase):
         message = Message(
             sender=sender,
             recipient=recipient,
+            realm=receiver.realm,
             content="hello **world**",
             date_sent=timezone_now(),
             sending_client=sending_client,
@@ -299,13 +305,9 @@ class MessageDictTest(ZulipTestCase):
         reaction = Reaction.objects.create(
             message=message, user_profile=sender, emoji_name="simple_smile"
         )
-        row = MessageDict.get_raw_db_rows([message.id])[0]
-        msg_dict = MessageDict.build_dict_from_raw_db_row(row)
+        msg_dict = MessageDict.ids_to_dict([message.id])[0]
         self.assertEqual(msg_dict["reactions"][0]["emoji_name"], reaction.emoji_name)
         self.assertEqual(msg_dict["reactions"][0]["user_id"], sender.id)
-        self.assertEqual(msg_dict["reactions"][0]["user"]["id"], sender.id)
-        self.assertEqual(msg_dict["reactions"][0]["user"]["email"], sender.email)
-        self.assertEqual(msg_dict["reactions"][0]["user"]["full_name"], sender.full_name)
 
     def test_missing_anchor(self) -> None:
         self.login("hamlet")
@@ -354,7 +356,7 @@ class MessageHydrationTest(ZulipTestCase):
 
     def test_hydrate_pm_recipient_info(self) -> None:
         cordelia = self.example_user("cordelia")
-        display_recipient: List[UserDisplayRecipient] = [
+        display_recipient: list[UserDisplayRecipient] = [
             dict(
                 email="aaron@example.com",
                 full_name="Aaron Smith",
@@ -418,7 +420,10 @@ class MessageHydrationTest(ZulipTestCase):
             search_fields={},
             apply_markdown=True,
             client_gravatar=True,
+            allow_empty_topic_name=True,
             allow_edit_history=False,
+            user_profile=cordelia,
+            realm=cordelia.realm,
         )
 
         self.assert_length(messages, 2)
@@ -435,6 +440,47 @@ class MessageHydrationTest(ZulipTestCase):
         self.assertIn('class="user-mention"', new_message["content"])
         self.assertEqual(new_message["flags"], ["mentioned"])
 
+    def test_message_for_ids_for_restricted_user_access(self) -> None:
+        self.set_up_db_for_testing_user_access()
+        hamlet = self.example_user("hamlet")
+        self.send_stream_message(
+            hamlet,
+            "test_stream1",
+            topic_name="test",
+            content="test message again",
+        )
+        realm = get_realm("zulip")
+        stream = get_stream("test_stream1", realm)
+
+        assert stream.recipient_id is not None
+        message_ids = Message.objects.filter(
+            recipient_id=stream.recipient_id, realm=realm
+        ).values_list("id", flat=True)
+        self.assert_length(message_ids, 2)
+
+        user_message_flags = {
+            message_ids[0]: ["read", "historical"],
+            message_ids[1]: ["read"],
+        }
+
+        messages = messages_for_ids(
+            message_ids=list(message_ids),
+            user_message_flags=user_message_flags,
+            search_fields={},
+            apply_markdown=True,
+            client_gravatar=True,
+            allow_empty_topic_name=True,
+            allow_edit_history=False,
+            user_profile=self.example_user("polonius"),
+            realm=realm,
+        )
+        (inaccessible_sender_msg,) = (msg for msg in messages if msg["sender_id"] != hamlet.id)
+        self.assertEqual(inaccessible_sender_msg["sender_id"], self.example_user("othello").id)
+        self.assertEqual(inaccessible_sender_msg["sender_full_name"], "Unknown user")
+        self.assertTrue(
+            inaccessible_sender_msg["avatar_url"].endswith("images/unknown-user-avatar.png")
+        )
+
     def test_display_recipient_up_to_date(self) -> None:
         """
         This is a test for a bug where due to caching of message_dicts,
@@ -450,6 +496,7 @@ class MessageHydrationTest(ZulipTestCase):
 
         cordelia_recipient = cordelia.recipient
         # Cause the display_recipient to get cached:
+        assert cordelia_recipient is not None
         get_display_recipient(cordelia_recipient)
 
         # Change cordelia's email:
@@ -468,7 +515,10 @@ class MessageHydrationTest(ZulipTestCase):
             search_fields={},
             apply_markdown=True,
             client_gravatar=True,
+            allow_empty_topic_name=True,
             allow_edit_history=False,
+            user_profile=cordelia,
+            realm=cordelia.realm,
         )
         message = messages[0]
 
@@ -485,20 +535,16 @@ class TestMessageForIdsDisplayRecipientFetching(ZulipTestCase):
     def _verify_display_recipient(
         self,
         display_recipient: DisplayRecipientT,
-        expected_recipient_objects: Union[Stream, List[UserProfile]],
+        expected_recipient_objects: list[UserProfile],
     ) -> None:
-        if isinstance(expected_recipient_objects, Stream):
-            self.assertEqual(display_recipient, expected_recipient_objects.name)
-
-        else:
-            for user_profile in expected_recipient_objects:
-                recipient_dict: UserDisplayRecipient = {
-                    "email": user_profile.email,
-                    "full_name": user_profile.full_name,
-                    "id": user_profile.id,
-                    "is_mirror_dummy": user_profile.is_mirror_dummy,
-                }
-                self.assertTrue(recipient_dict in display_recipient)
+        for user_profile in expected_recipient_objects:
+            recipient_dict: UserDisplayRecipient = {
+                "email": user_profile.email,
+                "full_name": user_profile.full_name,
+                "id": user_profile.id,
+                "is_mirror_dummy": user_profile.is_mirror_dummy,
+            }
+            self.assertTrue(recipient_dict in display_recipient)
 
     def test_display_recipient_personal(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -515,7 +561,10 @@ class TestMessageForIdsDisplayRecipientFetching(ZulipTestCase):
             search_fields={},
             apply_markdown=True,
             client_gravatar=True,
+            allow_empty_topic_name=True,
             allow_edit_history=False,
+            user_profile=cordelia,
+            realm=cordelia.realm,
         )
 
         self._verify_display_recipient(messages[0]["display_recipient"], [hamlet, cordelia])
@@ -536,24 +585,23 @@ class TestMessageForIdsDisplayRecipientFetching(ZulipTestCase):
             search_fields={},
             apply_markdown=True,
             client_gravatar=True,
+            allow_empty_topic_name=True,
             allow_edit_history=False,
+            user_profile=cordelia,
+            realm=cordelia.realm,
         )
 
-        self._verify_display_recipient(
-            messages[0]["display_recipient"], get_stream("Verona", cordelia.realm)
-        )
-        self._verify_display_recipient(
-            messages[1]["display_recipient"], get_stream("Denmark", cordelia.realm)
-        )
+        self.assertEqual(messages[0]["display_recipient"], "Verona")
+        self.assertEqual(messages[1]["display_recipient"], "Denmark")
 
-    def test_display_recipient_huddle(self) -> None:
+    def test_display_recipient_direct_message_group(self) -> None:
         hamlet = self.example_user("hamlet")
         cordelia = self.example_user("cordelia")
         othello = self.example_user("othello")
         iago = self.example_user("iago")
         message_ids = [
-            self.send_huddle_message(hamlet, [cordelia, othello], "test"),
-            self.send_huddle_message(cordelia, [hamlet, othello, iago], "test"),
+            self.send_group_direct_message(hamlet, [cordelia, othello], "test"),
+            self.send_group_direct_message(cordelia, [hamlet, othello, iago], "test"),
         ]
 
         messages = messages_for_ids(
@@ -562,7 +610,10 @@ class TestMessageForIdsDisplayRecipientFetching(ZulipTestCase):
             search_fields={},
             apply_markdown=True,
             client_gravatar=True,
+            allow_empty_topic_name=True,
             allow_edit_history=False,
+            user_profile=cordelia,
+            realm=cordelia.realm,
         )
 
         self._verify_display_recipient(
@@ -582,11 +633,11 @@ class TestMessageForIdsDisplayRecipientFetching(ZulipTestCase):
         self.subscribe(hamlet, "Scotland")
 
         message_ids = [
-            self.send_huddle_message(hamlet, [cordelia, othello], "test"),
+            self.send_group_direct_message(hamlet, [cordelia, othello], "test"),
             self.send_stream_message(cordelia, "Verona", content="test"),
             self.send_personal_message(hamlet, cordelia, "test"),
             self.send_stream_message(cordelia, "Denmark", content="test"),
-            self.send_huddle_message(cordelia, [hamlet, othello, iago], "test"),
+            self.send_group_direct_message(cordelia, [hamlet, othello, iago], "test"),
             self.send_personal_message(cordelia, othello, "test"),
         ]
 
@@ -596,19 +647,18 @@ class TestMessageForIdsDisplayRecipientFetching(ZulipTestCase):
             search_fields={},
             apply_markdown=True,
             client_gravatar=True,
+            allow_empty_topic_name=True,
             allow_edit_history=False,
+            user_profile=cordelia,
+            realm=cordelia.realm,
         )
 
         self._verify_display_recipient(
             messages[0]["display_recipient"], [hamlet, cordelia, othello]
         )
-        self._verify_display_recipient(
-            messages[1]["display_recipient"], get_stream("Verona", hamlet.realm)
-        )
+        self.assertEqual(messages[1]["display_recipient"], "Verona")
         self._verify_display_recipient(messages[2]["display_recipient"], [hamlet, cordelia])
-        self._verify_display_recipient(
-            messages[3]["display_recipient"], get_stream("Denmark", hamlet.realm)
-        )
+        self.assertEqual(messages[3]["display_recipient"], "Denmark")
         self._verify_display_recipient(
             messages[4]["display_recipient"], [hamlet, cordelia, othello, iago]
         )
@@ -619,6 +669,7 @@ class SewMessageAndReactionTest(ZulipTestCase):
     def test_sew_messages_and_reaction(self) -> None:
         sender = self.example_user("othello")
         receiver = self.example_user("hamlet")
+        realm = get_realm("zulip")
         pm_recipient = Recipient.objects.get(type_id=receiver.id, type=Recipient.PERSONAL)
         stream_name = "Çiğdem"
         stream = self.make_stream(stream_name)
@@ -631,6 +682,7 @@ class SewMessageAndReactionTest(ZulipTestCase):
                 message = Message(
                     sender=sender,
                     recipient=recipient,
+                    realm=realm,
                     content=f"whatever {i}",
                     date_sent=timezone_now(),
                     sending_client=sending_client,

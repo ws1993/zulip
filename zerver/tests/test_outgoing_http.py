@@ -4,13 +4,16 @@ from unittest import mock
 
 import requests
 import responses
-from requests.packages.urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+from typing_extensions import override
+from urllib3.util import Retry
 
 from zerver.lib.outgoing_http import OutgoingSession
 from zerver.lib.test_classes import ZulipTestCase
 
 
 class RequestMockWithProxySupport(responses.RequestsMock):
+    @override
     def _on_request(
         self,
         adapter: requests.adapters.HTTPAdapter,
@@ -18,21 +21,18 @@ class RequestMockWithProxySupport(responses.RequestsMock):
         **kwargs: Any,
     ) -> requests.Response:
         if "proxies" in kwargs and request.url:
-            proxy_uri = requests.utils.select_proxy(request.url, kwargs["proxies"])
-            if proxy_uri is not None:
+            proxy_url = requests.utils.select_proxy(request.url, kwargs["proxies"])
+            if proxy_url is not None:
                 request = requests.Request(
                     method="GET",
-                    url=f"{proxy_uri}/",
-                    headers=adapter.proxy_headers(proxy_uri),
+                    url=f"{proxy_url}/",
+                    headers=adapter.proxy_headers(proxy_url),
                 ).prepare()
-        return super()._on_request(  # type: ignore[misc]  # This is an undocumented internal API
-            adapter,
-            request,
-            **kwargs,
-        )
+        return super()._on_request(adapter, request, **kwargs)
 
 
 class RequestMockWithTimeoutAsHeader(responses.RequestsMock):
+    @override
     def _on_request(
         self,
         adapter: requests.adapters.HTTPAdapter,
@@ -41,11 +41,7 @@ class RequestMockWithTimeoutAsHeader(responses.RequestsMock):
     ) -> requests.Response:
         if kwargs.get("timeout") is not None:
             request.headers["X-Timeout"] = kwargs["timeout"]
-        return super()._on_request(  # type: ignore[misc]  # This is an undocumented internal API
-            adapter,
-            request,
-            **kwargs,
-        )
+        return super()._on_request(adapter, request, **kwargs)
 
 
 class TestOutgoingHttp(ZulipTestCase):
@@ -98,17 +94,25 @@ class TestOutgoingHttp(ZulipTestCase):
 
         # Defaults to no retries
         session = requests.Session()
+        assert isinstance(session.adapters["http://"], HTTPAdapter)
         self.assertEqual(session.adapters["http://"].max_retries.total, 0)
+        assert isinstance(session.adapters["https://"], HTTPAdapter)
         self.assertEqual(session.adapters["https://"].max_retries.total, 0)
 
         session = OutgoingSession(role="testing", timeout=1)
+        assert isinstance(session.adapters["http://"], HTTPAdapter)
         self.assertEqual(session.adapters["http://"].max_retries.total, 0)
+        assert isinstance(session.adapters["https://"], HTTPAdapter)
         self.assertEqual(session.adapters["https://"].max_retries.total, 0)
 
         session = OutgoingSession(role="testing", timeout=1, max_retries=2)
+        assert isinstance(session.adapters["http://"], HTTPAdapter)
         self.assertEqual(session.adapters["http://"].max_retries.total, 2)
+        assert isinstance(session.adapters["https://"], HTTPAdapter)
         self.assertEqual(session.adapters["https://"].max_retries.total, 2)
 
         session = OutgoingSession(role="testing", timeout=1, max_retries=Retry(total=5))
+        assert isinstance(session.adapters["http://"], HTTPAdapter)
         self.assertEqual(session.adapters["http://"].max_retries.total, 5)
+        assert isinstance(session.adapters["https://"], HTTPAdapter)
         self.assertEqual(session.adapters["https://"].max_retries.total, 5)

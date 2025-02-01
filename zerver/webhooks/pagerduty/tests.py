@@ -2,7 +2,7 @@ from zerver.lib.test_classes import WebhookTestCase
 
 
 class PagerDutyHookTests(WebhookTestCase):
-    STREAM_NAME = "pagerduty"
+    CHANNEL_NAME = "pagerduty"
     URL_TEMPLATE = "/api/v1/external/pagerduty?api_key={api_key}&stream={stream}"
     WEBHOOK_DIR_NAME = "pagerduty"
 
@@ -77,11 +77,11 @@ class PagerDutyHookTests(WebhookTestCase):
         self.check_webhook("mp_fail", "Incident 48219", expected_message)
 
     def test_unsupported_webhook_event(self) -> None:
-        post_params = dict(content_type="application/json")
         for version in range(1, 4):
             payload = self.get_body(f"unsupported_v{version}")
-            result = self.client_post(self.url, payload, **post_params)
-            self.assert_json_error(
+            result = self.client_post(self.url, payload, content_type="application/json")
+            self.assert_json_success(result)
+            self.assert_in_response(
+                "The 'incident.unsupported' event isn't currently supported by the PagerDuty webhook; ignoring",
                 result,
-                "The 'incident.unsupported' event isn't currently supported by the PagerDuty webhook",
             )

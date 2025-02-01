@@ -4,14 +4,28 @@
 replica PostgreSQL servers' xlog location.  Requires that the user this
 connects to PostgreSQL as has been granted the `pg_monitor` role.
 
+This can only use stdlib modules from python.
 """
+
+import configparser
 import re
 import subprocess
-from typing import Dict, List
+import sys
 
-from scripts.lib.zulip_tools import get_config, get_config_file
 
-config_file = get_config_file()
+def get_config(
+    config_file: configparser.RawConfigParser,
+    section: str,
+    key: str,
+    default_value: str = "",
+) -> str:
+    if config_file.has_option(section, key):
+        return config_file.get(section, key)
+    return default_value
+
+
+config_file = configparser.RawConfigParser()
+config_file.read("/etc/zulip/zulip.conf")
 
 states = {
     "OK": 0,
@@ -29,7 +43,7 @@ def report(state: str, msg: str) -> None:
     MAXSTATE = max(MAXSTATE, states[state])
 
 
-def run_sql_query(query: str) -> List[List[str]]:
+def run_sql_query(query: str) -> list[list[str]]:
     command = [
         "psql",
         "-t",  # Omit header line
@@ -39,21 +53,18 @@ def run_sql_query(query: str) -> List[List[str]]:
         "ON_ERROR_STOP=1",
         "-d",
         get_config(config_file, "postgresql", "database_name", "zulip"),
-        "-u",
-        get_config(config_file, "postgresql", "database_user", "zulip"),
+        # No -U; nagios connects as itself
         "-c",
         f"SELECT {query}",
     ]
     try:
-        output = subprocess.check_output(
-            command, stderr=subprocess.STDOUT, universal_newlines=True
-        ).strip()
+        output = subprocess.check_output(command, stderr=subprocess.STDOUT, text=True).strip()
         if not output:
             return []
         return [x.split("\0") for x in output.split("\n")]
     except subprocess.CalledProcessError as e:
-        report("CRITICAL", f"psql failed: {str(e)}: {e.output}")
-        exit(MAXSTATE)
+        report("CRITICAL", f"psql failed: {e}: {e.output}")
+        sys.exit(MAXSTATE)
 
 
 def loc_to_abs_offset(loc_str: str) -> int:
@@ -94,9 +105,9 @@ if is_in_recovery[0][0] == "t":
             report("CRITICAL", f"replica is in state {state}, not streaming")
 
         msg = f"replica is {replay_lag} bytes behind in replay of WAL logs from {primary_server}"
-        if replay_lag > 5 * 16 * 1024 ** 2:
+        if replay_lag > 5 * 16 * 1024**2:
             report("CRITICAL", msg)
-        elif replay_lag > 16 * 1024 ** 2:
+        elif replay_lag > 16 * 1024**2:
             report("WARNING", msg)
         else:
             report("OK", msg)
@@ -118,18 +129,18 @@ else:
             report("CRITICAL", f"replica {client_addr} is in state {state}, not streaming")
 
         sent_offset = loc_to_abs_offset(sent_lsn)
-        lag: Dict[str, int] = {}
+        lag: dict[str, int] = {}
         lag["write"] = sent_offset - loc_to_abs_offset(write_lsn)
         lag["flush"] = sent_offset - loc_to_abs_offset(flush_lsn)
         lag["replay"] = sent_offset - loc_to_abs_offset(replay_lsn)
         for lag_type in ("write", "flush", "replay"):
             lag_bytes = lag[lag_type]
             msg = f"replica {client_addr} is {lag_bytes} bytes behind in {lag_type} of WAL logs"
-            if lag_bytes > 5 * 16 * 1024 ** 2:
+            if lag_bytes > 5 * 16 * 1024**2:
                 report("CRITICAL", msg)
-            elif lag_bytes > 16 * 1024 ** 2:
+            elif lag_bytes > 16 * 1024**2:
                 report("WARNING", msg)
             else:
                 report("OK", msg)
 
-exit(MAXSTATE)
+sys.exit(MAXSTATE)

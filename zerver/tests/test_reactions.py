@@ -1,21 +1,22 @@
-from typing import Any, Dict, List, Mapping
+from typing import TYPE_CHECKING, Any
 from unittest import mock
 
 import orjson
-from django.http import HttpResponse
+from typing_extensions import override
 
-from zerver.lib.actions import (
-    do_change_stream_invite_only,
-    do_make_stream_web_public,
-    notify_reaction_update,
-)
+from zerver.actions.reactions import notify_reaction_update
+from zerver.actions.streams import do_change_stream_permission
 from zerver.lib.cache import cache_get, to_dict_cache_key_id
-from zerver.lib.emoji import emoji_name_to_emoji_code
+from zerver.lib.emoji import get_emoji_data
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.message import extract_message_dict
+from zerver.lib.message_cache import extract_message_dict
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.test_helpers import zulip_reaction_info
-from zerver.models import Message, Reaction, RealmEmoji, UserMessage, get_realm
+from zerver.models import Message, Reaction, RealmEmoji, UserMessage
+from zerver.models.realms import get_realm
+
+if TYPE_CHECKING:
+    from django.test.client import _MonkeyPatchedWSGIResponse as TestHttpResponse
 
 
 class ReactionEmojiTest(ZulipTestCase):
@@ -91,7 +92,7 @@ class ReactionEmojiTest(ZulipTestCase):
         emojis = ["smile", "tada"]
         expected_emoji_codes = ["1f642", "1f389"]
 
-        for sender, emoji in zip(senders, emojis):
+        for sender, emoji in zip(senders, emojis, strict=False):
             reaction_info = {
                 "emoji_name": emoji,
             }
@@ -108,17 +109,14 @@ class ReactionEmojiTest(ZulipTestCase):
                 "emoji_name": emoji,
                 "emoji_code": emoji_code,
                 "reaction_type": "unicode_emoji",
-                "user": {
-                    "email": f"user{sender.id}@zulip.testserver",
-                    "id": sender.id,
-                    "full_name": sender.full_name,
-                },
                 "user_id": sender.id,
             }
             # It's important that we preserve the loop order in this
             # test, since this is our test to verify that we're
             # returning reactions in chronological order.
-            for sender, emoji, emoji_code in zip(senders, emojis, expected_emoji_codes)
+            for sender, emoji, emoji_code in zip(
+                senders, emojis, expected_emoji_codes, strict=False
+            )
         ]
         self.assertEqual(expected_reaction_data, message["reactions"])
 
@@ -190,59 +188,49 @@ class ReactionEmojiTest(ZulipTestCase):
         result = self.api_post(sender, "/api/v1/messages/1/reactions", reaction_info)
         self.assert_json_success(result)
 
-    def test_emoji_name_to_emoji_code(self) -> None:
-        """
-        An emoji name is mapped canonically to emoji code.
-        """
+    def test_get_emoji_data(self) -> None:
         realm = get_realm("zulip")
         realm_emoji = RealmEmoji.objects.get(name="green_tick")
 
+        def verify(emoji_name: str, emoji_code: str, reaction_type: str) -> None:
+            emoji_data = get_emoji_data(realm.id, emoji_name)
+            self.assertEqual(emoji_data.emoji_code, emoji_code)
+            self.assertEqual(emoji_data.reaction_type, reaction_type)
+
         # Test active realm emoji.
-        emoji_code, reaction_type = emoji_name_to_emoji_code(realm, "green_tick")
-        self.assertEqual(emoji_code, str(realm_emoji.id))
-        self.assertEqual(reaction_type, "realm_emoji")
+        verify("green_tick", str(realm_emoji.id), "realm_emoji")
 
         # Test deactivated realm emoji.
         realm_emoji.deactivated = True
         realm_emoji.save(update_fields=["deactivated"])
         with self.assertRaises(JsonableError) as exc:
-            emoji_name_to_emoji_code(realm, "green_tick")
+            get_emoji_data(realm.id, "green_tick")
         self.assertEqual(str(exc.exception), "Emoji 'green_tick' does not exist")
 
         # Test ':zulip:' emoji.
-        emoji_code, reaction_type = emoji_name_to_emoji_code(realm, "zulip")
-        self.assertEqual(emoji_code, "zulip")
-        self.assertEqual(reaction_type, "zulip_extra_emoji")
+        verify("zulip", "zulip", "zulip_extra_emoji")
 
         # Test Unicode emoji.
-        emoji_code, reaction_type = emoji_name_to_emoji_code(realm, "astonished")
-        self.assertEqual(emoji_code, "1f632")
-        self.assertEqual(reaction_type, "unicode_emoji")
+        verify("astonished", "1f632", "unicode_emoji")
 
         # Test override Unicode emoji.
         overriding_emoji = RealmEmoji.objects.create(
             name="astonished", realm=realm, file_name="astonished"
         )
-        emoji_code, reaction_type = emoji_name_to_emoji_code(realm, "astonished")
-        self.assertEqual(emoji_code, str(overriding_emoji.id))
-        self.assertEqual(reaction_type, "realm_emoji")
+        verify("astonished", str(overriding_emoji.id), "realm_emoji")
 
         # Test deactivate over-ridding realm emoji.
         overriding_emoji.deactivated = True
         overriding_emoji.save(update_fields=["deactivated"])
-        emoji_code, reaction_type = emoji_name_to_emoji_code(realm, "astonished")
-        self.assertEqual(emoji_code, "1f632")
-        self.assertEqual(reaction_type, "unicode_emoji")
+        verify("astonished", "1f632", "unicode_emoji")
 
         # Test override `:zulip:` emoji.
         overriding_emoji = RealmEmoji.objects.create(name="zulip", realm=realm, file_name="zulip")
-        emoji_code, reaction_type = emoji_name_to_emoji_code(realm, "zulip")
-        self.assertEqual(emoji_code, str(overriding_emoji.id))
-        self.assertEqual(reaction_type, "realm_emoji")
+        verify("zulip", str(overriding_emoji.id), "realm_emoji")
 
         # Test non-existent emoji.
         with self.assertRaises(JsonableError) as exc:
-            emoji_name_to_emoji_code(realm, "invalid_emoji")
+            get_emoji_data(realm.id, "invalid_emoji")
         self.assertEqual(str(exc.exception), "Emoji 'invalid_emoji' does not exist")
 
 
@@ -282,10 +270,13 @@ class ReactionMessageIDTest(ZulipTestCase):
         result = self.api_post(
             pm_sender,
             "/api/v1/messages",
-            {"type": "private", "content": "Test message", "to": pm_recipient.email},
+            {
+                "type": "private",
+                "content": "Test message",
+                "to": orjson.dumps([pm_recipient.email]).decode(),
+            },
         )
-        self.assert_json_success(result)
-        pm_id = result.json()["id"]
+        pm_id = self.assert_json_success(result)["id"]
         reaction_info = {
             "emoji_name": "smile",
         }
@@ -308,7 +299,11 @@ class ReactionTest(ZulipTestCase):
         pm = self.api_post(
             pm_sender,
             "/api/v1/messages",
-            {"type": "private", "content": "Test message", "to": pm_recipient.email},
+            {
+                "type": "private",
+                "content": "Test message",
+                "to": orjson.dumps([pm_recipient.email]).decode(),
+            },
         )
         self.assert_json_success(pm)
         content = orjson.loads(pm.content)
@@ -338,7 +333,11 @@ class ReactionTest(ZulipTestCase):
         pm = self.api_post(
             pm_sender,
             "/api/v1/messages",
-            {"type": "private", "content": "Test message", "to": pm_recipient.email},
+            {
+                "type": "private",
+                "content": "Test message",
+                "to": orjson.dumps([pm_recipient.email]).decode(),
+            },
         )
         self.assert_json_success(pm)
 
@@ -366,13 +365,12 @@ class ReactionTest(ZulipTestCase):
         Removes an old existing reaction but the name of emoji got changed during
         various emoji infra changes.
         """
-        realm = get_realm("zulip")
         sender = self.example_user("hamlet")
-        emoji_code, reaction_type = emoji_name_to_emoji_code(realm, "smile")
+        emoji_data = get_emoji_data(sender.realm_id, "smile")
         reaction_info = {
             "emoji_name": "smile",
-            "emoji_code": emoji_code,
-            "reaction_type": reaction_type,
+            "emoji_code": emoji_data.emoji_code,
+            "reaction_type": emoji_data.reaction_type,
         }
 
         result = self.api_post(sender, "/api/v1/messages/1/reactions", reaction_info)
@@ -419,10 +417,13 @@ class ReactionEventTest(ZulipTestCase):
         result = self.api_post(
             pm_sender,
             "/api/v1/messages",
-            {"type": "private", "content": "Test message", "to": pm_recipient.email},
+            {
+                "type": "private",
+                "content": "Test message",
+                "to": orjson.dumps([pm_recipient.email]).decode(),
+            },
         )
-        self.assert_json_success(result)
-        pm_id = result.json()["id"]
+        pm_id = self.assert_json_success(result)["id"]
 
         expected_recipient_ids = {pm_sender.id, pm_recipient.id}
 
@@ -430,8 +431,7 @@ class ReactionEventTest(ZulipTestCase):
             "emoji_name": "smile",
         }
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(
                 reaction_sender, f"/api/v1/messages/{pm_id}/reactions", reaction_info
             )
@@ -459,10 +459,13 @@ class ReactionEventTest(ZulipTestCase):
         result = self.api_post(
             pm_sender,
             "/api/v1/messages",
-            {"type": "private", "content": "Test message", "to": pm_recipient.email},
+            {
+                "type": "private",
+                "content": "Test message",
+                "to": orjson.dumps([pm_recipient.email]).decode(),
+            },
         )
-        self.assert_json_success(result)
-        content = result.json()
+        content = self.assert_json_success(result)
         pm_id = content["id"]
 
         expected_recipient_ids = {pm_sender.id, pm_recipient.id}
@@ -474,8 +477,7 @@ class ReactionEventTest(ZulipTestCase):
         add = self.api_post(reaction_sender, f"/api/v1/messages/{pm_id}/reactions", reaction_info)
         self.assert_json_success(add)
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_delete(
                 reaction_sender, f"/api/v1/messages/{pm_id}/reactions", reaction_info
             )
@@ -485,7 +487,6 @@ class ReactionEventTest(ZulipTestCase):
         event_user_ids = set(events[0]["users"])
 
         self.assertEqual(expected_recipient_ids, event_user_ids)
-        self.assertEqual(event["user"]["email"], reaction_sender.email)
         self.assertEqual(event["type"], "reaction")
         self.assertEqual(event["op"], "remove")
         self.assertEqual(event["emoji_name"], "smile")
@@ -512,8 +513,7 @@ class ReactionEventTest(ZulipTestCase):
 
         # Hamlet and Polonius joined after the message was sent, and
         # so only Iago should receive the event.
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(
                 iago, f"/api/v1/messages/{message_before_id}/reactions", reaction_info
             )
@@ -532,7 +532,7 @@ class ReactionEventTest(ZulipTestCase):
         message_after_id = self.send_stream_message(
             iago, "test_reactions_stream", "after subscription history private"
         )
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(
                 iago, f"/api/v1/messages/{message_after_id}/reactions", reaction_info
             )
@@ -547,11 +547,17 @@ class ReactionEventTest(ZulipTestCase):
         self.assert_json_success(remove)
 
         # Make stream history public to subscribers
-        do_change_stream_invite_only(stream, False, history_public_to_subscribers=True)
+        do_change_stream_permission(
+            stream,
+            invite_only=False,
+            history_public_to_subscribers=True,
+            is_web_public=False,
+            acting_user=iago,
+        )
         # Since stream history is public to subscribers, reacting to
         # message_before_id should notify all subscribers:
         # Iago and Hamlet.
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(
                 iago, f"/api/v1/messages/{message_before_id}/reactions", reaction_info
             )
@@ -566,10 +572,16 @@ class ReactionEventTest(ZulipTestCase):
         self.assert_json_success(remove)
 
         # Make stream web_public as well.
-        do_make_stream_web_public(stream)
+        do_change_stream_permission(
+            stream,
+            invite_only=False,
+            history_public_to_subscribers=True,
+            is_web_public=True,
+            acting_user=iago,
+        )
         # For is_web_public streams, events even on old messages
         # should go to all subscribers, including guests like polonius.
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(
                 iago, f"/api/v1/messages/{message_before_id}/reactions", reaction_info
             )
@@ -583,13 +595,13 @@ class ReactionEventTest(ZulipTestCase):
         )
         self.assert_json_success(remove)
 
-        # Private message, event should go to both participants.
+        # Direct message, event should go to both participants.
         private_message_id = self.send_personal_message(
             iago,
             hamlet,
             "hello to single receiver",
         )
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(
                 hamlet, f"/api/v1/messages/{private_message_id}/reactions", reaction_info
             )
@@ -599,15 +611,15 @@ class ReactionEventTest(ZulipTestCase):
         event_user_ids = set(events[0]["users"])
         self.assertEqual(event_user_ids, {iago.id, hamlet.id})
 
-        # Group private message; event should go to all participants.
-        huddle_message_id = self.send_huddle_message(
+        # Group direct message; event should go to all participants.
+        group_direct_message_id = self.send_group_direct_message(
             hamlet,
             [polonius, iago],
-            "hello message to muliple receiver",
+            "hello message to multiple receiver",
         )
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(
-                polonius, f"/api/v1/messages/{huddle_message_id}/reactions", reaction_info
+                polonius, f"/api/v1/messages/{group_direct_message_id}/reactions", reaction_info
             )
         self.assert_json_success(result)
         event = events[0]["event"]
@@ -623,7 +635,7 @@ class EmojiReactionBase(ZulipTestCase):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
-    def post_reaction(self, reaction_info: Dict[str, str]) -> HttpResponse:
+    def post_reaction(self, reaction_info: dict[str, str]) -> "TestHttpResponse":
         message_id = 1
 
         result = self.api_post(
@@ -631,7 +643,7 @@ class EmojiReactionBase(ZulipTestCase):
         )
         return result
 
-    def post_other_reaction(self, reaction_info: Dict[str, str]) -> HttpResponse:
+    def post_other_reaction(self, reaction_info: dict[str, str]) -> "TestHttpResponse":
         message_id = 1
 
         result = self.api_post(
@@ -639,7 +651,7 @@ class EmojiReactionBase(ZulipTestCase):
         )
         return result
 
-    def delete_reaction(self, reaction_info: Dict[str, str]) -> HttpResponse:
+    def delete_reaction(self, reaction_info: dict[str, str]) -> "TestHttpResponse":
         message_id = 1
 
         result = self.api_delete(
@@ -649,7 +661,7 @@ class EmojiReactionBase(ZulipTestCase):
 
     def get_message_reactions(
         self, message_id: int, emoji_code: str, reaction_type: str
-    ) -> List[Reaction]:
+    ) -> list[Reaction]:
         message = Message.objects.get(id=message_id)
         reactions = Reaction.objects.filter(
             message=message, emoji_code=emoji_code, reaction_type=reaction_type
@@ -658,6 +670,7 @@ class EmojiReactionBase(ZulipTestCase):
 
 
 class DefaultEmojiReactionTests(EmojiReactionBase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         reaction_info = {
@@ -923,6 +936,7 @@ class ZulipExtraEmojiReactionTest(EmojiReactionBase):
 
 
 class RealmEmojiReactionTests(EmojiReactionBase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         green_tick_emoji = RealmEmoji.objects.get(name="green_tick")
@@ -1034,13 +1048,14 @@ class ReactionAPIEventTest(EmojiReactionBase):
             "emoji_code": "1f354",
             "reaction_type": "unicode_emoji",
         }
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
-            with mock.patch("zerver.lib.actions.send_event") as m:
-                m.side_effect = AssertionError(
-                    "Events should be sent only after the transaction commits!"
-                )
-                self.api_post(reaction_sender, f"/api/v1/messages/{pm_id}/reactions", reaction_info)
+        with (
+            self.capture_send_event_calls(expected_num_events=1) as events,
+            mock.patch("zerver.tornado.django_api.queue_json_publish_rollback_unsafe") as m,
+        ):
+            m.side_effect = AssertionError(
+                "Events should be sent only after the transaction commits!"
+            )
+            self.api_post(reaction_sender, f"/api/v1/messages/{pm_id}/reactions", reaction_info)
 
         event = events[0]["event"]
         event_user_ids = set(events[0]["users"])
@@ -1078,8 +1093,7 @@ class ReactionAPIEventTest(EmojiReactionBase):
         )
         self.assert_json_success(add)
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_delete(
                 reaction_sender,
                 f"/api/v1/messages/{pm_id}/reactions",
@@ -1104,9 +1118,9 @@ class ReactionAPIEventTest(EmojiReactionBase):
 
     def test_events_sent_after_transaction_commits(self) -> None:
         """
-        Tests that `send_event` is hooked to `transaction.on_commit`. This is important, because
-        we don't want to end up holding locks on message rows for too long if the event queue runs
-        into a problem.
+        Tests that `send_event_rollback_unsafe` is hooked to `transaction.on_commit`.
+        This is important, because we don't want to end up holding locks on message rows
+        for too long if the event queue runs into a problem.
         """
         hamlet = self.example_user("hamlet")
         self.send_stream_message(hamlet, "Denmark")
@@ -1119,9 +1133,11 @@ class ReactionAPIEventTest(EmojiReactionBase):
             reaction_type="whatever",
         )
 
-        with self.tornado_redirected_to_list([], expected_num_events=1):
-            with mock.patch("zerver.lib.actions.send_event") as m:
-                m.side_effect = AssertionError(
-                    "Events should be sent only after the transaction commits."
-                )
-                notify_reaction_update(hamlet, message, reaction, "stuff")
+        with (
+            self.capture_send_event_calls(expected_num_events=1),
+            mock.patch("zerver.tornado.django_api.queue_json_publish_rollback_unsafe") as m,
+        ):
+            m.side_effect = AssertionError(
+                "Events should be sent only after the transaction commits."
+            )
+            notify_reaction_update(hamlet, message, reaction, "stuff")

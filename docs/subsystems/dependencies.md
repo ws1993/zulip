@@ -43,8 +43,8 @@ In `version.py`, we have a special parameter, `PROVISION_VERSION`,
 which is used to help ensure developers don't spend time debugging
 test/linter/etc. failures that actually were caused by the developer
 rebasing and forgetting to provision". `PROVISION_VERSION` has a
-format of `x.y`; when `x` doesn't match the value from the last time
-the user provisioned, or `y` is higher than than the value from last
+format of `(x, y)`; when `x` doesn't match the value from the last time
+the user provisioned, or `y` is higher than the value from last
 time, most Zulip tools will crash early and ask the user to provision.
 This has empirically made a huge impact on how often developers spend
 time debugging a "weird failure" after rebasing that had an easy
@@ -90,13 +90,13 @@ the backend, but does in JavaScript.
 
 ## System packages
 
-For the third-party services like PostgreSQL, Redis, Nginx, and RabbitMQ
+For the third-party services like PostgreSQL, Redis, nginx, and RabbitMQ
 that are documented in the
 [architecture overview](../overview/architecture-overview.md), we rely on the
 versions of those packages provided alongside the Linux distribution
 on which Zulip is deployed. Because Zulip
-[only supports Ubuntu in production](../production/requirements.md), this
-usually means `apt`, though we do support
+[only supports Debian or Ubuntu in production](../production/requirements.md),
+this usually means `apt`, though we do support
 [other platforms in development](../development/setup-advanced.md). Since
 we don't control the versions of these dependencies, we avoid relying
 on specific versions of these packages wherever possible.
@@ -120,8 +120,8 @@ extension, used by our [full-text search](full-text-search.md).
 ## Python packages
 
 Zulip uses the version of Python itself provided by the host OS for
-the Zulip server. We currently support Python 3.6 and newer, with
-Ubuntu Bionic being the platform requiring 3.6 support. The comments
+the Zulip server. We currently support Python 3.10 and newer, with
+Ubuntu 22.04 being the platform requiring 3.10 support. The comments
 in `.github/workflows/zulip-ci.yml` document the Python versions used
 by each supported platform.
 
@@ -136,7 +136,7 @@ highlighting. The system is largely managed by the code in
   versions in a `requirements.txt` file to declare what we're using.
   Since we have a few different installation targets, we maintain
   several `requirements.txt` format files in the `requirements/`
-  directory (e.g. `dev.in` for development, `prod.in` for
+  directory (e.g., `dev.in` for development, `prod.in` for
   production, `docs.in` for ReadTheDocs, `common.in` for the vast
   majority of packages common to prod and development, etc.). We use
   `pip install --no-deps` to ensure we only install the packages we
@@ -219,20 +219,15 @@ We use the same set of strategies described for Python dependencies
 for most of our JavaScript dependencies, so we won't repeat the
 reasoning here.
 
-- In a fashion very analogous to the Python codebase,
-  `scripts/lib/node_cache.py` manages cached `node_modules`
-  directories in `/srv/zulip-npm-cache`. Each is named by its hash,
-  computed by the `generate_sha1sum_node_modules` function.
-  `scripts/lib/clean_node_cache.py` handles garbage-collection.
-- We use [yarn][], a `pip`-like tool for JavaScript, to download most
-  JavaScript dependencies. Yarn talks to standard the [npm][]
+- We use [pnpm][], a `pip`-like tool for JavaScript, to download most
+  JavaScript dependencies. pnpm talks to the standard [npm][]
   repository. We use the standard `package.json` file to declare our
   direct dependencies, with sections for development and
-  production. Yarn takes care of pinning the versions of indirect
-  dependencies in the `yarn.lock` file; `yarn install` updates the
-  `yarn.lock` files.
+  production. pnpm takes care of pinning the versions of indirect
+  dependencies in the `pnpm-lock.yaml` file; `pnpm install` updates the
+  `pnpm-lock.yaml` file.
 - `tools/update-prod-static`. This process is discussed in detail in
-  the [static asset pipeline](../subsystems/html-css.html#static-asset-pipeline)
+  the [static asset pipeline](html-css.md#static-asset-pipeline)
   article, but we don't use the `node_modules` directories directly in
   production. Instead, static assets are compiled using our static
   asset pipeline and it is the compiled assets that are served
@@ -242,24 +237,23 @@ reasoning here.
   release tarball.
 - **Checked-in packages**. In contrast with Python, we have a few
   JavaScript dependencies that we have copied into the main Zulip
-  repository under `static/third`, often with patches. These date
+  repository under `web/third`, often with patches. These date
   from an era before `npm` existed. It is a project goal to eliminate
   these checked-in versions of dependencies and instead use versions
   managed by the npm repositories.
 
-## Node.js and Yarn
+## Node.js and pnpm
 
 Node.js is installed by `scripts/lib/install-node` to
-`/srv/zulip-node` and symlinked to `/usr/local/bin/node`. Yarn is
-installed by `scripts/lib/install-yarn` to `/srv/zulip-yarn` and
-symlinked to `/usr/bin/yarn`.
+`/srv/zulip-node` and symlinked to `/usr/local/bin/node`. A pnpm
+symlink at `/usr/local/bin/pnpm` is managed by
+[Corepack](https://nodejs.org/api/corepack.html).
 
 We don't do anything special to try to manage multiple versions of
-Node.js or Yarn. (Previous versions of Zulip installed multiple
-versions of Node.js using the third-party `nvm` installer, but the
-current version no longer uses `nvm`; if it’s present in
-`/usr/local/nvm` where previous versions installed it, it will now be
-removed.)
+Node.js. (Previous versions of Zulip installed multiple versions of
+Node.js using the third-party `nvm` installer, but the current version
+no longer uses `nvm`; if it’s present in `/usr/local/nvm` where
+previous versions installed it, it will now be removed.)
 
 ## ShellCheck and shfmt
 
@@ -290,7 +284,7 @@ Zulip uses the [iamcal emoji data package][iamcal] for its emoji data
 and sprite sheets. We download this dependency using `npm`, and then
 have a tool, `tools/setup/build_emoji`, which reformats the emoji data
 into the files under `static/generated/emoji`. Those files are in
-turn used by our [Markdown processor](../subsystems/markdown.md) and
+turn used by our [Markdown processor](markdown.md) and
 `tools/update-prod-static` to make Zulip's emoji work in the various
 environments where they need to be displayed.
 
@@ -318,7 +312,7 @@ implementation of that tool.
 
 The list of languages supported by our Markdown syntax highlighting
 comes from the [pygments][] package. `tools/setup/build_pygments_data` is
-responsible for generating `static/generated/pygments_data.json` so that
+responsible for generating `web/generated/pygments_data.json` so that
 our JavaScript Markdown processor has access to the supported list.
 
 ## Modifying provisioning
@@ -339,7 +333,7 @@ usually one needs to think about making changes in 3 places:
 
 [virtualenv]: https://virtualenv.pypa.io/en/stable/
 [virtualenv-clone]: https://github.com/edwardgeorge/virtualenv-clone/
-[yarn]: https://yarnpkg.com/
+[pnpm]: https://pnpm.io/
 [npm]: https://npmjs.com/
 [iamcal]: https://github.com/iamcal/emoji-data
 [pygments]: https://pygments.org/

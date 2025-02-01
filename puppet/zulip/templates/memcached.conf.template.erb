@@ -51,3 +51,11 @@ logfile /var/log/memcached.log
 
 # Enable SASL authentication
 -S
+<% if @memcached_max_item_size != '1m' %>
+# Larger max-item-size
+-I <%= @memcached_max_item_size %>
+<% end -%>
+<%- if @memcached_size_reporting %>
+# Enable `stats sizes` (see https://github.com/memcached/memcached/blob/master/doc/protocol.txt)
+-o track_sizes
+<% end -%>

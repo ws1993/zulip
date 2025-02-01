@@ -1,29 +1,26 @@
-import datetime
-from typing import Any, List, Mapping
+from datetime import timedelta
 from unittest import mock
 
 import orjson
+import time_machine
 from django.utils.timezone import now as timezone_now
 
-from zerver.lib.actions import do_change_can_create_users, do_change_user_role
-from zerver.lib.exceptions import JsonableError
+from zerver.actions.realm_settings import do_set_realm_property
+from zerver.actions.users import do_change_can_create_users, do_change_user_role
+from zerver.lib.exceptions import JsonableError, StreamWildcardMentionNotAllowedError
 from zerver.lib.streams import access_stream_for_send_message
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.test_helpers import most_recent_message, queries_captured
+from zerver.lib.test_helpers import most_recent_message
 from zerver.lib.users import is_administrator_role
-from zerver.models import (
-    UserProfile,
-    UserStatus,
-    get_display_recipient,
-    get_realm,
-    get_stream,
-    get_user_by_delivery_email,
-)
+from zerver.models import Realm, UserProfile, UserStatus
+from zerver.models.realms import WildcardMentionPolicyEnum, get_realm
+from zerver.models.streams import get_stream
+from zerver.models.users import get_user_by_delivery_email
 
 
 # Most Zulip tests use ZulipTestCase, which inherits from django.test.TestCase.
 # We recommend learning Django basics first, so search the web for "django testing".
-# A common first result is https://docs.djangoproject.com/en/3.2/topics/testing/
+# A common first result is https://docs.djangoproject.com/en/5.0/topics/testing/
 class TestBasics(ZulipTestCase):
     def test_basics(self) -> None:
         # Django's tests are based on Python's unittest module, so you
@@ -128,6 +125,7 @@ class TestFullStack(ZulipTestCase):
                 avatar_url=content["user"]["avatar_url"],
                 avatar_version=1,
                 date_joined=content["user"]["date_joined"],
+                delivery_email=None,
                 email=cordelia.email,
                 full_name=cordelia.full_name,
                 is_active=True,
@@ -137,7 +135,7 @@ class TestFullStack(ZulipTestCase):
                 is_guest=False,
                 is_owner=False,
                 role=UserProfile.ROLE_MEMBER,
-                timezone="",
+                timezone="Etc/UTC",
                 user_id=cordelia.id,
             ),
         )
@@ -196,7 +194,7 @@ class TestFullStack(ZulipTestCase):
 
         # We often use assert_json_error for negative tests.
         result = self.client_post("/json/users", valid_params)
-        self.assert_json_error(result, "User not authorized for this query", 400)
+        self.assert_json_error(result, "User not authorized to create users", 400)
 
         do_change_can_create_users(iago, True)
         incomplete_params = dict(
@@ -229,11 +227,8 @@ class TestFullStack(ZulipTestCase):
 
         params = dict(status_text="on vacation")
 
-        events: List[Mapping[str, Any]] = []
-
-        # Use the tornado_redirected_to_list context manager to capture
-        # events.
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        # Use the capture_send_event_calls context manager to capture events.
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(cordelia, "/api/v1/users/me/status", params)
 
         self.assert_json_success(result)
@@ -298,7 +293,7 @@ class TestStreamHelpers(ZulipTestCase):
         access_stream_for_send_message(cordelia, stream, forwarder_user_profile=None)
 
         # ...but Othello can't.
-        with self.assertRaisesRegex(JsonableError, "Not authorized to send to stream"):
+        with self.assertRaisesRegex(JsonableError, "Not authorized to send to channel"):
             access_stream_for_send_message(othello, stream, forwarder_user_profile=None)
 
 
@@ -332,7 +327,7 @@ class TestMessageHelpers(ZulipTestCase):
         # extended to send multiple similar messages.
         self.assertEqual(iago_message.id, sent_message_id)
         self.assertEqual(iago_message.sender_id, hamlet.id)
-        self.assertEqual(get_display_recipient(iago_message.recipient), "Denmark")
+        self.assert_message_stream_name(iago_message, "Denmark")
         self.assertEqual(iago_message.topic_name(), "lunch")
         self.assertEqual(iago_message.content, "I want pizza!")
 
@@ -357,8 +352,8 @@ class TestQueryCounts(ZulipTestCase):
     def test_capturing_queries(self) -> None:
         # It's a common pitfall in Django to accidentally perform
         # database queries in a loop, due to lazy evaluation of
-        # foreign keys. We use the queries_captured context manager to
-        # ensure our query count is predictable.
+        # foreign keys. We use the assert_database_query_count
+        # context manager to ensure our query count is predictable.
         #
         # When a test containing one of these query count assertions
         # fails, we'll want to understand the new queries and whether
@@ -368,60 +363,69 @@ class TestQueryCounts(ZulipTestCase):
         hamlet = self.example_user("hamlet")
         cordelia = self.example_user("cordelia")
 
-        with queries_captured() as queries:
+        with self.assert_database_query_count(15):
             self.send_personal_message(
                 from_user=hamlet,
                 to_user=cordelia,
                 content="hello there!",
             )
 
-        # The assert_length helper is another useful extra from ZulipTestCase.
-        self.assert_length(queries, 16)
-
 
 class TestDevelopmentEmailsLog(ZulipTestCase):
-    # We have development specific utilities that automate common tasks
-    # to improve developer productivity.
-    #
-    # Ones such is /emails/generate/ endpoint that can be used to generate
-    # all sorts of emails zulip sends. Those can be accessed at /emails/
+    # The /emails/generate/ endpoint can be used to generate
+    # all sorts of emails. Those can be accessed at /emails/
     # in development server. Let's test that here.
     def test_generate_emails(self) -> None:
         # It is a common case where some functions that we test rely
         # on a certain setting's value. You can test those under the
         # context of a desired setting value as done below.
+        #
         # The endpoint we're testing here rely on these settings:
         #   * EMAIL_BACKEND: The backend class used to send emails.
         #   * DEVELOPMENT_LOG_EMAILS: Whether to log emails sent.
-        # so, we set those to required values.
         #
-        # If the code you're testing creates logs, it is best to capture them
-        # and verify the log messages. That can be achieved with assertLogs()
+        # We use our assertLogs() helper to catch log entries,
         # as you'll see below. Read more about assertLogs() at:
         # https://docs.python.org/3/library/unittest.html#unittest.TestCase.assertLogs
-        with self.settings(EMAIL_BACKEND="zproject.email_backends.EmailLogBackEnd"), self.settings(
-            DEVELOPMENT_LOG_EMAILS=True
-        ), self.assertLogs(level="INFO") as logger:
+        #
+        # We use mock.patch to simulate _do_send_messages.
+        with (
+            self.settings(EMAIL_BACKEND="zproject.email_backends.EmailLogBackEnd"),
+            self.settings(DEVELOPMENT_LOG_EMAILS=True),
+            self.assertLogs(level="INFO") as info_log,
+            mock.patch(
+                "zproject.email_backends.EmailLogBackEnd._do_send_messages", lambda *args: 1
+            ),
+        ):
+            # Parts of this endpoint use transactions, and use
+            # transaction.on_commit to run code when the transaction
+            # commits.  Tests are run inside one big outer
+            # transaction, so those never get a chance to run unless
+            # we explicitly make a fake boundary to run them at; that
+            # is what captureOnCommitCallbacks does.
+            with self.captureOnCommitCallbacks(execute=True):
+                result = self.client_get(
+                    "/emails/generate/"
+                )  # Generates emails and redirects to /emails/
 
-            result = self.client_get(
-                "/emails/generate/"
-            )  # Generates emails and redirects to /emails/
-            self.assertEqual("/emails/", result["Location"])  # Make sure redirect URL is correct.
+            # Verify redirect
+            self.assertEqual(result["Location"], "/emails/")
 
-            # The above call to /emails/generate/ creates 15 emails and
+            # The above call to /emails/generate/ creates the emails and
             # logs the below line for every email.
-            output_log = (
+            expected_log_line = (
                 "INFO:root:Emails sent in development are available at http://testserver/emails"
             )
-            # logger.output is a list of all the log messages captured. Verify it is as expected.
-            self.assertEqual(logger.output, [output_log] * 15)
+
+            # info_log.output is a list of all the log messages captured.
+            self.assertEqual(info_log.output, [expected_log_line] * 18)
 
             # Now, lets actually go the URL the above call redirects to, i.e., /emails/
             result = self.client_get(result["Location"])
 
-            # assert_in_success_response() is another helper that is commonly used to ensure
-            # we are on the right page by verifying a string exists in the page's content.
-            self.assert_in_success_response(["All the emails sent in the Zulip"], result)
+            # assert_in_success_response() verifies that the content
+            # we received from client_get includes the strings we expect
+            self.assert_in_success_response(["All emails sent in the Zulip"], result)
 
 
 class TestMocking(ZulipTestCase):
@@ -430,13 +434,75 @@ class TestMocking(ZulipTestCase):
     #
     # Mocking is generally used in situations where
     # we want to avoid running original code for reasons
-    # like skipping HTTP requests, saving execution time etc.
+    # like skipping HTTP requests, saving execution time,
+    # or simulating convenient return values.
     #
     # Learn more about mocking in-depth at:
     # https://zulip.readthedocs.io/en/latest/testing/testing-with-django.html#testing-with-mocks
-    #
-    # The following test demonstrates a simple use case
-    # where mocking is helpful in saving test-run time.
+    def test_wildcard_mentions(self) -> None:
+        cordelia = self.example_user("cordelia")
+        self.login_user(cordelia)
+        self.subscribe(cordelia, "test_stream")
+
+        # Let's explicitly set the policy for sending wildcard
+        # mentions to a stream. If a stream has too many
+        # subscribers, we won't allow any users to spam the stream.
+        do_set_realm_property(
+            cordelia.realm,
+            "wildcard_mention_policy",
+            WildcardMentionPolicyEnum.NOBODY,
+            acting_user=None,
+        )
+
+        # We will try the same message a couple times.
+        # Notice the content includes "@**all**".
+        all_mention = "@**all** test wildcard mention"
+
+        # First, let's test the SAD PATH, where cordelia
+        # tries a wildcard method and gets rejected.
+        #
+        # Here we use both mock.patch to simulate a return value
+        # and assertRaisesRegex to verify our function raises
+        # an error.
+        with (
+            mock.patch(
+                "zerver.lib.message.num_subscribers_for_stream_id",
+                return_value=Realm.WILDCARD_MENTION_THRESHOLD + 1,
+            ),
+            self.assertRaisesRegex(
+                StreamWildcardMentionNotAllowedError,
+                "You do not have permission to use channel wildcard mentions in this channel.",
+            ),
+        ):
+            self.send_stream_message(
+                sender=cordelia,
+                stream_name="test_stream",
+                content=all_mention,
+            )
+
+        # Verify the message was NOT sent.
+        message = most_recent_message(cordelia)
+        self.assertNotEqual(message.content, all_mention)
+
+        # Now for the HAPPY PATH, we still mock the number of
+        # subscribers, but here we simulate that we are under
+        # the limit.  We expect cordelia's message to go through.
+        with mock.patch(
+            "zerver.lib.message.num_subscribers_for_stream_id",
+            return_value=Realm.WILDCARD_MENTION_THRESHOLD - 1,
+        ):
+            self.send_stream_message(
+                sender=cordelia,
+                stream_name="test_stream",
+                content=all_mention,
+            )
+
+        # Verify the message WAS sent.
+        message = most_recent_message(cordelia)
+        self.assertEqual(message.content, all_mention)
+
+
+class TestTimeTravel(ZulipTestCase):
     def test_edit_message(self) -> None:
         """
         Verify if the time limit imposed on message editing is working correctly.
@@ -481,32 +547,16 @@ class TestMocking(ZulipTestCase):
         # Now that we tested message editing works within the limit,
         # we want to verify it doesn't work beyond the limit.
         #
-        # To do that we'll have to wait for the time limit to pass which is
-        # 5 minutes here. Easy, use time.sleep() but mind that it slows down the
-        # test to a great extent which isn't good. This is when mocking comes to rescue.
-        # We can check what the original code does to determine whether the time limit
-        # exceeded and mock that here such that the code runs as if the time limit
-        # exceeded without actually waiting for that long!
-        #
-        # In this case, it is timezone_now, an alias to django.utils.timezone.now,
-        # to which the difference with message-sent-time is checked. So, we want
-        # that timezone_now() call to return `datetime` object representing time
-        # that is beyond the limit.
-        #
-        # Notice how mock.patch() is used here to do exactly the above mentioned.
-        # mock.patch() here makes any calls to `timezone_now` in `zerver.lib.actions`
-        # to return the value passed to `return_value` in the its context.
-        # You can also use mock.patch() as a decorator depending on the
-        # requirements. Read more at the documentation link provided above.
-
-        time_beyond_edit_limit = message_sent_time + datetime.timedelta(
+        # First, calculate the time we want to travel to, adding
+        # a little buffer of 100 seconds beyond the limit.
+        time_beyond_edit_limit = message_sent_time + timedelta(
             seconds=MESSAGE_CONTENT_EDIT_LIMIT + 100
-        )  # There's a buffer time applied to the limit, hence the extra 100s.
+        )
 
-        with mock.patch(
-            "zerver.lib.actions.timezone_now",
-            return_value=time_beyond_edit_limit,
-        ):
+        # Now use time_machine.travel to simulate that we are in the future.
+        #
+        # See https://pypi.org/project/time-machine/ for more info.
+        with time_machine.travel(time_beyond_edit_limit, tick=False):
             result = self.client_patch(
                 f"/json/messages/{sent_message_id}", {"content": "I actually want pizza."}
             )

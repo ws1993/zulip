@@ -1,24 +1,22 @@
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any
 from unittest import mock
 
 import orjson
-from django.http import HttpRequest, HttpResponse
+from django.http import HttpRequest
 from django.test import override_settings
 
 from zerver.lib.initial_password import initial_password
-from zerver.lib.rate_limiter import add_ratelimit_rule, remove_ratelimit_rule
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.test_helpers import get_test_image_file
+from zerver.lib.test_helpers import get_test_image_file, ratelimit_rule
 from zerver.lib.users import get_all_api_keys
-from zerver.models import (
-    Draft,
-    NotificationTriggers,
-    ScheduledMessageNotificationEmail,
-    UserProfile,
-    get_user_profile_by_api_key,
-)
+from zerver.models import Draft, ScheduledMessageNotificationEmail, UserProfile
+from zerver.models.scheduled_jobs import NotificationTriggers
+from zerver.models.users import get_user_profile_by_api_key
+
+if TYPE_CHECKING:
+    from django.test.client import _MonkeyPatchedWSGIResponse as TestHttpResponse
 
 
 class ChangeSettingsTest(ZulipTestCase):
@@ -118,12 +116,22 @@ class ChangeSettingsTest(ZulipTestCase):
         json_result = self.client_patch("/json/settings", dict(full_name="x" * 1000))
         self.assert_json_error(json_result, "Name too long!")
 
-        # Now try a too-short name
-        json_result = self.client_patch("/json/settings", dict(full_name="x"))
-        self.assert_json_error(json_result, "Name too short!")
+        # Now try too-short names
+        short_names = ["", "x"]
+        for name in short_names:
+            json_result = self.client_patch("/json/settings", dict(full_name=name))
+            self.assert_json_error(json_result, "Name too short!")
 
     def test_illegal_characters_in_name_changes(self) -> None:
         self.login("hamlet")
+
+        # Make sure unicode works
+        json_result = self.client_patch("/json/settings", dict(full_name="BLÅHAJ"))
+        self.assert_json_success(json_result)
+
+        # Make sure zero-width-joiners work
+        json_result = self.client_patch("/json/settings", dict(full_name="BLÅHAJ 🏳️‍⚧️"))
+        self.assert_json_success(json_result)
 
         # Now try a name with invalid characters
         json_result = self.client_patch("/json/settings", dict(full_name="Opheli*"))
@@ -218,7 +226,12 @@ class ChangeSettingsTest(ZulipTestCase):
     def test_toggling_boolean_user_settings(self) -> None:
         """Test updating each boolean setting in UserProfile property_types"""
         boolean_settings = (
-            s for s in UserProfile.property_types if UserProfile.property_types[s] is bool
+            s
+            for s in UserProfile.property_types
+            if UserProfile.property_types[s] is bool
+            # Dense mode can't be toggled without changing other settings too.
+            # This setting is tested in test_changing_information_density_settings.
+            and s not in ["dense_mode"]
         )
         for user_setting in boolean_settings:
             self.check_for_toggle_param_patch("/json/settings", user_setting)
@@ -234,53 +247,51 @@ class ChangeSettingsTest(ZulipTestCase):
         )
         self.assert_json_error(result, "Wrong password!")
 
+    @override_settings(RATE_LIMITING_AUTHENTICATE=True)
+    @ratelimit_rule(10, 2, domain="authenticate_by_username")
     def test_wrong_old_password_rate_limiter(self) -> None:
         self.login("hamlet")
-        with self.settings(RATE_LIMITING_AUTHENTICATE=True):
-            add_ratelimit_rule(10, 2, domain="authenticate_by_username")
-            start_time = time.time()
-            with mock.patch("time.time", return_value=start_time):
-                result = self.client_patch(
-                    "/json/settings",
-                    dict(
-                        old_password="bad_password",
-                        new_password="ignored",
-                    ),
-                )
-                self.assert_json_error(result, "Wrong password!")
-                result = self.client_patch(
-                    "/json/settings",
-                    dict(
-                        old_password="bad_password",
-                        new_password="ignored",
-                    ),
-                )
-                self.assert_json_error(result, "Wrong password!")
+        start_time = time.time()
+        with mock.patch("time.time", return_value=start_time):
+            result = self.client_patch(
+                "/json/settings",
+                dict(
+                    old_password="bad_password",
+                    new_password="ignored",
+                ),
+            )
+            self.assert_json_error(result, "Wrong password!")
+            result = self.client_patch(
+                "/json/settings",
+                dict(
+                    old_password="bad_password",
+                    new_password="ignored",
+                ),
+            )
+            self.assert_json_error(result, "Wrong password!")
 
-                # We're over the limit, so we'll get blocked even with the correct password.
-                result = self.client_patch(
-                    "/json/settings",
-                    dict(
-                        old_password=initial_password(self.example_email("hamlet")),
-                        new_password="ignored",
-                    ),
-                )
-                self.assert_json_error(
-                    result, "You're making too many attempts! Try again in 10 seconds."
-                )
+            # We're over the limit, so we'll get blocked even with the correct password.
+            result = self.client_patch(
+                "/json/settings",
+                dict(
+                    old_password=initial_password(self.example_email("hamlet")),
+                    new_password="ignored",
+                ),
+            )
+            self.assert_json_error(
+                result, "You're making too many attempts! Try again in 10 seconds."
+            )
 
-            # After time passes, we should be able to succeed if we give the correct password.
-            with mock.patch("time.time", return_value=start_time + 11):
-                json_result = self.client_patch(
-                    "/json/settings",
-                    dict(
-                        old_password=initial_password(self.example_email("hamlet")),
-                        new_password="foobar1",
-                    ),
-                )
-                self.assert_json_success(json_result)
-
-            remove_ratelimit_rule(10, 2, domain="authenticate_by_username")
+        # After time passes, we should be able to succeed if we give the correct password.
+        with mock.patch("time.time", return_value=start_time + 11):
+            json_result = self.client_patch(
+                "/json/settings",
+                dict(
+                    old_password=initial_password(self.example_email("hamlet")),
+                    new_password="foobar1",
+                ),
+            )
+            self.assert_json_success(json_result)
 
     @override_settings(
         AUTHENTICATION_BACKENDS=(
@@ -316,9 +327,12 @@ class ChangeSettingsTest(ZulipTestCase):
             )
             self.assert_json_error(result, "Your Zulip password is managed in LDAP")
 
-        with self.settings(
-            LDAP_APPEND_DOMAIN="example.com", AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map
-        ), self.assertLogs("zulip.ldap", "DEBUG") as debug_log:
+        with (
+            self.settings(
+                LDAP_APPEND_DOMAIN="example.com", AUTH_LDAP_USER_ATTR_MAP=ldap_user_attr_map
+            ),
+            self.assertLogs("zulip.ldap", "DEBUG") as debug_log,
+        ):
             result = self.client_patch(
                 "/json/settings",
                 dict(
@@ -345,17 +359,27 @@ class ChangeSettingsTest(ZulipTestCase):
             self.assert_json_error(result, "Your Zulip password is managed in LDAP")
 
     def do_test_change_user_setting(self, setting_name: str) -> None:
-
-        test_changes: Dict[str, Any] = dict(
+        test_changes: dict[str, Any] = dict(
             default_language="de",
-            default_view="all_messages",
+            web_home_view="all_messages",
             emojiset="google",
-            timezone="US/Mountain",
+            timezone="America/Denver",
             demote_inactive_streams=2,
+            web_mark_read_on_scroll_policy=2,
+            web_channel_default_view=2,
+            user_list_style=2,
+            web_animate_image_previews="on_hover",
+            web_stream_unreads_count_display_policy=2,
+            web_font_size_px=14,
+            web_line_height_percent=122,
             color_scheme=2,
             email_notifications_batching_period_seconds=100,
             notification_sound="ding",
             desktop_icon_count_display=2,
+            email_address_visibility=3,
+            realm_name_in_email_notifications_policy=2,
+            automatically_follow_topics_policy=1,
+            automatically_unmute_topics_in_muted_streams_policy=1,
         )
 
         self.login("hamlet")
@@ -364,7 +388,14 @@ class ChangeSettingsTest(ZulipTestCase):
         if test_value is None:
             raise AssertionError(f"No test created for {setting_name}")
 
-        if setting_name not in ["demote_inactive_streams", "color_scheme"]:
+        if setting_name not in [
+            "demote_inactive_streams",
+            "user_list_style",
+            "color_scheme",
+            "web_mark_read_on_scroll_policy",
+            "web_channel_default_view",
+            "web_stream_unreads_count_display_policy",
+        ]:
             data = {setting_name: test_value}
         else:
             data = {setting_name: orjson.dumps(test_value).decode()}
@@ -384,34 +415,96 @@ class ChangeSettingsTest(ZulipTestCase):
         self.do_test_change_user_setting("timezone")
 
     def test_invalid_setting_value(self) -> None:
-        invalid_values_dict = dict(
-            default_language="invalid_de",
-            default_view="invalid_view",
-            emojiset="apple",
-            timezone="invalid_US/Mountain",
-            demote_inactive_streams=10,
-            color_scheme=10,
-            notification_sound="invalid_sound",
-            desktop_icon_count_display=10,
-        )
-
+        invalid_values: list[dict[str, Any]] = [
+            {
+                "setting_name": "default_language",
+                "value": "invalid_de",
+                "error_msg": "Invalid default_language",
+            },
+            {
+                "setting_name": "web_home_view",
+                "value": "invalid_view",
+                "error_msg": "Invalid web_home_view: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "emojiset",
+                "value": "apple",
+                "error_msg": "Invalid emojiset: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "timezone",
+                "value": "invalid_US/Mountain",
+                "error_msg": "Invalid timezone: Value error, Not a recognized time zone",
+            },
+            {
+                "setting_name": "demote_inactive_streams",
+                "value": 10,
+                "error_msg": "Invalid demote_inactive_streams: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "web_mark_read_on_scroll_policy",
+                "value": 10,
+                "error_msg": "Invalid web_mark_read_on_scroll_policy: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "web_channel_default_view",
+                "value": 10,
+                "error_msg": "Invalid web_channel_default_view: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "user_list_style",
+                "value": 10,
+                "error_msg": "Invalid user_list_style: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "web_animate_image_previews",
+                "value": "invalid_value",
+                "error_msg": "Invalid web_animate_image_previews: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "web_stream_unreads_count_display_policy",
+                "value": 10,
+                "error_msg": "Invalid web_stream_unreads_count_display_policy: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "color_scheme",
+                "value": 10,
+                "error_msg": "Invalid color_scheme: Value error, Not in the list of possible values",
+            },
+            {
+                "setting_name": "notification_sound",
+                "value": "invalid_sound",
+                "error_msg": "Invalid notification sound '\"invalid_sound\"'",
+            },
+            {
+                "setting_name": "desktop_icon_count_display",
+                "value": 10,
+                "error_msg": "Invalid desktop_icon_count_display: Value error, Not in the list of possible values",
+            },
+        ]
         self.login("hamlet")
-        for setting_name in invalid_values_dict.keys():
-            invalid_value = invalid_values_dict.get(setting_name)
-            if isinstance(invalid_value, str):
-                invalid_value = orjson.dumps(invalid_value).decode()
+        for invalid_value in invalid_values:
+            if isinstance(invalid_value["value"], str):
+                invalid_value["value"] = orjson.dumps(invalid_value["value"]).decode()
 
-            req = {setting_name: invalid_value}
+            req = {invalid_value["setting_name"]: invalid_value["value"]}
             result = self.client_patch("/json/settings", req)
 
-            expected_error_msg = f"Invalid {setting_name}"
-            if setting_name == "notification_sound":
-                expected_error_msg = f"Invalid notification sound '{invalid_value}'"
-            self.assert_json_error(result, expected_error_msg)
+            self.assert_json_error(result, invalid_value["error_msg"])
             hamlet = self.example_user("hamlet")
-            self.assertNotEqual(getattr(hamlet, setting_name), invalid_value)
+            self.assertNotEqual(
+                getattr(hamlet, invalid_value["setting_name"]), invalid_value["value"]
+            )
 
-    def do_change_emojiset(self, emojiset: str) -> HttpResponse:
+    def test_change_timezone_montreal(self) -> None:
+        self.login("hamlet")
+        data = {"timezone": "America/Montreal"}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.timezone, "America/Toronto")
+
+    def do_change_emojiset(self, emojiset: str) -> "TestHttpResponse":
         self.login("hamlet")
         data = {"emojiset": emojiset}
         result = self.client_patch("/json/settings", data)
@@ -424,7 +517,9 @@ class ChangeSettingsTest(ZulipTestCase):
 
         for emojiset in banned_emojisets:
             result = self.do_change_emojiset(emojiset)
-            self.assert_json_error(result, "Invalid emojiset")
+            self.assert_json_error(
+                result, "Invalid emojiset: Value error, Not in the list of possible values"
+            )
 
         for emojiset in valid_emojisets:
             result = self.do_change_emojiset(emojiset)
@@ -446,12 +541,8 @@ class ChangeSettingsTest(ZulipTestCase):
         self.login("hamlet")
 
         # Now try an invalid setting name
-        json_result = self.client_patch("/json/settings", dict(invalid_setting="value"))
-        self.assert_json_success(json_result)
-
-        result = orjson.loads(json_result.content)
-        self.assertIn("ignored_parameters_unsupported", result)
-        self.assertEqual(result["ignored_parameters_unsupported"], ["invalid_setting"])
+        result = self.client_patch("/json/settings", dict(invalid_setting="value"))
+        self.assert_json_success(result, ignored_parameters=["invalid_setting"])
 
     def test_changing_setting_using_display_setting_endpoint(self) -> None:
         """
@@ -461,11 +552,11 @@ class ChangeSettingsTest(ZulipTestCase):
         self.login("hamlet")
 
         result = self.client_patch(
-            "/json/settings/display", dict(color_scheme=UserProfile.COLOR_SCHEME_NIGHT)
+            "/json/settings/display", dict(color_scheme=UserProfile.COLOR_SCHEME_DARK)
         )
         self.assert_json_success(result)
         hamlet = self.example_user("hamlet")
-        self.assertEqual(hamlet.color_scheme, UserProfile.COLOR_SCHEME_NIGHT)
+        self.assertEqual(hamlet.color_scheme, UserProfile.COLOR_SCHEME_DARK)
 
     def test_changing_setting_using_notification_setting_endpoint(self) -> None:
         """
@@ -482,6 +573,109 @@ class ChangeSettingsTest(ZulipTestCase):
         hamlet = self.example_user("hamlet")
         self.assertEqual(hamlet.enable_stream_desktop_notifications, True)
 
+    def test_changing_information_density_settings(self) -> None:
+        hamlet = self.example_user("hamlet")
+        hamlet.dense_mode = True
+        hamlet.web_font_size_px = 14
+        hamlet.web_line_height_percent = 122
+        hamlet.save()
+        self.login("hamlet")
+
+        data: dict[str, str | int] = {"web_font_size_px": 16}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_error(
+            result,
+            "Incompatible values for 'dense_mode' and 'web_font_size_px'.",
+        )
+
+        data = {"web_font_size_px": 16, "dense_mode": orjson.dumps(False).decode()}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.web_font_size_px, 16)
+        self.assertEqual(hamlet.dense_mode, False)
+
+        data = {"web_font_size_px": 20}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.web_font_size_px, 20)
+        self.assertEqual(hamlet.dense_mode, False)
+
+        # Check dense_mode is still false when both the
+        # settings are set to legacy values.
+        data = {"web_font_size_px": 14}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.web_font_size_px, 14)
+        self.assertEqual(hamlet.web_line_height_percent, 122)
+        self.assertEqual(hamlet.dense_mode, False)
+
+        data = {"dense_mode": orjson.dumps(True).decode()}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.web_font_size_px, 14)
+        self.assertEqual(hamlet.dense_mode, True)
+
+        data = {"web_line_height_percent": 140}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_error(
+            result,
+            "Incompatible values for 'dense_mode' and 'web_line_height_percent'.",
+        )
+
+        data = {"web_line_height_percent": 140, "dense_mode": orjson.dumps(False).decode()}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.web_line_height_percent, 140)
+        self.assertEqual(hamlet.dense_mode, False)
+
+        data = {"web_line_height_percent": 130}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.web_line_height_percent, 130)
+        self.assertEqual(hamlet.dense_mode, False)
+
+        # Check dense_mode is still false when both the
+        # settings are set to legacy values.
+        data = {"web_line_height_percent": 122}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.web_font_size_px, 14)
+        self.assertEqual(hamlet.web_line_height_percent, 122)
+        self.assertEqual(hamlet.dense_mode, False)
+
+        data = {"dense_mode": orjson.dumps(True).decode(), "web_font_size_px": 16}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_error(
+            result,
+            "Incompatible values for 'dense_mode' and 'web_font_size_px'.",
+        )
+
+        data = {"dense_mode": orjson.dumps(True).decode(), "web_line_height_percent": 140}
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_error(
+            result,
+            "Incompatible values for 'dense_mode' and 'web_line_height_percent'.",
+        )
+
+        data = {
+            "dense_mode": orjson.dumps(True).decode(),
+            "web_font_size_px": 14,
+            "web_line_height_percent": 122,
+        }
+        result = self.client_patch("/json/settings", data)
+        self.assert_json_success(result)
+        hamlet = self.example_user("hamlet")
+        self.assertEqual(hamlet.web_font_size_px, 14)
+        self.assertEqual(hamlet.web_line_height_percent, 122)
+        self.assertEqual(hamlet.dense_mode, True)
+
 
 class UserChangesTest(ZulipTestCase):
     def test_update_api_key(self) -> None:
@@ -495,9 +689,18 @@ class UserChangesTest(ZulipTestCase):
         for api_key in old_api_keys:
             self.assertEqual(get_user_profile_by_api_key(api_key).email, email)
 
+        # First verify this endpoint is not registered in the /json/... path
+        # to prevent access with only a session.
         result = self.client_post("/json/users/me/api_key/regenerate")
-        self.assert_json_success(result)
-        new_api_key = result.json()["api_key"]
+        self.assertEqual(result.status_code, 404)
+
+        # A logged-in session doesn't allow access to an /api/v1/ endpoint
+        # of course.
+        result = self.client_post("/api/v1/users/me/api_key/regenerate")
+        self.assertEqual(result.status_code, 401)
+
+        result = self.api_post(user, "/api/v1/users/me/api_key/regenerate")
+        new_api_key = self.assert_json_success(result)["api_key"]
         self.assertNotIn(new_api_key, old_api_keys)
         user = self.example_user("hamlet")
         current_api_keys = get_all_api_keys(user)

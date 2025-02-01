@@ -1,15 +1,14 @@
-from typing import Iterable, Optional, Sequence, Union, cast
+from collections.abc import Iterable, Sequence
+from email.headerregistry import Address
+from typing import Annotated, Literal, cast
 
-import pytz
-from dateutil.parser import parse as dateparser
 from django.core import validators
 from django.core.exceptions import ValidationError
 from django.http import HttpRequest, HttpResponse
-from django.utils.timezone import now as timezone_now
 from django.utils.translation import gettext as _
+from pydantic import Json
 
-from zerver.lib.actions import (
-    check_schedule_message,
+from zerver.actions.message_send import (
     check_send_message,
     compute_irc_user_fullname,
     compute_jabber_user_fullname,
@@ -18,43 +17,36 @@ from zerver.lib.actions import (
     extract_stream_indicator,
 )
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.message import render_markdown
-from zerver.lib.request import REQ, RequestNotes, has_request_variables
+from zerver.lib.markdown import render_message_markdown
+from zerver.lib.request import RequestNotes
 from zerver.lib.response import json_success
-from zerver.lib.timestamp import convert_to_UTC
-from zerver.lib.topic import REQ_topic
-from zerver.lib.validator import to_float
+from zerver.lib.typed_endpoint import (
+    DOCUMENTATION_PENDING,
+    ApiParamConfig,
+    OptionalTopic,
+    typed_endpoint,
+)
 from zerver.lib.zcommand import process_zcommands
 from zerver.lib.zephyr import compute_mit_user_fullname
-from zerver.models import (
-    Client,
-    Message,
-    Realm,
-    RealmDomain,
-    UserProfile,
-    email_to_domain,
-    get_user_including_cross_realm,
-)
+from zerver.models import Client, Message, RealmDomain, UserProfile
+from zerver.models.users import get_user_including_cross_realm
 
 
-class InvalidMirrorInput(Exception):
+class InvalidMirrorInputError(Exception):
     pass
 
 
 def create_mirrored_message_users(
-    request: HttpRequest, user_profile: UserProfile, recipients: Iterable[str]
+    client: Client,
+    user_profile: UserProfile,
+    recipients: Iterable[str],
+    sender: str,
+    recipient_type_name: str,
 ) -> UserProfile:
-    if "sender" not in request.POST:
-        raise InvalidMirrorInput("No sender")
-
-    sender_email = request.POST["sender"].strip().lower()
+    sender_email = sender.strip().lower()
     referenced_users = {sender_email}
-    if request.POST["type"] == "private":
-        for email in recipients:
-            referenced_users.add(email.lower())
-
-    client = RequestNotes.get_notes(request).client
-    assert client is not None
+    if recipient_type_name == "private":
+        referenced_users.update(email.lower() for email in recipients)
 
     if client.name == "zephyr_mirror":
         user_check = same_realm_zephyr_user
@@ -66,19 +58,19 @@ def create_mirrored_message_users(
         user_check = same_realm_jabber_user
         fullname_function = compute_jabber_user_fullname
     else:
-        raise InvalidMirrorInput("Unrecognized mirroring client")
+        raise InvalidMirrorInputError("Unrecognized mirroring client")
 
     for email in referenced_users:
         # Check that all referenced users are in our realm:
         if not user_check(user_profile, email):
-            raise InvalidMirrorInput("At least one user cannot be mirrored")
+            raise InvalidMirrorInputError("At least one user cannot be mirrored")
 
     # Create users for the referenced users, if needed.
     for email in referenced_users:
         create_mirror_user_if_needed(user_profile.realm, email, fullname_function)
 
-    sender = get_user_including_cross_realm(sender_email, user_profile.realm)
-    return sender
+    sender_user_profile = get_user_including_cross_realm(sender_email, user_profile.realm)
+    return sender_user_profile
 
 
 def same_realm_zephyr_user(user_profile: UserProfile, email: str) -> bool:
@@ -93,7 +85,7 @@ def same_realm_zephyr_user(user_profile: UserProfile, email: str) -> bool:
     except ValidationError:
         return False
 
-    domain = email_to_domain(email)
+    domain = Address(addr_spec=email).domain.lower()
 
     # Assumes allow_subdomains=False for all RealmDomain's corresponding to
     # these realms.
@@ -112,7 +104,8 @@ def same_realm_irc_user(user_profile: UserProfile, email: str) -> bool:
     except ValidationError:
         return False
 
-    domain = email_to_domain(email).replace("irc.", "")
+    domain = Address(addr_spec=email).domain.lower()
+    domain = domain.removeprefix("irc.")
 
     # Assumes allow_subdomains=False for all RealmDomain's corresponding to
     # these realms.
@@ -127,86 +120,56 @@ def same_realm_jabber_user(user_profile: UserProfile, email: str) -> bool:
 
     # If your Jabber users have a different email domain than the
     # Zulip users, this is where you would do any translation.
-    domain = email_to_domain(email)
+    domain = Address(addr_spec=email).domain.lower()
 
     # Assumes allow_subdomains=False for all RealmDomain's corresponding to
     # these realms.
     return RealmDomain.objects.filter(realm=user_profile.realm, domain=domain).exists()
 
 
-def handle_deferred_message(
-    sender: UserProfile,
-    client: Client,
-    message_type_name: str,
-    message_to: Union[Sequence[str], Sequence[int]],
-    topic_name: Optional[str],
-    message_content: str,
-    delivery_type: str,
-    defer_until: str,
-    tz_guess: Optional[str],
-    forwarder_user_profile: UserProfile,
-    realm: Optional[Realm],
-) -> HttpResponse:
-    deliver_at = None
-    local_tz = "UTC"
-    if tz_guess:
-        local_tz = tz_guess
-    elif sender.timezone:
-        local_tz = sender.timezone
-    try:
-        deliver_at = dateparser(defer_until)
-    except ValueError:
-        raise JsonableError(_("Invalid time format"))
-
-    deliver_at_usertz = deliver_at
-    if deliver_at_usertz.tzinfo is None:
-        user_tz = pytz.timezone(local_tz)
-        deliver_at_usertz = user_tz.normalize(user_tz.localize(deliver_at))
-    deliver_at = convert_to_UTC(deliver_at_usertz)
-
-    if deliver_at <= timezone_now():
-        raise JsonableError(_("Time must be in the future."))
-
-    check_schedule_message(
-        sender,
-        client,
-        message_type_name,
-        message_to,
-        topic_name,
-        message_content,
-        delivery_type,
-        deliver_at,
-        realm=realm,
-        forwarder_user_profile=forwarder_user_profile,
-    )
-    return json_success({"deliver_at": str(deliver_at_usertz)})
-
-
-@has_request_variables
+@typed_endpoint
 def send_message_backend(
     request: HttpRequest,
     user_profile: UserProfile,
-    message_type_name: str = REQ("type"),
-    req_to: Optional[str] = REQ("to", default=None),
-    forged_str: Optional[str] = REQ("forged", default=None, documentation_pending=True),
-    topic_name: Optional[str] = REQ_topic(),
-    message_content: str = REQ("content"),
-    widget_content: Optional[str] = REQ(default=None, documentation_pending=True),
-    realm_str: Optional[str] = REQ("realm_str", default=None, documentation_pending=True),
-    local_id: Optional[str] = REQ(default=None),
-    queue_id: Optional[str] = REQ(default=None),
-    delivery_type: str = REQ("delivery_type", default="send_now", documentation_pending=True),
-    defer_until: Optional[str] = REQ("deliver_at", default=None, documentation_pending=True),
-    tz_guess: Optional[str] = REQ("tz_guess", default=None, documentation_pending=True),
-    time: Optional[float] = REQ(default=None, converter=to_float, documentation_pending=True),
+    *,
+    req_type: Annotated[Literal["direct", "private", "stream", "channel"], ApiParamConfig("type")],
+    req_to: Annotated[str | None, ApiParamConfig("to")] = None,
+    req_sender: Annotated[
+        str | None, ApiParamConfig("sender", documentation_status=DOCUMENTATION_PENDING)
+    ] = None,
+    forged_str: Annotated[
+        str | None, ApiParamConfig("forged", documentation_status=DOCUMENTATION_PENDING)
+    ] = None,
+    topic_name: OptionalTopic = None,
+    message_content: Annotated[str, ApiParamConfig("content")],
+    widget_content: Annotated[
+        str | None, ApiParamConfig("widget_content", documentation_status=DOCUMENTATION_PENDING)
+    ] = None,
+    local_id: str | None = None,
+    queue_id: str | None = None,
+    time: Annotated[
+        Json[float] | None, ApiParamConfig("time", documentation_status=DOCUMENTATION_PENDING)
+    ] = None,
+    read_by_sender: Json[bool] | None = None,
 ) -> HttpResponse:
+    recipient_type_name = req_type
+    if recipient_type_name == "direct":
+        # For now, use "private" from Message.API_RECIPIENT_TYPES.
+        # TODO: Use "direct" here, as well as in events and
+        # message (created, schdeduled, drafts) objects/dicts.
+        recipient_type_name = "private"
+    elif recipient_type_name == "channel":
+        # For now, use "stream" from Message.API_RECIPIENT_TYPES.
+        # TODO: Use "channel" here, as well as in events and
+        # message (created, schdeduled, drafts) objects/dicts.
+        recipient_type_name = "stream"
 
-    # If req_to is None, then we default to an
+    # If to is None, then we default to an
     # empty list of recipients.
-    message_to: Union[Sequence[int], Sequence[str]] = []
+    message_to: Sequence[int] | Sequence[str] = []
 
     if req_to is not None:
-        if message_type_name == "stream":
+        if recipient_type_name == "stream":
             stream_indicator = extract_stream_indicator(req_to)
 
             # For legacy reasons check_send_message expects
@@ -232,16 +195,12 @@ def send_message_backend(
     if forged and not can_forge_sender:
         raise JsonableError(_("User not authorized for this query"))
 
-    realm = None
-    if realm_str and realm_str != user_profile.realm.string_id:
-        # The realm_str parameter does nothing, because it has to match
-        # the user's realm - but we keep it around for backward compatibility.
-        raise JsonableError(_("User not authorized for this query"))
+    realm = user_profile.realm
 
     if client.name in ["zephyr_mirror", "irc_mirror", "jabber_mirror", "JabberMirror"]:
         # Here's how security works for mirroring:
         #
-        # For private messages, the message must be (1) both sent and
+        # For direct messages, the message must be (1) both sent and
         # received exclusively by users in your realm, and (2)
         # received by the forwarding user.
         #
@@ -252,9 +211,9 @@ def send_message_backend(
         # The most important security checks are in
         # `create_mirrored_message_users` below, which checks the
         # same-realm constraint.
-        if "sender" not in request.POST:
+        if req_sender is None:
             raise JsonableError(_("Missing sender"))
-        if message_type_name != "private" and not can_forge_sender:
+        if recipient_type_name != "private" and not can_forge_sender:
             raise JsonableError(_("User not authorized for this query"))
 
         # For now, mirroring only works with recipient emails, not for
@@ -268,40 +227,30 @@ def send_message_backend(
         message_to = cast(Sequence[str], message_to)
 
         try:
-            mirror_sender = create_mirrored_message_users(request, user_profile, message_to)
-        except InvalidMirrorInput:
+            mirror_sender = create_mirrored_message_users(
+                client, user_profile, message_to, req_sender, recipient_type_name
+            )
+        except InvalidMirrorInputError:
             raise JsonableError(_("Invalid mirrored message"))
 
         if client.name == "zephyr_mirror" and not user_profile.realm.is_zephyr_mirror_realm:
             raise JsonableError(_("Zephyr mirroring is not allowed in this organization"))
         sender = mirror_sender
     else:
-        if "sender" in request.POST:
+        if req_sender is not None:
             raise JsonableError(_("Invalid mirrored message"))
         sender = user_profile
 
-    if (delivery_type == "send_later" or delivery_type == "remind") and defer_until is None:
-        raise JsonableError(_("Missing deliver_at in a request for delayed message delivery"))
+    if read_by_sender is None:
+        # Legacy default: a message you sent from a non-API client is
+        # automatically marked as read for yourself.
+        read_by_sender = client.default_read_by_sender()
 
-    if (delivery_type == "send_later" or delivery_type == "remind") and defer_until is not None:
-        return handle_deferred_message(
-            sender,
-            client,
-            message_type_name,
-            message_to,
-            topic_name,
-            message_content,
-            delivery_type,
-            defer_until,
-            tz_guess,
-            forwarder_user_profile=user_profile,
-            realm=realm,
-        )
-
-    ret = check_send_message(
+    data: dict[str, int] = {}
+    sent_message_result = check_send_message(
         sender,
         client,
-        message_type_name,
+        recipient_type_name,
         message_to,
         topic_name,
         message_content,
@@ -312,27 +261,37 @@ def send_message_backend(
         local_id=local_id,
         sender_queue_id=queue_id,
         widget_content=widget_content,
+        read_by_sender=read_by_sender,
     )
-    return json_success({"id": ret})
+    data["id"] = sent_message_result.message_id
+    if sent_message_result.automatic_new_visibility_policy:
+        data["automatic_new_visibility_policy"] = (
+            sent_message_result.automatic_new_visibility_policy
+        )
+    return json_success(request, data=data)
 
 
-@has_request_variables
+@typed_endpoint
 def zcommand_backend(
-    request: HttpRequest, user_profile: UserProfile, command: str = REQ("command")
+    request: HttpRequest, user_profile: UserProfile, *, command: str
 ) -> HttpResponse:
-    return json_success(process_zcommands(command, user_profile))
+    return json_success(request, data=process_zcommands(command, user_profile))
 
 
-@has_request_variables
+@typed_endpoint
 def render_message_backend(
-    request: HttpRequest, user_profile: UserProfile, content: str = REQ()
+    request: HttpRequest,
+    user_profile: UserProfile,
+    *,
+    content: str,
 ) -> HttpResponse:
     message = Message()
     message.sender = user_profile
+    message.realm = user_profile.realm
     message.content = content
     client = RequestNotes.get_notes(request).client
     assert client is not None
     message.sending_client = client
 
-    rendering_result = render_markdown(message, content, realm=user_profile.realm)
-    return json_success({"rendered": rendering_result.rendered_content})
+    rendering_result = render_message_markdown(message, content, realm=user_profile.realm)
+    return json_success(request, data={"rendered": rendering_result.rendered_content})

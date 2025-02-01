@@ -1,9 +1,7 @@
-import datetime
 import os
 import re
-from typing import List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
 
-import pytz
 from django.conf import settings
 from django.utils.timezone import now as timezone_now
 
@@ -15,40 +13,36 @@ from zerver.signals import get_device_browser
 # LAST_SERVER_UPGRADE_TIME is the last time the server had a version deployed.
 if settings.PRODUCTION:  # nocoverage
     timestamp = os.path.basename(os.path.abspath(settings.DEPLOY_ROOT))
-    LAST_SERVER_UPGRADE_TIME = datetime.datetime.strptime(timestamp, "%Y-%m-%d-%H-%M-%S").replace(
-        tzinfo=pytz.utc
+    LAST_SERVER_UPGRADE_TIME = datetime.strptime(timestamp, "%Y-%m-%d-%H-%M-%S").replace(
+        tzinfo=timezone.utc
     )
 else:
     LAST_SERVER_UPGRADE_TIME = timezone_now()
 
 
-def is_outdated_server(user_profile: Optional[UserProfile]) -> bool:
+def is_outdated_server(user_profile: UserProfile | None) -> bool:
     # Release tarballs are unpacked via `tar -xf`, which means the
     # `mtime` on files in them is preserved from when the release
     # tarball was built.  Checking this allows us to catch cases where
     # someone has upgraded in the last year but to a release more than
     # a year old.
     git_version_path = os.path.join(settings.DEPLOY_ROOT, "version.py")
-    release_build_time = datetime.datetime.utcfromtimestamp(
-        os.path.getmtime(git_version_path)
-    ).replace(tzinfo=pytz.utc)
+    release_build_time = datetime.fromtimestamp(os.path.getmtime(git_version_path), timezone.utc)
 
     version_no_newer_than = min(LAST_SERVER_UPGRADE_TIME, release_build_time)
-    deadline = version_no_newer_than + datetime.timedelta(
-        days=settings.SERVER_UPGRADE_NAG_DEADLINE_DAYS
-    )
+    deadline = version_no_newer_than + timedelta(days=settings.SERVER_UPGRADE_NAG_DEADLINE_DAYS)
 
     if user_profile is None or not user_profile.is_realm_admin:
         # Administrators get warned at the deadline; all users 30 days later.
-        deadline = deadline + datetime.timedelta(days=30)
+        deadline += timedelta(days=30)
 
     if timezone_now() > deadline:
         return True
     return False
 
 
-def pop_numerals(ver: str) -> Tuple[List[int], str]:
-    match = re.search(r"^( \d+ (?: \. \d+ )* ) (.*)", ver, re.X)
+def pop_numerals(ver: str) -> tuple[list[int], str]:
+    match = re.search(r"^( \d+ (?: \. \d+ )* ) (.*)", ver, re.VERBOSE)
     if match is None:
         return [], ver
     numerals, rest = match.groups()
@@ -56,7 +50,7 @@ def pop_numerals(ver: str) -> Tuple[List[int], str]:
     return numbers, rest
 
 
-def version_lt(ver1: str, ver2: str) -> Optional[bool]:
+def version_lt(ver1: str, ver2: str) -> bool | None:
     """
     Compare two Zulip-style version strings.
 
@@ -98,15 +92,15 @@ def version_lt(ver1: str, ver2: str) -> Optional[bool]:
     return None
 
 
-def find_mobile_os(user_agent: str) -> Optional[str]:
-    if re.search(r"\b Android \b", user_agent, re.I | re.X):
+def find_mobile_os(user_agent: str) -> str | None:
+    if re.search(r"\b Android \b", user_agent, re.IGNORECASE | re.VERBOSE):
         return "android"
-    if re.search(r"\b(?: iOS | iPhone\ OS )\b", user_agent, re.I | re.X):
+    if re.search(r"\b(?: iOS | iPhone\ OS )\b", user_agent, re.IGNORECASE | re.VERBOSE):
         return "ios"
     return None
 
 
-def is_outdated_desktop_app(user_agent_str: str) -> Tuple[bool, bool, bool]:
+def is_outdated_desktop_app(user_agent_str: str) -> tuple[bool, bool, bool]:
     # Returns (insecure, banned, auto_update_broken)
     user_agent = parse_user_agent(user_agent_str)
     if user_agent["name"] == "ZulipDesktop":
@@ -134,8 +128,32 @@ def is_outdated_desktop_app(user_agent_str: str) -> Tuple[bool, bool, bool]:
     return (False, False, False)
 
 
-def is_unsupported_browser(user_agent: str) -> Tuple[bool, Optional[str]]:
+def is_unsupported_browser(user_agent: str) -> tuple[bool, str | None]:
     browser_name = get_device_browser(user_agent)
     if browser_name == "Internet Explorer":
         return (True, browser_name)
     return (False, browser_name)
+
+
+def is_pronouns_field_type_supported(user_agent_str: str | None) -> bool:
+    # In order to avoid users having a bad experience with these
+    # custom profile fields disappearing after applying migration
+    # 0421_migrate_pronouns_custom_profile_fields, we provide this
+    # compatibility shim to show such custom profile fields as
+    # SHORT_TEXT to older mobile app clients.
+    #
+    # TODO/compatibility(7.0): Because this is a relatively minor
+    # detail, we can remove this compatibility hack once most users
+    # have upgraded to a sufficiently new mobile client.
+    if user_agent_str is None:
+        return True
+
+    user_agent = parse_user_agent(user_agent_str)
+    if user_agent["name"] != "ZulipMobile":
+        return True
+
+    FIRST_VERSION_TO_SUPPORT_PRONOUNS_FIELD = "27.192"
+    if version_lt(user_agent["version"], FIRST_VERSION_TO_SUPPORT_PRONOUNS_FIELD):
+        return False
+
+    return True

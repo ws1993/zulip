@@ -1,11 +1,11 @@
 class zulip::supervisor {
   $supervisor_service = $zulip::common::supervisor_service
 
-  package { 'supervisor': ensure => 'installed' }
+  package { 'supervisor': ensure => installed }
 
   $system_conf_dir = $zulip::common::supervisor_system_conf_dir
   file { $system_conf_dir:
-    ensure  => 'directory',
+    ensure  => directory,
     require => Package['supervisor'],
     owner   => 'root',
     group   => 'root',
@@ -16,41 +16,13 @@ class zulip::supervisor {
   $should_purge = $facts['leave_supervisor'] != 'true'
   # lint:endignore
   file { $conf_dir:
-    ensure  => 'directory',
+    ensure  => directory,
     require => Package['supervisor'],
     owner   => 'root',
     group   => 'root',
     purge   => $should_purge,
     recurse => true,
     notify  => Service[$supervisor_service],
-  }
-
-  # These files were moved from /etc/supervisor/conf.d/ into a zulip/
-  # subdirectory in 2020-10 in version 4.0; these lines can be removed
-  # in Zulip version 5.0 and later.
-  file { [
-    "${zulip::common::supervisor_system_conf_dir}/cron.conf",
-    "${zulip::common::supervisor_system_conf_dir}/nginx.conf",
-    "${zulip::common::supervisor_system_conf_dir}/smokescreen.conf",
-    "${zulip::common::supervisor_system_conf_dir}/thumbor.conf",
-    "${zulip::common::supervisor_system_conf_dir}/zulip.conf",
-    "${zulip::common::supervisor_system_conf_dir}/zulip_db.conf",
-    ]:
-    ensure => absent,
-  }
-
-  # These were similarly moved, but were only referenced in zulip_ops,
-  # and thus can be removed as soon as all relevant hosts have been
-  # updated:
-  file { [
-    "${zulip::common::supervisor_system_conf_dir}/grafana.conf",
-    "${zulip::common::supervisor_system_conf_dir}/munin_tunnels.conf",
-    "${zulip::common::supervisor_system_conf_dir}/prometheus.conf",
-    "${zulip::common::supervisor_system_conf_dir}/prometheus_node_exporter.conf",
-    "${zulip::common::supervisor_system_conf_dir}/redis_tunnel.conf",
-    "${zulip::common::supervisor_system_conf_dir}/zmirror.conf",
-    ]:
-    ensure => absent,
   }
 
   # In the docker environment, we don't want/need supervisor to be
@@ -105,19 +77,30 @@ class zulip::supervisor {
     }
     exec { 'supervisor-restart':
       refreshonly => true,
+      provider    => shell,
       command     => $zulip::common::supervisor_reload,
       require     => Service[$supervisor_service],
     }
   }
 
-  file { $zulip::common::supervisor_conf_file:
-    ensure  => file,
+  $file_descriptor_limit = zulipconf('application_server', 'service_file_descriptor_limit', 40000)
+  concat { $zulip::common::supervisor_conf_file:
+    ensure  => 'present',
     require => Package[supervisor],
     owner   => 'root',
     group   => 'root',
     mode    => '0644',
-    content => template('zulip/supervisor/supervisord.conf.erb'),
     notify  => Exec['supervisor-restart'],
+  }
+  concat::fragment { '00-supervisor-top':
+    order   => '01',
+    target  => $zulip::common::supervisor_conf_file,
+    content => rstrip(template('zulip/supervisor/supervisord.conf.erb')),
+  }
+  concat::fragment { '99-supervisor-end':
+    order   => '99',
+    target  => $zulip::common::supervisor_conf_file,
+    content => "\n",
   }
 
   file { '/usr/local/bin/secret-env-wrapper':

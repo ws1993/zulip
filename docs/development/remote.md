@@ -62,7 +62,7 @@ The main difference from the standard instructions is that for a
 remote development environment, and you're not using our Digital Ocean
 Droplet infrastructure (which handles `EXTERNAL_HOST` for you), you'll
 need to run `export EXTERNAL_HOST=<REMOTE_IP>:9991` in a shell before
-running `run-dev.py` (and see also the `--interface=''` option
+running `run-dev` (and see also the `--interface=''` option
 documented below).
 
 If your server has a static IP address, we recommend putting this
@@ -77,14 +77,14 @@ development server with the following command in the directory where
 you cloned Zulip:
 
 ```bash
-./tools/run-dev.py --interface=''
+./tools/run-dev --interface=''
 ```
 
 This will start up the Zulip server on port 9991. You can then
-navigate to `http://<REMOTE_IP>:9991` and you should see something like
+navigate to `http://<REMOTE_IP>:9991/devlogin` and you should see something like
 this screenshot of the Zulip development environment:
 
-![Image of Zulip development environment](../images/zulip-dev.png)
+![Image of Zulip development environment](../images/zulip-devlogin.png)
 
 The `--interface=''` option makes the Zulip development environment
 accessible from any IP address (in contrast with the much more secure
@@ -151,7 +151,7 @@ guide][rtd-git-guide]. In brief, the steps are as follows.
 On your **local computer**:
 
 1. Open _Terminal_ (macOS/Linux) or _Git for BASH_.
-2. Change directory to where you cloned Zulip (e.g. `cd zulip`).
+2. Change directory to where you cloned Zulip (e.g., `cd zulip`).
 3. Use `git add` and `git commit` to stage and commit your changes (if you
    haven't already).
 4. Push your commits to GitHub with `git push origin branchname`.
@@ -211,11 +211,11 @@ well; contributions of precise documentation for them are welcome!
    ```
 3. Make sure the remote server is running in VS Code (you can
    force-start through the Command Palette).
-4. SSH to your remote machine using
+4. SSH to your remote machine using:
    ```console
    $ ssh -R 52698:localhost:52698 user@example.org
    ```
-5. On your remote machine, run
+5. On your remote machine, run:
    ```console
    $ rmate [options] file
    ```
@@ -270,8 +270,8 @@ Next, read the following to learn more about developing for Zulip:
 - [Using the development environment][rtd-using-dev-env]
 - [Testing][rtd-testing]
 
-[install-direct]: ../development/setup-advanced.html#installing-directly-on-ubuntu-debian-centos-or-fedora
-[install-vagrant]: ../development/setup-vagrant.md
+[install-direct]: setup-advanced.md#installing-directly-on-ubuntu-debian-centos-or-fedora
+[install-vagrant]: setup-recommended.md
 [rtd-git-guide]: ../git/index.md
 [rtd-using-dev-env]: using.md
 [rtd-testing]: ../testing/testing.md
@@ -282,17 +282,17 @@ Next, read the following to learn more about developing for Zulip:
 
 ## Using an nginx reverse proxy
 
-For some applications (e.g. developing an OAuth2 integration for
+For some applications (e.g., developing an OAuth2 integration for
 Facebook), you may need your Zulip development to have a valid SSL
-certificate. While `run-dev.py` doesn't support that, you can do this
-with an `nginx` reverse proxy sitting in front of `run-dev.py.`.
+certificate. While `run-dev` doesn't support that, you can do this
+with an `nginx` reverse proxy sitting in front of `run-dev`.
 
 The following instructions assume you have a Zulip Droplet working and
 that the user is `zulipdev`; edit accordingly if the situation is
 different.
 
 1. First, get an SSL certificate; you can use
-   [our certbot wrapper script used for production](../production/ssl-certificates.html#certbot-recommended)
+   [our certbot wrapper script used for production](../production/ssl-certificates.md#certbot-recommended)
    by running the following commands as root:
 
    ```bash
@@ -314,11 +314,7 @@ different.
    service nginx reload  # Actually enabled your nginx configuration
    ```
 
-1. Edit `zproject/dev_settings.py` to set
-   `EXTERNAL_URI_SCHEME = "https://"`, so that URLs served by the
-   development environment will be HTTPS.
-
-1. Start the Zulip development environment with the following command:
+1. Start the Zulip development environment in HTTPS mode with the following command:
    ```bash
-   env EXTERNAL_HOST="hostname.example.com" ./tools/run-dev.py --interface=''
+   env EXTERNAL_HOST="hostname.example.com" ./tools/run-dev --behind-https-proxy --interface=''
    ```

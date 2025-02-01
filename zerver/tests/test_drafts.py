@@ -1,6 +1,6 @@
 import time
 from copy import deepcopy
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import orjson
 
@@ -11,8 +11,8 @@ from zerver.models import Draft
 class DraftCreationTests(ZulipTestCase):
     def create_and_check_drafts_for_success(
         self,
-        draft_dicts: List[Dict[str, Any]],
-        expected_draft_dicts: Optional[List[Dict[str, Any]]] = None,
+        draft_dicts: list[dict[str, Any]],
+        expected_draft_dicts: list[dict[str, Any]] | None = None,
     ) -> None:
         hamlet = self.example_user("hamlet")
 
@@ -32,7 +32,7 @@ class DraftCreationTests(ZulipTestCase):
         self.assertEqual(new_draft_dicts, expected_draft_dicts)
 
     def create_and_check_drafts_for_error(
-        self, draft_dicts: List[Dict[str, Any]], expected_message: str
+        self, draft_dicts: list[dict[str, Any]], expected_message: str
     ) -> None:
         hamlet = self.example_user("hamlet")
 
@@ -82,11 +82,12 @@ class DraftCreationTests(ZulipTestCase):
                 "timestamp": 1595479019,
             }
         ]
+        # For direct messages, the topic should be ignored.
         expected_draft_dicts = [
             {
                 "type": "private",
                 "to": [zoe.id],
-                "topic": "",  # For private messages the topic should be ignored.
+                "topic": "",
                 "content": "What if we made it possible to sync drafts in Zulip?",
                 "timestamp": 1595479019,
             }
@@ -105,11 +106,12 @@ class DraftCreationTests(ZulipTestCase):
                 "timestamp": 1595479019,
             }
         ]
+        # For direct messages, the topic should be ignored.
         expected_draft_dicts = [
             {
                 "type": "private",
                 "to": [zoe.id, othello.id],
-                "topic": "",  # For private messages the topic should be ignored.
+                "topic": "",
                 "content": "What if we made it possible to sync drafts in Zulip?",
                 "timestamp": 1595479019,
             }
@@ -129,21 +131,21 @@ class DraftCreationTests(ZulipTestCase):
                 "topic": "sync drafts",
                 "content": "Let's add backend support for syncing drafts.",
                 "timestamp": 1595479019,
-            },  # Stream message draft
+            },
             {
                 "type": "private",
                 "to": [zoe.id],
                 "topic": "",
                 "content": "What if we made it possible to sync drafts in Zulip?",
                 "timestamp": 1595479020,
-            },  # Private message draft
+            },
             {
                 "type": "private",
                 "to": [zoe.id, othello.id],
                 "topic": "",
                 "content": "What if we made it possible to sync drafts in Zulip?",
                 "timestamp": 1595479021,
-            },  # Private group message draft
+            },
         ]
         self.create_and_check_drafts_for_success(draft_dicts)
 
@@ -238,7 +240,7 @@ class DraftCreationTests(ZulipTestCase):
             }
         ]
         self.create_and_check_drafts_for_error(
-            draft_dicts, "Must specify exactly 1 stream ID for stream messages"
+            draft_dicts, "Must specify exactly 1 channel ID for channel messages"
         )
 
     def test_create_stream_draft_for_inaccessible_stream(self) -> None:
@@ -253,7 +255,7 @@ class DraftCreationTests(ZulipTestCase):
                 "timestamp": 1595479019,
             }
         ]
-        self.create_and_check_drafts_for_error(draft_dicts, "Invalid stream id")
+        self.create_and_check_drafts_for_error(draft_dicts, "Invalid channel ID")
 
         # When the stream itself does not exist:
         draft_dicts = [
@@ -265,7 +267,7 @@ class DraftCreationTests(ZulipTestCase):
                 "timestamp": 1595479019,
             }
         ]
-        self.create_and_check_drafts_for_error(draft_dicts, "Invalid stream id")
+        self.create_and_check_drafts_for_error(draft_dicts, "Invalid channel ID")
 
     def test_create_personal_message_draft_for_non_existing_user(self) -> None:
         draft_dicts = [
@@ -349,7 +351,7 @@ class DraftEditTests(ZulipTestCase):
         new_draft_dict.pop("id")
         self.assertEqual(new_draft_dict, draft_dict)
 
-    def test_edit_non_existant_draft(self) -> None:
+    def test_edit_non_existent_draft(self) -> None:
         hamlet = self.example_user("hamlet")
 
         initial_count = Draft.objects.count()
@@ -447,7 +449,7 @@ class DraftDeleteTests(ZulipTestCase):
         # Now make sure that the there are no more drafts.
         self.assertEqual(Draft.objects.count() - initial_count, 0)
 
-    def test_delete_non_existant_draft(self) -> None:
+    def test_delete_non_existent_draft(self) -> None:
         hamlet = self.example_user("hamlet")
 
         # Make sure that no draft exists in the first place.
@@ -564,8 +566,8 @@ class DraftFetchTest(ZulipTestCase):
         self.assertEqual(data["count"], 3)
 
         first_draft_id = Draft.objects.filter(user_profile=hamlet).order_by("id")[0].id
-        expected_draft_contents = [
-            {"id": first_draft_id + i, **draft_dicts[i]} for i in range(0, 3)
+        expected_draft_contents: list[dict[str, object]] = [
+            {"id": first_draft_id + i, **draft_dicts[i]} for i in range(3)
         ]
 
         self.assertEqual(data["drafts"], expected_draft_contents)

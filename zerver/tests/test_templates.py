@@ -1,8 +1,6 @@
-from unittest.mock import MagicMock, call, patch
-
 from django.template.loader import get_template
 
-from zerver.lib.exceptions import InvalidMarkdownIncludeStatement
+from zerver.lib.exceptions import InvalidMarkdownIncludeStatementError
 from zerver.lib.test_classes import ZulipTestCase
 
 
@@ -38,16 +36,16 @@ header
 
 <h1 id="heading">Heading</h1>
 <p>
-  <div class="code-section has-tabs" markdown="1">
+  <div class="tabbed-section has-tabs" markdown="1">
     <ul class="nav">
-      <li data-language="ios" tabindex="0">iOS</li>
-      <li data-language="desktop-web" tabindex="0">Desktop/Web</li>
+      <li data-tab-key="ios" tabindex="0">iOS</li>
+      <li data-tab-key="desktop-web" tabindex="0">Desktop/Web</li>
     </ul>
     <div class="blocks">
-      <div data-language="ios" markdown="1"></p>
+      <div class="tab-content" data-tab-key="ios" markdown="1"></p>
         <p>iOS instructions</p>
       <p></div>
-      <div data-language="desktop-web" markdown="1"></p>
+      <div class="tab-content" data-tab-key="desktop-web" markdown="1"></p>
         <p>Desktop/browser instructions</p>
       <p></div>
     </div>
@@ -56,16 +54,16 @@ header
 
 <h2 id="heading-2">Heading 2</h2>
 <p>
-  <div class="code-section has-tabs" markdown="1">
+  <div class="tabbed-section has-tabs" markdown="1">
     <ul class="nav">
-      <li data-language="desktop-web" tabindex="0">Desktop/Web</li>
-      <li data-language="android" tabindex="0">Android</li>
+      <li data-tab-key="desktop-web" tabindex="0">Desktop/Web</li>
+      <li data-tab-key="android" tabindex="0">Android</li>
     </ul>
     <div class="blocks">
-      <div data-language="desktop-web" markdown="1"></p>
+      <div class="tab-content" data-tab-key="desktop-web" markdown="1"></p>
         <p>Desktop/browser instructions</p>
       <p></div>
-      <div data-language="android" markdown="1"></p>
+      <div class="tab-content" data-tab-key="android" markdown="1"></p>
         <p>Android instructions</p>
       <p></div>
     </div>
@@ -74,12 +72,12 @@ header
 
 <h2 id="heading-3">Heading 3</h2>
 <p>
-  <div class="code-section no-tabs" markdown="1">
+  <div class="tabbed-section no-tabs" markdown="1">
     <ul class="nav">
-      <li data-language="instructions-for-all-platforms" tabindex="0">Instructions for all platforms</li>
+      <li data-tab-key="instructions-for-all-platforms" tabindex="0">Instructions for all platforms</li>
     </ul>
     <div class="blocks">
-      <div data-language="instructions-for-all-platforms" markdown="1"></p>
+      <div class="tab-content" data-tab-key="instructions-for-all-platforms" markdown="1"></p>
         <p>Instructions for all platforms</p>
       <p></div>
     </div>
@@ -118,25 +116,16 @@ footer
         )
         self.assertEqual(content_sans_whitespace, expected)
 
-    @patch("builtins.print")
-    def test_custom_markdown_include_extension(self, mock_print: MagicMock) -> None:
+    def test_custom_markdown_include_extension(self) -> None:
         template = get_template("tests/test_markdown.html")
         context = {
             "markdown_test_file": "zerver/tests/markdown/test_custom_include_extension.md",
         }
 
         with self.assertRaisesRegex(
-            InvalidMarkdownIncludeStatement, "Invalid Markdown include statement"
+            InvalidMarkdownIncludeStatementError, "Invalid Markdown include statement"
         ):
             template.render(context)
-        self.assertEqual(
-            mock_print.mock_calls,
-            [
-                call(
-                    "Warning: could not find file templates/zerver/help/include/nonexistent-macro.md. Error: [Errno 2] No such file or directory: 'templates/zerver/help/include/nonexistent-macro.md'"
-                )
-            ],
-        )
 
     def test_custom_markdown_include_extension_empty_macro(self) -> None:
         template = get_template("tests/test_markdown.html")

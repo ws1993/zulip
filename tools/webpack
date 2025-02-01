@@ -3,21 +3,47 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 from typing import NoReturn
 
-os.chdir(os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+os.chdir(os.path.join(os.path.dirname(__file__), "../web"))
 
 
-def build_for_prod_or_puppeteer(quiet: bool) -> NoReturn:
+from version import ZULIP_VERSION
+
+webpack_command = [
+    "node",
+    "--experimental-strip-types",
+    "--no-warnings=ExperimentalWarning",
+    "../node_modules/webpack-cli/bin/cli.js",
+]
+
+
+def build_for_prod_or_puppeteer(quiet: bool, config_name: str | None = None) -> NoReturn:
     """Builds for production, writing the output to disk"""
 
-    webpack_args = ["node"]
     with open("/proc/meminfo") as meminfo:
         if int(next(meminfo).split()[1]) < 3 * 1024 * 1024:
-            webpack_args += ["--max-old-space-size=1536"]
-    webpack_args += ["node_modules/.bin/webpack-cli", "--mode=production"]
+            os.environ["NODE_OPTIONS"] = "--max-old-space-size=1536"
+    webpack_args = [
+        *webpack_command,
+        "build",
+        "--mode=production",
+        f"--env=ZULIP_VERSION={ZULIP_VERSION}",
+    ]
     if quiet:
         webpack_args += ["--stats=errors-only"]
+    if config_name is not None:
+        webpack_args += [f"--config-name={config_name}"]
+    if "PUPPETEER_TESTS" in os.environ:
+        webpack_args.append("--env=puppeteer_tests")
+
+    # Silence warnings from "browserslist" about using old data; those
+    # warnings are only useful for development
+    os.environ["BROWSERSLIST_IGNORE_OLD_DATA"] = "1"
+
     os.execvp(webpack_args[0], webpack_args)
 
 
@@ -27,10 +53,11 @@ def build_for_dev_server(host: str, port: str, minify: bool, disable_host_check:
     # This is our most dynamic configuration, which we use for our
     # dev server.  The key piece here is that we identify changes to
     # files as devs make edits and serve new assets on the fly.
-    webpack_args = ["node", "node_modules/.bin/webpack-cli", "serve"]
-    webpack_args += [
+    webpack_args = [
+        *webpack_command,
+        "serve",
         # webpack-cli has a bug where it ignores --watch-poll with
-        # multi-config, and we don't need the katex-cli part anyway.
+        # multi-config, and we don't need the katex part anyway.
         "--config-name=frontend",
         f"--host={host}",
         f"--port={port}",
@@ -44,7 +71,7 @@ def build_for_dev_server(host: str, port: str, minify: bool, disable_host_check:
     if disable_host_check:
         webpack_args.append("--allowed-hosts=all")
     else:
-        webpack_args.append("--allowed-hosts=" + ",".join([host, ".zulipdev.com", ".zulipdev.org"]))
+        webpack_args.append(f"--allowed-hosts={host},.zulipdev.com,.zulipdev.org")
 
     # Tell webpack-dev-server to fall back to periodic polling on
     # filesystems where inotify is known to be broken.
@@ -79,8 +106,8 @@ def build_for_dev_server(host: str, port: str, minify: bool, disable_host_check:
         # We did a chdir to the root of the Zulip checkout above.
         for filepath in [
             "webpack.config.ts",
-            "tools/webpack.assets.json",
-            "tools/webpack.dev-assets.json",
+            "webpack.assets.json",
+            "webpack.dev-assets.json",
         ]:
             watch_manager.add_watch(filepath, pyinotify.IN_MODIFY)
         event_notifier.loop()
@@ -100,17 +127,17 @@ def build_for_most_tests() -> None:
     # configuration for ALL tests, but figuring out the full history here
     # was out of the scope of the effort here to add some comments and
     # clean up names.
-    with open("tools/webpack.assets.json") as json_data:
+    with open("webpack.assets.json") as json_data:
         entries = json.load(json_data)
 
-    with open("tools/webpack.dev-assets.json") as json_data:
+    with open("webpack.dev-assets.json") as json_data:
         entries.update(json.load(json_data))
 
     stat_data = {
         "status": "done",
         "chunks": {entry: [f"{entry}-stubentry.js"] for entry in entries},
     }
-    directory = "var"
+    directory = "../var"
     if not os.path.exists(directory):
         os.makedirs(directory)
     with open(os.path.join(directory, "webpack-stats-test.json"), "w") as outfile:
@@ -137,6 +164,7 @@ parser.add_argument(
 parser.add_argument(
     "--disable-host-check", action="store_true", help="Disable host check for webpack-dev-server"
 )
+parser.add_argument("--config-name", help="Limit production building to only one config-name")
 
 args = parser.parse_args()
 if "PUPPETEER_TESTS" in os.environ:
@@ -146,4 +174,4 @@ elif args.test:
 elif args.watch:
     build_for_dev_server(args.host, args.port, args.minify, args.disable_host_check)
 else:
-    build_for_prod_or_puppeteer(args.quiet)
+    build_for_prod_or_puppeteer(args.quiet, args.config_name)

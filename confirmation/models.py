@@ -1,10 +1,11 @@
 # Copyright: (c) 2008, Jarek Zgoda <jarek.zgoda@gmail.com>
 
 __revision__ = "$Id: models.py 28 2009-10-22 15:03:02Z jarek.zgoda $"
-import datetime
 import secrets
 from base64 import b32encode
-from typing import List, Mapping, Optional, Union
+from collections.abc import Mapping
+from datetime import timedelta
+from typing import Optional, TypeAlias, Union, cast
 from urllib.parse import urljoin
 
 from django.conf import settings
@@ -13,23 +14,31 @@ from django.contrib.contenttypes.models import ContentType
 from django.db import models
 from django.db.models import CASCADE
 from django.http import HttpRequest, HttpResponse
-from django.shortcuts import render
+from django.template.response import TemplateResponse
 from django.urls import reverse
 from django.utils.timezone import now as timezone_now
-from typing_extensions import Protocol
+from typing_extensions import override
 
-from zerver.models import EmailChangeStatus, MultiuseInvite, PreregistrationUser, Realm, UserProfile
+from confirmation import settings as confirmation_settings
+from zerver.lib.types import UNSET, Unset
+from zerver.models import (
+    EmailChangeStatus,
+    MultiuseInvite,
+    PreregistrationRealm,
+    PreregistrationUser,
+    Realm,
+    RealmReactivationStatus,
+    UserProfile,
+)
+
+if settings.ZILENCER_ENABLED:
+    from zilencer.models import (
+        PreregistrationRemoteRealmBillingUser,
+        PreregistrationRemoteServerBillingUser,
+    )
 
 
-class HasRealmObject(Protocol):
-    realm: Realm
-
-
-class OptionalHasRealmObject(Protocol):
-    realm: Optional[Realm]
-
-
-class ConfirmationKeyException(Exception):
+class ConfirmationKeyError(Exception):
     WRONG_LENGTH = 1
     EXPIRED = 2
     DOES_NOT_EXIST = 3
@@ -40,13 +49,13 @@ class ConfirmationKeyException(Exception):
 
 
 def render_confirmation_key_error(
-    request: HttpRequest, exception: ConfirmationKeyException
+    request: HttpRequest, exception: ConfirmationKeyError
 ) -> HttpResponse:
-    if exception.error_type == ConfirmationKeyException.WRONG_LENGTH:
-        return render(request, "confirmation/link_malformed.html", status=404)
-    if exception.error_type == ConfirmationKeyException.EXPIRED:
-        return render(request, "confirmation/link_expired.html", status=404)
-    return render(request, "confirmation/link_does_not_exist.html", status=404)
+    if exception.error_type == ConfirmationKeyError.WRONG_LENGTH:
+        return TemplateResponse(request, "confirmation/link_malformed.html", status=404)
+    if exception.error_type == ConfirmationKeyError.EXPIRED:
+        return TemplateResponse(request, "confirmation/link_expired.html", status=404)
+    return TemplateResponse(request, "confirmation/link_does_not_exist.html", status=404)
 
 
 def generate_key() -> str:
@@ -54,60 +63,111 @@ def generate_key() -> str:
     return b32encode(secrets.token_bytes(15)).decode().lower()
 
 
-ConfirmationObjT = Union[MultiuseInvite, PreregistrationUser, EmailChangeStatus]
+NoZilencerConfirmationObjT: TypeAlias = (
+    MultiuseInvite
+    | PreregistrationRealm
+    | PreregistrationUser
+    | EmailChangeStatus
+    | UserProfile
+    | RealmReactivationStatus
+)
+ZilencerConfirmationObjT: TypeAlias = Union[
+    NoZilencerConfirmationObjT,
+    "PreregistrationRemoteServerBillingUser",
+    "PreregistrationRemoteRealmBillingUser",
+]
+
+ConfirmationObjT: TypeAlias = NoZilencerConfirmationObjT | ZilencerConfirmationObjT
 
 
 def get_object_from_key(
-    confirmation_key: str, confirmation_types: List[int], activate_object: bool = True
+    confirmation_key: str,
+    confirmation_types: list[int],
+    *,
+    mark_object_used: bool,
+    allow_used: bool = False,
 ) -> ConfirmationObjT:
+    """Access a confirmation object from one of the provided confirmation
+    types with the provided key.
+
+    The mark_object_used parameter determines whether to mark the
+    confirmation object as used (which generally prevents it from
+    being used again). It should always be False for MultiuseInvite
+    objects, since they are intended to be used multiple times.
+
+    By default, used confirmation objects cannot be used again as part
+    of their security model.
+    """
+
     # Confirmation keys used to be 40 characters
     if len(confirmation_key) not in (24, 40):
-        raise ConfirmationKeyException(ConfirmationKeyException.WRONG_LENGTH)
+        raise ConfirmationKeyError(ConfirmationKeyError.WRONG_LENGTH)
     try:
         confirmation = Confirmation.objects.get(
             confirmation_key=confirmation_key, type__in=confirmation_types
         )
     except Confirmation.DoesNotExist:
-        raise ConfirmationKeyException(ConfirmationKeyException.DOES_NOT_EXIST)
+        raise ConfirmationKeyError(ConfirmationKeyError.DOES_NOT_EXIST)
 
-    if timezone_now() > confirmation.expiry_date:
-        raise ConfirmationKeyException(ConfirmationKeyException.EXPIRED)
+    if confirmation.expiry_date is not None and timezone_now() > confirmation.expiry_date:
+        raise ConfirmationKeyError(ConfirmationKeyError.EXPIRED)
 
     obj = confirmation.content_object
     assert obj is not None
-    if activate_object and hasattr(obj, "status"):
-        obj.status = getattr(settings, "STATUS_ACTIVE", 1)
+
+    forbidden_statuses = {confirmation_settings.STATUS_REVOKED}
+    if not allow_used:
+        forbidden_statuses.add(confirmation_settings.STATUS_USED)
+
+    if hasattr(obj, "status") and obj.status in forbidden_statuses:
+        # Confirmations where the object has the status attribute are one-time use
+        # and are marked after being revoked (or used).
+        raise ConfirmationKeyError(ConfirmationKeyError.EXPIRED)
+
+    if mark_object_used:
+        # MultiuseInvite objects do not use the STATUS_USED status, since they are
+        # intended to be used more than once.
+        assert confirmation.type != Confirmation.MULTIUSE_INVITE
+        assert hasattr(obj, "status")
+        obj.status = getattr(settings, "STATUS_USED", 1)
         obj.save(update_fields=["status"])
     return obj
 
 
-def create_confirmation_link(
-    obj: Union[Realm, HasRealmObject, OptionalHasRealmObject],
+def create_confirmation_object(
+    obj: ConfirmationObjT,
     confirmation_type: int,
     *,
-    validity_in_days: Optional[int] = None,
-    url_args: Mapping[str, str] = {},
-) -> str:
-    # validity_in_days is an override for the default values which are
+    validity_in_minutes: int | None | Unset = UNSET,
+    no_associated_realm_object: bool = False,
+) -> "Confirmation":
+    # validity_in_minutes is an override for the default values which are
     # determined by the confirmation_type - its main purpose is for use
     # in tests which may want to have control over the exact expiration time.
     key = generate_key()
-    realm = None
-    if isinstance(obj, Realm):
-        realm = obj
-    elif hasattr(obj, "realm"):
+
+    # Some confirmation objects, like those for realm creation or those used
+    # for the self-hosted management flows, are not associated with a realm
+    # hosted by this Zulip server.
+    if no_associated_realm_object:
+        realm = None
+    else:
+        obj = cast(NoZilencerConfirmationObjT, obj)
+        assert not isinstance(obj, PreregistrationRealm)
         realm = obj.realm
 
     current_time = timezone_now()
     expiry_date = None
-    if validity_in_days:
-        expiry_date = current_time + datetime.timedelta(days=validity_in_days)
+    if not isinstance(validity_in_minutes, Unset):
+        if validity_in_minutes is None:
+            expiry_date = None
+        else:
+            assert validity_in_minutes is not None
+            expiry_date = current_time + timedelta(minutes=validity_in_minutes)
     else:
-        expiry_date = current_time + datetime.timedelta(
-            days=_properties[confirmation_type].validity_in_days
-        )
+        expiry_date = current_time + timedelta(days=_properties[confirmation_type].validity_in_days)
 
-    Confirmation.objects.create(
+    return Confirmation.objects.create(
         content_object=obj,
         date_sent=current_time,
         confirmation_key=key,
@@ -115,31 +175,55 @@ def create_confirmation_link(
         expiry_date=expiry_date,
         type=confirmation_type,
     )
-    return confirmation_url(key, realm, confirmation_type, url_args)
+
+
+def create_confirmation_link(
+    obj: ConfirmationObjT,
+    confirmation_type: int,
+    *,
+    validity_in_minutes: int | None | Unset = UNSET,
+    url_args: Mapping[str, str] = {},
+    no_associated_realm_object: bool = False,
+) -> str:
+    return confirmation_url_for(
+        create_confirmation_object(
+            obj,
+            confirmation_type,
+            validity_in_minutes=validity_in_minutes,
+            no_associated_realm_object=no_associated_realm_object,
+        ),
+        url_args=url_args,
+    )
+
+
+def confirmation_url_for(confirmation_obj: "Confirmation", url_args: Mapping[str, str] = {}) -> str:
+    return confirmation_url(
+        confirmation_obj.confirmation_key, confirmation_obj.realm, confirmation_obj.type, url_args
+    )
 
 
 def confirmation_url(
     confirmation_key: str,
-    realm: Optional[Realm],
+    realm: Realm | None,
     confirmation_type: int,
     url_args: Mapping[str, str] = {},
 ) -> str:
     url_args = dict(url_args)
     url_args["confirmation_key"] = confirmation_key
     return urljoin(
-        settings.ROOT_DOMAIN_URI if realm is None else realm.uri,
+        settings.ROOT_DOMAIN_URI if realm is None else realm.url,
         reverse(_properties[confirmation_type].url_name, kwargs=url_args),
     )
 
 
 class Confirmation(models.Model):
     content_type = models.ForeignKey(ContentType, on_delete=CASCADE)
-    object_id: int = models.PositiveIntegerField(db_index=True)
+    object_id = models.PositiveBigIntegerField(db_index=True)
     content_object = GenericForeignKey("content_type", "object_id")
-    date_sent: datetime.datetime = models.DateTimeField(db_index=True)
-    confirmation_key: str = models.CharField(max_length=40, db_index=True)
-    expiry_date: datetime.datetime = models.DateTimeField(db_index=True)
-    realm: Optional[Realm] = models.ForeignKey(Realm, null=True, on_delete=CASCADE)
+    date_sent = models.DateTimeField(db_index=True)
+    confirmation_key = models.CharField(max_length=40, db_index=True)
+    expiry_date = models.DateTimeField(db_index=True, null=True)
+    realm = models.ForeignKey(Realm, null=True, on_delete=CASCADE)
 
     # The following list is the set of valid types
     USER_REGISTRATION = 1
@@ -150,13 +234,19 @@ class Confirmation(models.Model):
     MULTIUSE_INVITE = 6
     REALM_CREATION = 7
     REALM_REACTIVATION = 8
-    type: int = models.PositiveSmallIntegerField()
-
-    def __str__(self) -> str:
-        return f"<Confirmation: {self.content_object}>"
+    REMOTE_SERVER_BILLING_LEGACY_LOGIN = 9
+    REMOTE_REALM_BILLING_LEGACY_LOGIN = 10
+    type = models.PositiveSmallIntegerField()
 
     class Meta:
         unique_together = ("type", "confirmation_key")
+        indexes = [
+            models.Index(fields=["content_type", "object_id"]),
+        ]
+
+    @override
+    def __str__(self) -> str:
+        return f"{self.content_object!r}"
 
 
 class ConfirmationType:
@@ -185,6 +275,13 @@ _properties = {
     Confirmation.REALM_CREATION: ConfirmationType("get_prereg_key_and_redirect"),
     Confirmation.REALM_REACTIVATION: ConfirmationType("realm_reactivation"),
 }
+if settings.ZILENCER_ENABLED:
+    _properties[Confirmation.REMOTE_SERVER_BILLING_LEGACY_LOGIN] = ConfirmationType(
+        "remote_billing_legacy_server_from_login_confirmation_link"
+    )
+    _properties[Confirmation.REMOTE_REALM_BILLING_LEGACY_LOGIN] = ConfirmationType(
+        "remote_realm_billing_from_login_confirmation_link"
+    )
 
 
 def one_click_unsubscribe_link(user_profile: UserProfile, email_type: str) -> str:
@@ -206,17 +303,17 @@ def one_click_unsubscribe_link(user_profile: UserProfile, email_type: str) -> st
 # add another Confirmation.type for this; it's this way for historical reasons.
 
 
-def validate_key(creation_key: Optional[str]) -> Optional["RealmCreationKey"]:
+def validate_key(creation_key: str | None) -> Optional["RealmCreationKey"]:
     """Get the record for this key, raising InvalidCreationKey if non-None but invalid."""
     if creation_key is None:
         return None
     try:
         key_record = RealmCreationKey.objects.get(creation_key=creation_key)
     except RealmCreationKey.DoesNotExist:
-        raise RealmCreationKey.Invalid()
+        raise RealmCreationKey.InvalidError
     time_elapsed = timezone_now() - key_record.date_created
     if time_elapsed.total_seconds() > settings.REALM_CREATION_LINK_VALIDITY_DAYS * 24 * 3600:
-        raise RealmCreationKey.Invalid()
+        raise RealmCreationKey.InvalidError
     return key_record
 
 
@@ -237,7 +334,7 @@ class RealmCreationKey(models.Model):
 
     # True just if we should presume the email address the user enters
     # is theirs, and skip sending mail to it to confirm that.
-    presume_email_valid: bool = models.BooleanField(default=False)
+    presume_email_valid = models.BooleanField(default=False)
 
-    class Invalid(Exception):
+    class InvalidError(Exception):
         pass

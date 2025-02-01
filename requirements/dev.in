@@ -1,18 +1,17 @@
 # After editing this file, you MUST afterward run
 # /tools/update-locked-requirements to update requirements/dev.txt.
 # See requirements/README.md for more detail.
--r pip.in
 -r prod.in
 -r docs.in
 
 # moto s3 mock
 moto[s3]
 
-# Needed for running tools/run-dev.py
-Twisted
+# For tools/run-dev
+aiohttp
 
 # Needed for documentation links test
-https://github.com/scrapy/scrapy/archive/c5b1ee810167266fcd259f263dbfc0fe0204761a.zip#egg=Scrapy==2.5.0+git  # aioapns requires h2 ≥ 4.0: https://github.com/scrapy/scrapy/pull/5113
+Scrapy
 
 # Needed to compute test coverage
 coverage
@@ -23,23 +22,18 @@ fakeldap
 # For testing mock http requests
 responses
 
-# For sorting imports
-isort
-
 # For doing highly usable Python profiling
 line-profiler
-
-# for pep8 linter
-pycodestyle
 
 # Python reformatter
 black
 
-# Needed to run pyflakes linter
-pyflakes
+# Python linter
+ruff
 
 # Needed for watching file changes
 pyinotify
+pyasyncore  # https://github.com/seb-m/pyinotify/issues/204
 
 # Needed to run tests in parallel
 tblib
@@ -47,7 +41,7 @@ tblib
 # For linting Git commit messages
 gitlint-core
 
-# Needed for visualising cprofile reports
+# Needed for visualising cProfile reports
 snakeviz
 
 # Needed for creating DigitalOcean droplets
@@ -57,23 +51,15 @@ python-digitalocean
 pip-tools<6.3.0  # https://github.com/jazzband/pip-tools/pull/1455 breaks our hack for installing specific commits from Git
 
 # zulip's linting framework - zulint
-https://github.com/zulip/zulint/archive/9908540b7734b51f86ccabab706befc2ff33212a.zip#egg=zulint==0.0.1
+https://github.com/zulip/zulint/archive/9be0a32bf75a9d8738b005f0b880567fff64e943.zip#egg=zulint==1.0.0+git
 
 -r mypy.in
 
-# These modules are built into later versions of Python and will
-# generate different locked files if executed with Python ≥ 3.7, so
-# despite being dependent packages, they have to be added separately.
-importlib-metadata;python_version<"3.10"  # for jsonpickle, jsonschema
-
-# Needed for using integration logo svg files as bot avatars
-cairosvg
-
 # Needed for tools/check-thirdparty
-python-debian<0.1.42  # https://bugs.debian.org/997857
+python-debian
 
 # Pattern-based lint tool
-semgrep
+semgrep<1.80.0  # https://github.com/semgrep/semgrep/issues/10408
 
 # Contains Pysa, a security-focused static analyzer
 pyre-check
@@ -83,3 +69,6 @@ natsort
 
 # For spell check linter
 codespell
+
+# For mocking time
+time-machine

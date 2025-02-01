@@ -8,10 +8,11 @@ indent_style = space
 insert_final_newline = true
 trim_trailing_whitespace = true
 
-binary_next_line = true  # for shfmt
-switch_case_indent = true  # for shfmt
+[[shell]]
+binary_next_line = true
+switch_case_indent = true
 
-[{*.{js,json,ts},check-openapi}]
+[{*.{cjs,cts,js,json,mjs,mts,ts},check-openapi}]
 max_line_length = 100
 
 [*.{py,pyi}]

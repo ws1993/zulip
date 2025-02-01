@@ -20,7 +20,7 @@ First, a few notes on philosophy.
   design/implementation work to make requests fast over the operational
   work of running 2-5x as much hardware to handle the same load.
 
-See also [scalability for production users](../production/requirements.html#scalability).
+See also [scalability for production users](../production/requirements.md#scalability).
 
 ## Load profiles
 
@@ -38,7 +38,7 @@ of load profiles:
   example for this, with more than 15K total user accounts, of which
   only several hundred have logged in during the last few weeks.
   Zulip has many important optimizations, including [soft
-  deactivation](../subsystems/sending-messages.html#soft-deactivation)
+  deactivation](sending-messages.md#soft-deactivation)
   to ensure idle users have minimal impact on both server-side
   scalability and request latency.
 - Fulltime teams, like your typical corporate Zulip installation,
@@ -73,9 +73,10 @@ to thoughtfully implement the data fetch code path for every feature.
 Furthermore, a snappy user interface is one of Zulip's design goals, and
 so we care about the performance of any user-facing code path, even
 though many of them are not material to scalability of the server.
-But only with regard to the requests detailed below, is it worth considering
-optimizations which save a few milliseconds that would be invisible to the end user,
-if they carry any cost in code readability.
+But when an optimization only saves a few milliseconds that would be
+invisible to the end user, and carries any cost in code readability,
+the optimization is worth considering only if it applies to
+the major endpoints listed below.
 
 In Zulip's documentation, our general rule is to primarily write facts
 that are likely to remain true for a long time. While the numbers
@@ -114,7 +115,7 @@ is negligible.
 ### Tornado
 
 Zulip's Tornado-based [real-time push
-system](../subsystems/events-system.md), and in particular
+system](events-system.md), and in particular
 `GET /events`, accounts for something like 50% of all HTTP requests to
 a production Zulip server. Despite `GET /events` being extremely
 high-volume, the typical request takes 1-3ms to process, and doesn't
@@ -149,7 +150,7 @@ thousands of concurrent users.
 presence information and return the information for all other active
 users in the organization, account for about 36% of all HTTP requests
 on production Zulip servers. See
-[presence](../subsystems/presence.md) for details on this system and
+[presence](presence.md) for details on this system and
 how it's optimized. For this article, it's important to know that
 presence is one of the most important scalability concerns for any
 chat system, because it cannot be cached long, and is structurally a
@@ -178,7 +179,7 @@ Zulip is somewhat unusual among web apps in sending essentially all of the
 data required for the entire Zulip web app in this single request,
 which is part of why the Zulip web app loads very quickly -- one only
 needs a single round trip aside from cacheable assets (avatars, images, JS,
-CSS). Data on other users in the organization, streams, supported
+CSS). Data on other users in the organization, channels, supported
 emoji, custom profile fields, etc., is all included. The nice thing
 about this model is that essentially every UI element in the Zulip
 client can be rendered immediately without paying latency to the
@@ -210,21 +211,21 @@ typical organization but potentially multiple seconds for large open
 organizations with 10,000s of users. There is also smaller
 variability based on a individual user's personal data state,
 primarily in that having 10,000s of unread messages results in a
-somewhat expensive query to find which streams/topics those are in.
+somewhat expensive query to find which channels/topics those are in.
 
 We consider any organization having normal `page_params` fetch times
 greater than a second to be a bug, and there is ongoing work to fix that.
 
 It can help when thinking about this to imagine `page_params` as what
 in another web app would have been 25 or so HTTP GET requests, each
-fetching data of a given type (users, streams, custom emoji, etc.); in
+fetching data of a given type (users, channels, custom emoji, etc.); in
 Zulip, we just do all of those in a single API request. In the
 future, we will likely move to a design that does much of the database
 fetching work for different features in parallel to improve latency.
 
-For organizations with 10K+ users and many default streams, the
+For organizations with 10K+ users and many default channels, the
 majority of time spent constructing `page_params` is spent marshalling
-data on which users are subscribed to which streams, which is an area
+data on which users are subscribed to which channels, which is an area
 of active optimization work.
 
 ### Fetching message history
@@ -237,7 +238,7 @@ it does a large number of these requests:
 - Most of these requests are from users clicking into different views
   -- to avoid certain subtle bugs, Zulip's web app currently fetches
   content from the server even when it has the history for the
-  relevant stream/topic cached locally.
+  relevant channel/topic cached locally.
 - When a browser opens the Zulip web app, it will eventually fetch and
   cache in the browser all messages newer than the oldest unread
   message in a non-muted context. This can be in total extremely
@@ -249,7 +250,7 @@ it does a large number of these requests:
   zulip.com, this can result in a thundering herd effect for both `/`
   and `GET /messages`. A great deal of care has been taking in
   designing this [auto-reload
-  system](../subsystems/hashchange-system.html#server-initiated-reloads)
+  system](hashchange-system.md#server-initiated-reloads)
   to spread most of that herd over several minutes.
 
 Typical requests consume 20-100ms to process, much of which is waiting
@@ -283,19 +284,13 @@ scalability cost of fetching message history dramatically.
 Requests to fetch uploaded files (including user avatars) account for
 about 5% of total HTTP requests. Zulip spends consistently ~10-15ms
 processing one of these requests (mostly authorization logic), before
-handing off delivery of the file to `nginx` or S3 (depending on the
-configured [upload backend](../production/upload-backends.md)).
-
-We can significantly reduce the volume of these requests in large
-production Zulip servers by fixing [Zulip's upload authorization
-strategy preventing browser caching of
-uploads](https://github.com/zulip/zulip/issues/13088), since many of
-them result from a single client downloading the same file repeatedly
-as it navigates around the app.
+handing off delivery of the file to `nginx` (which may itself fetch
+from S3, depending on the configured [upload
+backend](../production/upload-backends.md)).
 
 ### Sending and editing messages
 
-[Sending new messages](../subsystems/sending-messages.md) (including
+[Sending new messages](sending-messages.md) (including
 incoming webhooks) represents less than 0.5% of total request volume.
 That this number is small should not be surprising even though sending
 messages is intuitively the main feature of a chat service: a message
@@ -303,7 +298,7 @@ sent to 50 users triggers ~50 `GET /events` requests.
 
 A typical message-send request takes 20-70ms, with more expensive
 requests typically resulting from [Markdown
-rendering](../subsystems/markdown.md) of more complex syntax. As a
+rendering](markdown.md) of more complex syntax. As a
 result, these requests are not material to Zulip's scalability.
 Editing messages and adding emoji reactions are very similar to
 sending them for the purposes of performance and scalability, since
@@ -319,7 +314,7 @@ but are also extremely cheap (~3ms).
 
 ### Other endpoints
 
-Other API actions, like subscribing to a stream, editing settings,
+Other API actions, like subscribing to a channel, editing settings,
 registering an account, etc., are vanishingly rare compared to the
 requests detailed above, fundamentally because almost nobody changes
 these things more than a few dozen times over the lifetime of their
@@ -335,7 +330,7 @@ scalability of a Zulip server.
 The above doesn't cover all of the work that a production Zulip server
 does; various tasks like sending outgoing emails or recording the data
 that powers [/stats](https://zulip.com/help/analytics) are run by
-[queue processors](../subsystems/queuing.md) and cron jobs, not in
+[queue processors](queuing.md) and cron jobs, not in
 response to incoming HTTP requests. In practice, all of these have
 been written such that they are immaterial to total load and thus
 architectural scalability, though we do from time to time need to do
@@ -358,7 +353,7 @@ Python/CPU time (being harder to scale horizontally).
 
 Most optimizations to make an endpoint cheaper will start with
 optimizing the database queries and/or employing
-[caching](../subsystems/caching.md), and then continue as needed with
+[caching](caching.md), and then continue as needed with
 profiling of the Python code and any memcached queries.
 
 For a handful of the critical code paths listed above, we further
@@ -367,7 +362,7 @@ for narrow sections; typically this is sufficient to result in the
 database query time dominating that spent by the Python application
 server process.
 
-Zulip's [server logs](../subsystems/logging.md) are designed to
+Zulip's [server logs](logging.md) are designed to
 provide insight when a request consumes significant database or
 memcached resources, which is useful both in development and in
 production.

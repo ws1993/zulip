@@ -20,7 +20,30 @@ in a more colloquial style, German translations should be rather informal as wel
   say _"Dieser Fehler tritt häufiger auf."_
 
 - "Das ist die Seite, wo der Quelltext steht." - the "_wo_" is regional,
-  say _"Das ist die Seite, auf der der Quelltext steht."_ instead.
+  say _"Das ist die Seite, auf der Quelltext steht."_ instead.
+
+### Gender-inclusive language
+
+**Use gender-inclusive language, placing a _gender colon_
+([Gender-Doppelpunkt](https://de.wikipedia.org/wiki/Gender-Doppelpunkt))
+where necessary.**
+
+Place the gender colon between the word stem and the feminine ending.
+
+- Instead of _Nutzer_, use _Nutzer:innen_
+- Instead of _dieser Nutzer_, use _diese:r Nutzer:in_
+
+**Try to find gender-neutral alternatives before using the gender colon.**
+
+- Instead of _jede:r_, try to use _alle_.
+
+**If a gender-neutral term is readily available, consider using it.**
+
+- Instead of _benutzerdefiniert_, consider using _eigen_.
+
+**In compound nouns, only use the gender colon in the last element, if appropriate.**
+
+- Instead of _Nutzer:innengruppe_ or _Nutzer:innen-Gruppe_, use _Nutzergruppe_.
 
 ### Form of address
 
@@ -34,9 +57,9 @@ the reader and remember to capitalize _Du_.
 
 **Prefer imperative over constructions with auxiliary verbs.**
 
-For instructions, try to use the imperative (e.g. _"Gehe auf die Seite"_ -
+For instructions, try to use the imperative (e.g., _"Gehe auf die Seite"_ -
 _"Go to the page"_) instead of constructions with auxiliary verbs
-(e.g. _"Du musst auf die Seite ... gehen"_ - _"You have to go the page ..."_).
+(e.g., _"Du musst auf die Seite ... gehen"_ - _"You have to go the page ..."_).
 This keeps the phrases short, less stiff and avoids unnecessary addressing
 of the reader.
 
@@ -46,14 +69,14 @@ of the reader.
 
 To be consistent with other online platforms, use continuous labels for buttons,
 item titles, etc. with verbs in infinitive form,
-e.g. _Manage streams_ - _Kanäle verwalten_ instead of _Verwalte Kanäle_.
+e.g., _Manage streams_ - _Kanäle verwalten_ instead of _Verwalte Kanäle_.
 
 ### Concatenation of words
 
 **Try to avoid it.**
 
 German is famous for its concatenations of nouns
-(e.g. _Heizölrückstoßdämpfung_, which means _fuel oil recoil attenuation_).
+(e.g., _Heizölrückstoßdämpfung_, which means _fuel oil recoil attenuation_).
 For the sake of correct rendering and simplicity, you should try to avoid such
 concatenations whenever possible, since they can break the layout of the Zulip
 frontend. Try to stick to a maximum length of 20 characters and follow your
@@ -75,11 +98,8 @@ This becomes even more evident in internet applications,
 so you should not be afraid of using them if they provide an advantage over
 the German equivalent. Take the following two examples as a reference:
 
-- Translating _Stream_: Use the German word _Kanal_, since it is just as short
-  and used in other web apps.
-
 - Translating _Bot_: Use _Bot_, as a completely accurate German
-  equivalent **doesn't** exist (e.g. _Roboter_) and the term _Bot_ is not
+  equivalent **doesn't** exist (e.g., _Roboter_) and the term _Bot_ is not
   unknown to German speakers.
 
 ### Special characters
@@ -113,7 +133,7 @@ Make sure to not walk into such a trap.
 
 - Balance common verbs and nouns with specific IT-related translations
   of English terms - this can be tricky, try to check how other resources
-  were translated (e.g. Gmail, Microsoft websites, Facebook) to decide
+  were translated (e.g., Gmail, Microsoft websites, Facebook) to decide
   what wouldn't sound awkward / rude in German.
 
 - For additional translation information, feel free to check out
@@ -129,13 +149,13 @@ speakers in the community. It's all about making Zulip friendly and usable.
 
 _"Nachricht" (Facebook, WhatsApp, Transifex)_
 
-- Private Message (PM) - **Private Nachricht (PN)**
+- Direct Message (DM), Direct Messages (DMs) - **Direktnachricht (DM), Direktnachrichten (DMs)**
 
-Since we try to avoid concatenating words whenever possible, don't use
-"Privatnachricht" . PN is the officially used abbreviation for
-"Private Nachricht" and is used in many German chat forums.
+While we try to avoid concatenating words whenever possible, "Direktnachricht" is used
+by many other platforms (e.g., X/Twitter, Slack, Discord).
+Use _DM_ with its plural form _DMs_ rather than DN/DNs in line with other services.
 
-_"Private Nachricht" (YouTube, Transifex)_
+_"Direktnachricht" (X/Twitter, Slack)_
 
 - Starred Message - **Markierte Nachricht**
 
@@ -162,17 +182,6 @@ small German forums)_
 - Topic - **Thema**
 
 _(Gmail - for email subjects, Transifex)_
-
-- Invite-Only Stream - **Geschlossener Stream**
-
-For users to be able to join to an "invite-only" stream, they must have been
-invited by some user in this stream. This type of stream is equivalent to
-Facebook's "closed" groups, which in turn translates to "geschlossen" in German.
-This translation seems to be appropriate, for example [Linguee](https://www.linguee.de/englisch-deutsch/uebersetzung/invite-only.html)
-search returns only paraphrases of this term.
-
-_"Geschlossener Stream" (Transifex), "Geschlossene Gruppe" (Facebook),
-paraphrases (Linguee)_
 
 - Public Stream - **Öffentlicher Stream**
 
@@ -226,13 +235,13 @@ and there is no German equivalent, talking of "Views" is preferable in the
 developer documentation and makes it easier to rely on parts of the German
 _and_ parts of the English documentation.
 
-- View - **Ansicht** (User documentation)
+- View - **Ansicht** (User-facing documentation)
 
-For the user documentation, we want to use "Ansicht" instead of "view", as
-"Ansicht" provides a translated description for what you think of when hearing
-"view". "Ansicht" is not desirable for the developer documentation, since it
-does not emphasize the developing aspects of views (in contrast to anglicisms,
-which Germans often link to IT-related definitions).
+For user-facing documentation, we want to use "Ansicht" instead of "view",
+as "Ansicht" provides a translated description for what you think of when
+hearing "view". "Ansicht" is not desirable for the developer documentation,
+since it does not emphasize the developing aspects of views (in contrast to
+anglicisms, which Germans often link to IT-related definitions).
 
 _"Ansicht" (Transifex)_
 
@@ -263,7 +272,7 @@ _"Deabonnieren" (YouTube, Transifex)_
 Transifex has two different translations for "Narrow to" -
 "Schränke auf ... ein." and "Begrenze auf ... ." Both sound a bit strange to a
 German speaker, since they would expect grammatically correct sentences when
-using the imperative (e.g. "Schränke diesen Stream ein auf ... .") Since this
+using the imperative (e.g., "Schränke diesen Stream ein auf ... .") Since this
 would be too long for many labels, the infinitive "begrenzen auf" is preferable.
 "einschränken auf" sounds equally good, but Transifex shows more use cases for
 "begrenzen auf".
@@ -272,8 +281,8 @@ _"Schränke auf ... ein." (Transifex) "Begrenze auf ... ." (Transifex)_
 
 - Filter - **Filtern**
 
-A direct translation is fine here. Watch out to to use the infinitive instead
-of the imperative, e.g. "Nachrichten filtern" instead of "Filtere Nachrichten".
+A direct translation is fine here. Watch out to use the infinitive instead
+of the imperative, e.g., "Nachrichten filtern" instead of "Filtere Nachrichten".
 
 _"Filtern" (Thunderbird, LinkedIn)_
 
@@ -293,13 +302,13 @@ _"Suchen" (YouTube, Google, Facebook, Transifex)_
 
 - Pin/Unpin - **Anpinnen/Loslösen**
 
-While "pinnen" is shorter than "anpinnen", "anpinnen" sweeps any amiguity out of
+While "pinnen" is shorter than "anpinnen", "anpinnen" sweeps any ambiguity out of
 the way. This term is not used too often on Zulip, so the length shouldn't be a
 problem.
 
 _"Anpinnen/Ablösen" (Transifex), "Pinnen" (Pinterest)_
 
-- Mention/@mention - **Erwähnen/"@-Erwähnen**
+- Mention/@mention - **Erwähnen/@-erwähnen**
 
 Make sure to say "@-erwähnen", but "die @-Erwähnung" (capitalized).
 
@@ -320,17 +329,17 @@ the infinitive form "anpassen".
 
 _"Ich möchte" - (Transifex, general sense of politeness)_
 
-- User - **Nutzer**
+- User - **Nutzer:in**
 
-"Benutzer" would work as well, but "Nutzer" is shorter and more commonly
+"Benutzer:in" would work as well, but "Nutzer:in" is shorter and more commonly
 used in web applications.
 
-_"Nutzer" (Facebook, Gmail), "Benutzer" (Transifex)_
+_"Nutzer\*innen" (Figma, Facebook), "Benutzer\*innen" (GitHub,
+Airtable), "Nutzer" (Facebook, Gmail), "Benutzer" (Transifex)_
 
-- Person/People - Nutzer/Personen
+- Person/People - Personen
 
-We use "Personen" instead of plural "Nutzer" for "people", as "Nutzer" stays
-the same in plural.
+We use "Personen" instead of plural "Nutzer:innen" for "people".
 
 _"Nutzer/Personen" (Transifex)_
 

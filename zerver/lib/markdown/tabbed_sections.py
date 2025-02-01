@@ -1,18 +1,20 @@
 import re
-from typing import Any, Dict, List, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 import markdown
 from markdown.extensions import Extension
 from markdown.preprocessors import Preprocessor
+from typing_extensions import override
 
-from zerver.lib.markdown.preprocessor_priorities import PREPROCESSOR_PRIORITES
+from zerver.lib.markdown.priorities import PREPROCESSOR_PRIORITIES
 
 START_TABBED_SECTION_REGEX = re.compile(r"^\{start_tabs\}$")
 END_TABBED_SECTION_REGEX = re.compile(r"^\{end_tabs\}$")
-TAB_CONTENT_REGEX = re.compile(r"^\{tab\|\s*(.+?)\s*\}$")
+TAB_CONTENT_REGEX = re.compile(r"^\{tab\|([^}]+)\}$")
 
-CODE_SECTION_TEMPLATE = """
-<div class="code-section {tab_class}" markdown="1">
+TABBED_SECTION_TEMPLATE = """
+<div class="tabbed-section {tab_class}" markdown="1">
 {nav_bar}
 <div class="blocks">
 {blocks}
@@ -27,11 +29,11 @@ NAV_BAR_TEMPLATE = """
 """.strip()
 
 NAV_LIST_ITEM_TEMPLATE = """
-<li data-language="{data_language}" tabindex="0">{label}</li>
+<li data-tab-key="{data_tab_key}" tabindex="0">{label}</li>
 """.strip()
 
 DIV_TAB_CONTENT_TEMPLATE = """
-<div data-language="{data_language}" markdown="1">
+<div class="tab-content" data-tab-key="{data_tab_key}" markdown="1">
 {content}
 </div>
 """.strip()
@@ -45,6 +47,8 @@ TAB_SECTION_LABELS = {
     "mac": "macOS",
     "windows": "Windows",
     "linux": "Linux",
+    "most-systems": "Most systems",
+    "linux-with-apt": "Linux with APT",
     "python": "Python",
     "js": "JavaScript",
     "curl": "curl",
@@ -53,10 +57,10 @@ TAB_SECTION_LABELS = {
     "desktop": "Desktop",
     "mobile": "Mobile",
     "mm-default": "Default installation",
+    "mm-cloud": "Cloud instance",
     "mm-docker": "Docker",
     "mm-gitlab-omnibus": "GitLab Omnibus",
-    "send-email-invitations": "Send email invitations",
-    "share-an-invite-link": "Share an invite link",
+    "mm-self-hosting-cloud-export": "Self hosting (cloud export)",
     "require-invitations": "Require invitations",
     "allow-anyone-to-join": "Allow anyone to join",
     "restrict-by-email-domain": "Restrict by email domain",
@@ -71,20 +75,66 @@ TAB_SECTION_LABELS = {
     "custom-proxy-settings": "Custom proxy settings",
     "stream": "From a stream view",
     "not-stream": "From other views",
-    "via-recent-topics": "Via recent topics",
+    "via-recent-conversations": "Via recent conversations",
+    "via-inbox-view": "Via inbox view",
     "via-left-sidebar": "Via left sidebar",
+    "via-right-sidebar": "Via right sidebar",
     "instructions-for-all-platforms": "Instructions for all platforms",
-    "public-streams": "Public streams",
-    "private-streams": "Private streams",
+    "public-channels": "Public channels",
+    "private-channels": "Private channels",
+    "web-public-channels": "Web-public channels",
+    "via-user-card": "Via user card",
+    "via-user-profile": "Via user profile",
+    "via-organization-settings": "Via organization settings",
+    "via-personal-settings": "Via personal settings",
+    "via-channel-settings": "Via channel settings",
+    "via-group-settings": "Via group settings",
+    "via-compose-box": "Via compose box",
+    "default-subdomain": "Default subdomain",
+    "custom-subdomain": "Custom subdomain",
+    "zulip-cloud-standard": "Zulip Cloud Standard",
+    "zulip-cloud-plus": "Zulip Cloud Plus",
+    "request-sponsorship": "Request sponsorship",
+    "request-education-pricing": "Request education pricing",
+    "zulip-cloud": "Zulip Cloud",
+    "self-hosting": "Self hosting",
+    "okta": "Okta",
+    "onelogin": "OneLogin",
+    "azuread": "Entra ID (AzureAD)",
+    "entraid": "Microsoft Entra ID",
+    "keycloak": "Keycloak",
+    "auth0": "Auth0",
+    "logged-in": "If you are logged in",
+    "logged-out": "If you are logged out",
+    "user": "User",
+    "bot": "Bot",
+    "on-sign-up": "On sign-up",
+    "via-paste": "Via paste",
+    "via-drag-and-drop": "Via drag-and-drop",
+    "via-markdown": "Via Markdown",
+    "via-compose-box-buttons": "Via compose box button",
+    "channel-compose": "Compose to a channel",
+    "dm-compose": "Compose a DM",
+    "v8": "Zulip Server 8.0+",
+    "v6": "Zulip Server 6.0+",
+    "v4": "Zulip Server 4.0+",
+    "all-versions": "All versions",
+    "by-card": "Pay by credit card",
+    "by-invoice": "Pay by invoice",
+    "for-a-bot": "For a bot",
+    "for-yourself": "For yourself",
+    "new-organizations": "New organizations",
+    "imported-organizations": "Imported organizations",
 }
 
 
 class TabbedSectionsGenerator(Extension):
+    @override
     def extendMarkdown(self, md: markdown.Markdown) -> None:
         md.preprocessors.register(
             TabbedSectionsPreprocessor(md, self.getConfigs()),
             "tabbed_sections",
-            PREPROCESSOR_PRIORITES["tabbed_sections"],
+            PREPROCESSOR_PRIORITIES["tabbed_sections"],
         )
 
 
@@ -92,7 +142,8 @@ class TabbedSectionsPreprocessor(Preprocessor):
     def __init__(self, md: markdown.Markdown, config: Mapping[str, Any]) -> None:
         super().__init__(md)
 
-    def run(self, lines: List[str]) -> List[str]:
+    @override
+    def run(self, lines: list[str]) -> list[str]:
         tab_section = self.parse_tabs(lines)
         while tab_section:
             if "tabs" in tab_section:
@@ -101,13 +152,13 @@ class TabbedSectionsPreprocessor(Preprocessor):
                 tab_class = "no-tabs"
                 tab_section["tabs"] = [
                     {
-                        "tab_name": "instructions-for-all-platforms",
+                        "tab_key": "instructions-for-all-platforms",
                         "start": tab_section["start_tabs_index"],
                     }
                 ]
             nav_bar = self.generate_nav_bar(tab_section)
             content_blocks = self.generate_content_blocks(tab_section, lines)
-            rendered_tabs = CODE_SECTION_TEMPLATE.format(
+            rendered_tabs = TABBED_SECTION_TEMPLATE.format(
                 tab_class=tab_class, nav_bar=nav_bar, blocks=content_blocks
             )
 
@@ -117,7 +168,7 @@ class TabbedSectionsPreprocessor(Preprocessor):
             tab_section = self.parse_tabs(lines)
         return lines
 
-    def generate_content_blocks(self, tab_section: Dict[str, Any], lines: List[str]) -> str:
+    def generate_content_blocks(self, tab_section: dict[str, Any], lines: list[str]) -> str:
         tab_content_blocks = []
         for index, tab in enumerate(tab_section["tabs"]):
             start_index = tab["start"] + 1
@@ -131,7 +182,7 @@ class TabbedSectionsPreprocessor(Preprocessor):
 
             content = "\n".join(lines[start_index:end_index]).strip()
             tab_content_block = DIV_TAB_CONTENT_TEMPLATE.format(
-                data_language=tab["tab_name"],
+                data_tab_key=tab["tab_key"],
                 # Wrapping the content in two newlines is necessary here.
                 # If we don't do this, the inner Markdown does not get
                 # rendered properly.
@@ -140,23 +191,23 @@ class TabbedSectionsPreprocessor(Preprocessor):
             tab_content_blocks.append(tab_content_block)
         return "\n".join(tab_content_blocks)
 
-    def generate_nav_bar(self, tab_section: Dict[str, Any]) -> str:
+    def generate_nav_bar(self, tab_section: dict[str, Any]) -> str:
         li_elements = []
         for tab in tab_section["tabs"]:
-            tab_name = tab.get("tab_name")
-            tab_label = TAB_SECTION_LABELS.get(tab_name)
+            tab_key = tab.get("tab_key")
+            tab_label = TAB_SECTION_LABELS.get(tab_key)
             if tab_label is None:
                 raise ValueError(
-                    f"Tab '{tab_name}' is not present in TAB_SECTION_LABELS in zerver/lib/markdown/tabbed_sections.py"
+                    f"Tab '{tab_key}' is not present in TAB_SECTION_LABELS in zerver/lib/markdown/tabbed_sections.py"
                 )
 
-            li = NAV_LIST_ITEM_TEMPLATE.format(data_language=tab_name, label=tab_label)
+            li = NAV_LIST_ITEM_TEMPLATE.format(data_tab_key=tab_key, label=tab_label)
             li_elements.append(li)
 
         return NAV_BAR_TEMPLATE.format(tabs="\n".join(li_elements))
 
-    def parse_tabs(self, lines: List[str]) -> Optional[Dict[str, Any]]:
-        block: Dict[str, Any] = {}
+    def parse_tabs(self, lines: list[str]) -> dict[str, Any] | None:
+        block: dict[str, Any] = {}
         for index, line in enumerate(lines):
             start_match = START_TABBED_SECTION_REGEX.search(line)
             if start_match:
@@ -165,7 +216,7 @@ class TabbedSectionsPreprocessor(Preprocessor):
             tab_content_match = TAB_CONTENT_REGEX.search(line)
             if tab_content_match:
                 block.setdefault("tabs", [])
-                tab = {"start": index, "tab_name": tab_content_match.group(1)}
+                tab = {"start": index, "tab_key": tab_content_match.group(1)}
                 block["tabs"].append(tab)
 
             end_match = END_TABBED_SECTION_REGEX.search(line)

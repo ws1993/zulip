@@ -1,7 +1,7 @@
 # Schema migrations
 
 Zulip uses the [standard Django system for doing schema
-migrations](https://docs.djangoproject.com/en/3.2/topics/migrations/).
+migrations](https://docs.djangoproject.com/en/5.0/topics/migrations/).
 There is some example usage in the [new feature
 tutorial](../tutorials/new-feature-tutorial.md).
 
@@ -9,9 +9,9 @@ This page documents some important issues related to writing schema
 migrations.
 
 - If your database migration is just to reflect new fields in
-  `models.py`, you'll typically want to just:
+  `models/*.py`, you'll typically want to just:
   - Rebase your branch before you start (this may save work later).
-  - Update the model class definitions in `zerver/models.py`.
+  - Update the model class definitions in `zerver/models/*.py`.
   - Run `./manage.py makemigrations` to generate a migration file
   - Rename the migration file to have a descriptive name if Django
     generated used a date-based name like `0089_auto_20170710_1353.py`
@@ -33,7 +33,7 @@ migrations.
   - If your migrations were automatically generated using
     `manage.py makemigrations`, a good option is to just remove your
     migration and rerun the command after rebasing. Remember to
-    `git rebase` to do this in the the commit that changed `models.py`
+    `git rebase` to do this in the commit that changed `models/*.py`
     if you have a multi-commit branch.
   - If you wrote code as part of preparing your migrations, or prefer
     this workflow, you can use run `./tools/renumber-migrations`,
@@ -49,28 +49,35 @@ migrations.
   migration that exists on the release branch. This should be
   followed, on `main`, by a migration which merges the two resulting
   tips; you can make such a merge with `manage.py makemigrations --merge`.
-- **Large tables**: For our very largest tables (e.g. Message and
+- **Large tables**: For our very largest tables (e.g., Message and
   UserMessage), we often need to take precautions when adding columns
   to the table, performing data backfills, or building indexes. We
   have a `zerver/lib/migrate.py` library to help with adding columns
   and backfilling data.
-- **Adding indexes** Regular `CREATE INDEX` SQL (corresponding to Django's
-  `AddIndex` operation) locks writes to the affected table. This can be
+- **Adding indexes**. Django's regular `AddIndex` operation (corresponding
+  to `CREATE INDEX` in SQL) locks writes to the affected table. This can be
   problematic when dealing with larger tables in particular and we've
-  generally preferred to use `CREATE INDEX CONCURRENTLY` to allow the index
-  to be built while the server is active. While in historical migrations
-  we've used `RunSQL` directly, newer versions of Django add the corresponding
-  operation `AddIndexConcurrently` and thus that's what should normally be used.
+  generally preferred to use `AddIndexConcurrently` (corresponding to
+  `CREATE INDEX CONCURRENTLY`) to allow the index to be built while
+  the server is active.
 - **Atomicity**. By default, each Django migration is run atomically
   inside a transaction. This can be problematic if one wants to do
   something in a migration that touches a lot of data and would best
-  be done in batches of e.g. 1000 objects (e.g. a `Message` or
+  be done in batches of, for example, 1000 objects (e.g., a `Message` or
   `UserMessage` table change). There is a [useful Django
   feature][migrations-non-atomic] that makes it possible to add
   `atomic=False` at the top of a `Migration` class and thus not have
   the entire migration in a transaction. This should make it possible
   to use the batch update tools in `zerver/lib/migrate.py` (originally
   written to work with South) for doing larger database migrations.
+- **No-op migrations**. Django detects model changes that does not
+  necessarily lead to a schema change in the database.
+  For example, field validators are a part of the Django ORM, but they
+  are not stored in the database. When removing such validators from
+  an existing model, nothing gets dropped from the database, but Django
+  would still generate a migration for that. We prefer to avoid adding
+  this kind of no-op migrations. Instead of generating a new migration,
+  you'll want to modify the latest migration affecting the field.
 
 - **Accessing code and models in RunPython migrations**. When writing
   a migration that includes custom python code (aka `RunPython`), you
@@ -123,13 +130,13 @@ migrations.
     to do lots of small batches, potentially with a brief sleep in
     between, so that we don't block other operations from finishing.
   - **Rerunnability/idempotency**. Good migrations are ones where if
-    operational concerns (e.g. it taking down the Zulip server for
+    operational concerns (e.g., it taking down the Zulip server for
     users) interfere with it finishing, it's easy to restart the
     migration without doing a bunch of hand investigation. Ideally,
     the migration can even continue where it left off, without needing
     to redo work.
   - **Multi-step migrations**. For really big migrations, one wants
-    to split the transition into into several commits that are each
+    to split the transition into several commits that are each
     individually correct, and can each be deployed independently:
 
     1. First, do a migration to add the new column to the Message table
@@ -137,7 +144,7 @@ migrations.
     2. Second, do a migration to copy values from the old column to
        the new column, to ensure that the two data stores agree.
     3. Third, a commit that stops writing to the old field.
-    4. Any cleanup work, e.g. if the old field were a column, we'd do
+    4. Any cleanup work, e.g., if the old field were a column, we'd do
        a migration to remove it entirely here.
 
     This multi-step process is how most migrations on large database
@@ -164,7 +171,7 @@ an incorrect migration messes up a database in a way that's impossible
 to undo without going to backups.
 
 [django-migration-test-blog-post]: https://www.caktusgroup.com/blog/2016/02/02/writing-unit-tests-django-migrations/
-[migrations-non-atomic]: https://docs.djangoproject.com/en/3.2/howto/writing-migrations/#non-atomic-migrations
+[migrations-non-atomic]: https://docs.djangoproject.com/en/5.0/howto/writing-migrations/#non-atomic-migrations
 
 ## Schema and initial data changes
 
@@ -173,12 +180,17 @@ If you follow the processes described above, `tools/provision` and
 migrations and run migrations on (`./manage.py migrate`) or rebuild
 the relevant database automatically as appropriate.
 
-While developing migrations, you may accidentally corrupt
-your databases while debugging your new code.
-You can always rebuild these databases from scratch.
+Notably, both `manage.py migrate` (`git grep post_migrate.connect` for
+details) and restarting `tools/run-dev` will flush `memcached`, so you
+shouldn't have to worry about cached objects from a previous database
+schema.
 
-Use `tools/rebuild-test-database` to rebuild the database
-used for `test-backend` and other automated tests.
+While developing migrations, you may accidentally corrupt your
+databases while debugging your new code. You can always rebuild these
+databases from scratch:
 
-Use `tools/rebuild-dev-database` to rebuild the database
-used in [manual testing](../development/using.md).
+- Use `tools/rebuild-test-database` to rebuild the database
+  used for `test-backend` and other automated tests.
+
+- Use `tools/rebuild-dev-database` to rebuild the database
+  used in [manual testing](../development/using.md).

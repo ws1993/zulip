@@ -1,6 +1,8 @@
 # Zulip Rules of Use
 
-**Last updated: December 13, 2021**
+**Last updated: December 13, 2021.** View [change history][changes-rules].
+
+[changes-rules]: https://github.com/zulip/zulip/commits/main/templates/corporate/policies/rules.md
 
 Zulip is designed to help thoughtful people work on difficult problems together,
 whether they work from a shared office or from all over the world. Zulip offers
@@ -16,7 +18,7 @@ additionally encouraged to write a Code of Conduct and link to it from their
 further guidance on expected behavior in their communities.
 
 If you encounter a Zulip message or behavior by a Zulip user that appears to
-violate these rules, please [report it to us](/support). We aim to be thoughtful
+violate these rules, please [report it to us](/support/). We aim to be thoughtful
 and judicious in handling reported content. Depending on the severity and scope
 of the problem, our response may include issuing a warning, removing the
 content, deactivating user accounts or organizations, and/or reporting the
@@ -101,7 +103,7 @@ any of the following:
 - **Do not send spam**, including unsolicited communications, promotions, or
   advertisements.
 - **Do not target other accounts with notification spam** by mentioning someone
-  or sending them private messages that they do not want.
+  or sending them direct messages that they do not want.
 - **Do not use other accounts to contact a user who has muted you** or create a
   new account in an organization that has deactivated your account for abusive
   behavior**.** Do not circumvent features we offer to enable users to protect

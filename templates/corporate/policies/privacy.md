@@ -1,6 +1,8 @@
 # Privacy Policy
 
-**Effective date: January 1, 2022**
+**Effective date: January 1, 2022.** View [change history][changes-privacy].
+
+[changes-privacy]: https://github.com/zulip/zulip/commits/main/templates/corporate/policies/privacy.md
 
 At Kandra Labs, Inc. (“Zulip”), we take your privacy seriously. Please read this
 Privacy Policy to learn how we treat your personal data. **By using or accessing
@@ -70,7 +72,7 @@ provide them to us:
 | **Web Analytics**                                                             | - Web page interactions<br>- Referring webpage/source through which you accessed the Services<br>- Statistics associated with the interaction between device or browser and the Services                                                                                                                                                                                                                                   | - Service Providers<br>- Analytics Partners                                                                                                                                                          |
 | **Social Network Data**                                                       | - Email address<br>- User name                                                                                                                                                                                                                                                                                                                                                                                             | - Service Providers                                                                                                                                                                                  |
 | **Geolocation Data**                                                          | - IP-address-based coarse location information                                                                                                                                                                                                                                                                                                                                                                             | - Service Providers<br>- Analytics Partners                                                                                                                                                          |
-| **Other Identifying Information that You Voluntarily Choose to Provide**      | - Identifying information in emails, letters, Zulip messages or support communications you send us<br>- Zulip messages, uploaded files, stream descriptions, and other content you provide using our Services (e.g. in a Zulip client) <br>- Values of custom profile fields configured by your Zulip Organization, where you might choose to enter your phone number, job title, birthday, or other biographical details. | - Service Providers<br>- Parties You Authorize, Access or Authenticate                                                                                                                               |
+| **Other Identifying Information that You Voluntarily Choose to Provide**      | - Identifying information in emails, letters, Zulip messages or support communications you send us<br>- Zulip messages, uploaded files, channel descriptions, and other content you provide using our Services (e.g., in a Zulip client) <br>- Values of custom profile fields configured by your Zulip Organization, where you might choose to enter your phone number, job title, birthday, or other biographical details. | - Service Providers<br>- Parties You Authorize, Access or Authenticate                                                                                                                               |
 | **Other Identifying Information that Another User Chooses to Provide to You** | - Messages or other content that other Zulip users may send you. <br>- Messages or content that any Zulip Organization Administrator of a Zulip community that you may join may provide about you.                                                                                                                                                                                                                         | - Service Providers<br>- Parties You Authorize, Access or Authenticate                                                                                                                               |
 
 
@@ -93,7 +95,7 @@ We collect Personal Data about you from the following categories of sources:
           desktop apps, or interact with the Services over a network
           using a web browser or other client, we may receive and
           collect information about your device and your network
-          connection (e.g. your IP address).
+          connection (e.g., your IP address).
         - If you download a Zulip application such as our mobile and
           desktop apps, or interact with the Services over a network
           using a web browser or other client, we may receive and
@@ -191,10 +193,10 @@ parties listed in this section. We do not sell Personal Data.
   include:
     - Other Zulip users. When you send a message to another Zulip user or
       otherwise provide data to Zulip, it may be shared with some or all other
-      users in that Zulip Organization. Please note that some Zulip streams [may
+      users in that Zulip Organization. Please note that some Zulip channels [may
       be accessible to the general
-      public](/help/stream-permissions), in addition to the
-      stream’s current subscribers. For more information, please review our
+      public](/help/channel-permissions#web-public-channels), in addition to the
+      channel’s current subscribers. For more information, please review our
       [Terms of Service](/policies/terms).
     - Zulip Organization Administrators may export all Zulip data for a Zulip
       Organization for archival/backup purposes, to import the data into a
@@ -368,7 +370,7 @@ other content that you have sent to another Zulip user. If you request deletion
 of your account, all such messages and content will be associated with a
 “Deleted User.” In addition, please note that anyone that you send messages or
 other content to (or who may otherwise have access to such messages or content
-through a Zulip Organization or stream) may have downloaded or copied such
+through a Zulip Organization or channel) may have downloaded or copied such
 messages or content. Zulip will not be able to delete such downloaded or copied
 messages or content.
 
@@ -428,6 +430,8 @@ change these settings in your
 privacy](/accounts/go/?next=%23settings%2Faccount-and-privacy) settings.
 
 ### Nevada Resident Rights
+
+As noted above, we do not sell Personal Data.
 
 If you are a resident of Nevada, you have the right to opt-out of the
 sale of certain Personal Data to third parties who intend to license
@@ -549,7 +553,7 @@ to verify your identity and the nature of your request.
   deletion of your account, all such messages and content will be associated
   with a “Deleted User.”  In addition, please note that anyone that you send
   messages or other content to (or who may otherwise have access to such
-  messages or content through a Zulip Organization or stream), may have
+  messages or content through a Zulip Organization or channel), may have
   downloaded or copied such messages or content. Zulip will not be able to
   delete such downloaded or copied messages or content.
 - **Withdrawal of Consent**:  If we are processing your Personal Data based on
@@ -611,5 +615,5 @@ regarding such collection and use, please do not hesitate to contact us at:
 If you are located in the European Union or United Kingdom, you may use our
 contact information above, or contact our European-based representative:
 
-- European Union Representative: Jack Baylor, 2 Ashton Place, Gardiner’s Hill Cork, Ireland
+- European Union Representative: George Barry, 4 St Christopher's Rd, Montenotte, Cork, T23 E9TR, Ireland
 - UK Representative: S. Alec Lawton, Graigwen, Plasycoed road, Pontypool Torfaen, NP4 6QH, UK

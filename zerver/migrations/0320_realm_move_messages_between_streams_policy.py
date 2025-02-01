@@ -4,7 +4,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("zerver", "0319_realm_giphy_rating"),
     ]
@@ -13,6 +12,6 @@ class Migration(migrations.Migration):
         migrations.AddField(
             model_name="realm",
             name="move_messages_between_streams_policy",
-            field=models.PositiveSmallIntegerField(default=2),
+            field=models.PositiveSmallIntegerField(default=1),
         ),
     ]

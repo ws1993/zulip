@@ -1,16 +1,16 @@
-"use strict";
-
-module.exports = {
-    extends: ["stylelint-config-standard", "stylelint-config-prettier"],
+export default {
+    extends: ["stylelint-config-standard"],
+    plugins: ["stylelint-high-performance-animation"],
     rules: {
         // Add some exceptions for recommended rules
-        "at-rule-no-unknown": [true, {ignoreAtRules: ["extend", "define-mixin", "mixin"]}],
+        "at-rule-no-unknown": [true, {ignoreAtRules: ["extend"]}],
         "font-family-no-missing-generic-family-keyword": [
             true,
             {ignoreFontFamilies: ["FontAwesome"]},
         ],
 
         // Disable recommended rules we don't comply with yet
+        "media-query-no-invalid": null,
         "no-descending-specificity": null,
 
         // Disable standard rules we don't comply with yet
@@ -20,11 +20,6 @@ module.exports = {
         "selector-class-pattern": null,
         "selector-id-pattern": null,
 
-        // Compatibility with older browsers
-        "alpha-value-notation": "number",
-        "color-function-notation": "legacy",
-        "hue-degree-notation": "number",
-
         // Limit language features
         "color-no-hex": true,
         "color-named": "never",
@@ -33,17 +28,20 @@ module.exports = {
             "/^(border(-top|-right|-bottom|-left)?|outline)(-width)?$/": [
                 /\b(thin|medium|thick)\b/,
             ],
+            // no quotation marks around grid-area; use
+            // `grid-area: my_area`, not `grid-area: "my_area"`
+            "grid-area": [/".*"/],
         },
         "function-disallowed-list": [
-            // We use hsl(a) instead of rgb(a)
+            // We use hsl instead of rgb
             "rgb",
-            "rgba",
         ],
+        "plugin/no-low-performance-animation-properties": [true, {ignore: "paint-properties"}],
 
         // Zulip CSS should have no dependencies on external resources
         "function-url-no-scheme-relative": true,
         "function-url-scheme-allowed-list": [
-            "data", // Allow data URIs
+            "data", // Allow data URLs
         ],
     },
 };

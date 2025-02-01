@@ -1,19 +1,20 @@
-from typing import Any, Dict, Optional, Union
+from typing import Any
 
 import requests
-from requests.packages.urllib3.util.retry import Retry
+from typing_extensions import override
+from urllib3.util import Retry
 
 
 class OutgoingSession(requests.Session):
     def __init__(
         self,
         role: str,
-        timeout: int,
-        headers: Optional[Dict[str, str]] = None,
-        max_retries: Optional[Union[int, Retry]] = None,
+        timeout: float,
+        headers: dict[str, str] | None = None,
+        max_retries: int | Retry | None = None,
     ) -> None:
         super().__init__()
-        retry: Optional[Retry] = Retry(total=0)
+        retry: Retry | None = Retry(total=0)
         if max_retries is not None:
             if isinstance(max_retries, Retry):
                 retry = max_retries
@@ -28,17 +29,19 @@ class OutgoingSession(requests.Session):
 
 class OutgoingHTTPAdapter(requests.adapters.HTTPAdapter):
     role: str
-    timeout: int
+    timeout: float
 
-    def __init__(self, role: str, timeout: int, max_retries: Optional[Retry]) -> None:
+    def __init__(self, role: str, timeout: float, max_retries: Retry | None) -> None:
         self.role = role
         self.timeout = timeout
         super().__init__(max_retries=max_retries)
 
+    @override
     def send(self, *args: Any, **kwargs: Any) -> requests.Response:
         if kwargs.get("timeout") is None:
             kwargs["timeout"] = self.timeout
         return super().send(*args, **kwargs)
 
-    def proxy_headers(self, proxy: str) -> Dict[str, str]:
+    @override
+    def proxy_headers(self, proxy: str) -> dict[str, str]:
         return {"X-Smokescreen-Role": self.role}

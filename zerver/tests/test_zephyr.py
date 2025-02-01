@@ -1,13 +1,16 @@
 import subprocess
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import patch
 
 import orjson
-from django.http import HttpResponse
 
 from zerver.lib.test_classes import ZulipTestCase
 from zerver.lib.users import get_api_key
-from zerver.models import get_realm, get_user
+from zerver.models.realms import get_realm
+from zerver.models.users import get_user
+
+if TYPE_CHECKING:
+    from django.test.client import _MonkeyPatchedWSGIResponse as TestHttpResponse
 
 
 class ZephyrTest(ZulipTestCase):
@@ -15,7 +18,7 @@ class ZephyrTest(ZulipTestCase):
         user = self.example_user("hamlet")
         self.login_user(user)
 
-        def post(subdomain: Any, **kwargs: Any) -> HttpResponse:
+        def post(subdomain: Any, **kwargs: Any) -> "TestHttpResponse":
             params = {k: orjson.dumps(v).decode() for k, v in kwargs.items()}
             return self.client_post(
                 "/accounts/webathena_kerberos_login/", params, subdomain=subdomain
@@ -48,13 +51,22 @@ class ZephyrTest(ZulipTestCase):
             result = post("zephyr", cred=cred)
         self.assert_json_error(result, "Invalid Kerberos cache")
 
-        with ccache_mock(return_value=b"1234"), ssh_mock(
-            side_effect=subprocess.CalledProcessError(1, [])
-        ), self.assertLogs(level="ERROR") as log:
+        with (
+            ccache_mock(return_value=b"1234"),
+            ssh_mock(side_effect=subprocess.CalledProcessError(1, [])),
+            mirror_mock(),
+            self.assertLogs(level="ERROR") as log,
+        ):
             result = post("zephyr", cred=cred)
 
         self.assert_json_error(result, "We were unable to set up mirroring for you")
         self.assertIn("Error updating the user's ccache", log.output[0])
+
+        with ccache_mock(return_value=b"1234"), self.assertLogs(level="ERROR") as log:
+            result = post("zephyr", cred=cred)
+
+        self.assert_json_error(result, "We were unable to set up mirroring for you")
+        self.assertIn("PERSONAL_ZMIRROR_SERVER is not properly configured", log.output[0])
 
         with ccache_mock(return_value=b"1234"), mirror_mock(), ssh_mock() as ssh:
             result = post("zephyr", cred=cred)
@@ -78,9 +90,12 @@ class ZephyrTest(ZulipTestCase):
             )
 
         cred = dict(cname=dict(nameString=["kerberos_alter_ego"]))
-        with ccache_mock(
-            return_value=b"1234"
-        ), mirror_mock(), ssh_mock() as ssh, kerberos_alter_egos_mock():
+        with (
+            ccache_mock(return_value=b"1234"),
+            mirror_mock(),
+            ssh_mock() as ssh,
+            kerberos_alter_egos_mock(),
+        ):
             result = post("zephyr", cred=cred)
 
         self.assert_json_success(result)

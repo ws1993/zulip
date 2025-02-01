@@ -1,19 +1,22 @@
 import sys
 from argparse import ArgumentParser
-from typing import Any, Union
+from typing import Any
 
 from django.core.exceptions import ValidationError
 from django.core.management.base import CommandError
 from django.db.utils import IntegrityError
+from typing_extensions import override
 
 from zerver.lib.domains import validate_domain
 from zerver.lib.management import ZulipBaseCommand
-from zerver.models import RealmDomain, get_realm_domains
+from zerver.models import RealmDomain
+from zerver.models.realms import get_realm_domains
 
 
 class Command(ZulipBaseCommand):
     help = """Manage domains for the specified realm"""
 
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
             "--op", default="show", help="What operation to do (add, show, remove)."
@@ -24,12 +27,14 @@ class Command(ZulipBaseCommand):
         parser.add_argument("domain", metavar="<domain>", nargs="?", help="domain to add or remove")
         self.add_realm_args(parser, required=True)
 
-    def handle(self, *args: Any, **options: Union[str, bool]) -> None:
+    @override
+    def handle(self, *args: Any, **options: str | bool) -> None:
         realm = self.get_realm(options)
         assert realm is not None  # Should be ensured by parser
         if options["op"] == "show":
             print(f"Domains for {realm.string_id}:")
             for realm_domain in get_realm_domains(realm):
+                assert isinstance(realm_domain["domain"], str)
                 if realm_domain["allow_subdomains"]:
                     print(realm_domain["domain"] + " (subdomains allowed)")
                 else:

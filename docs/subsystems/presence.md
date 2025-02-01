@@ -13,7 +13,7 @@ scalability problems for a team chat tool like Zulip.
 There's a lot of performance-related details in the backend and
 network protocol design that we won't get into here. The focus of
 this is what one needs to know to correctly implement a Zulip client's
-presence implementation (e.g. web app, mobile app, terminal client, or
+presence implementation (e.g., web app, mobile app, terminal client, or
 other tool that's intended to represent whether a user is online and
 using Zulip).
 
@@ -23,11 +23,10 @@ requests contains a few parameters. The most important is "status",
 which had 2 valid values:
 
 - "active" -- this means the user has interacted with the client
-  recently. We use this for the "green" state in the web app.
+  recently.
 - "idle" -- the user has not interacted with the client recently.
   This is important for the case where a user left a Zulip tab open on
-  their desktop at work and went home for the weekend. We use this
-  for the "orange" state in the web app.
+  their desktop at work and went home for the weekend.
 
 The client receives in the response to that request a data set that,
 for each user, contains their status and timestamp that we last heard
@@ -37,7 +36,7 @@ about that data structure:
 - It's really important that the timestamp is the last time we heard
   from the client. A client can only interpret the status to display
   about another user by doing a simple computation using the (status,
-  timestamp) pair. E.g. a user who last used Zulip 1 week ago will
+  timestamp) pair. E.g., a user who last used Zulip 1 week ago will
   have a timestamp of 1 week ago and a status of "active". Why?
   Because this correctly handles the race conditions. For example, if
   the threshold for displaying a user as "offline" was 5 minutes
@@ -48,10 +47,6 @@ about that data structure:
 - Users can disable their own presence updates in user settings
   (`UserProfile.presence_enabled` is the flag storing [this user
   preference](https://zulip.com/help/status-and-availability#disable-updating-availability)).
-- The `status_from_timestamp` function in `static/js/presence.js` is
+- The `status_from_timestamp` function in `web/src/presence.js` is
   useful sample code; the `OFFLINE_THRESHOLD_SECS` check is critical
   to correct output.
-- We provide the data for e.g. whether the user was online on their
-  desktop or the mobile app, but for a basic client, you will likely
-  only want to parse the "aggregated" key, which shows the summary
-  answer for "is this user online".

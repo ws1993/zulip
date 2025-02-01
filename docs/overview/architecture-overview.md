@@ -5,9 +5,9 @@
 The main Zulip codebase is at <https://github.com/zulip/zulip>. It
 contains the Zulip backend (written in Python 3.x and Django), the
 web app (written in JavaScript and TypeScript) and our library of
-incoming webhook [integrations](https://zulip.com/integrations)
+incoming webhook [integrations](https://zulip.com/integrations/)
 with other services and applications (see [the directory structure
-guide](../overview/directory-structure.md)).
+guide](directory-structure.md)).
 
 [Zulip Mobile](https://github.com/zulip/zulip-mobile) is the official
 mobile Zulip client supporting both iOS and Android, written in
@@ -29,7 +29,7 @@ adapter](https://github.com/zulip/hubot-zulip); integrations with
 [Trello](https://github.com/zulip/trello-to-zulip);
 and [many more](https://github.com/zulip/).
 
-We use [Transifex](https://www.transifex.com/zulip/zulip/) to do
+We use [Transifex](https://explore.transifex.com/zulip/zulip/) to do
 translations.
 
 In this overview, we'll mainly discuss the core Zulip server and web
@@ -40,23 +40,23 @@ application.
 Zulip is a real-time team chat application meant to provide a great
 experience for a wide range of organizations, from companies to
 volunteer projects to groups of friends, ranging in size from a small
-team to 10,000s of users. It has [hundreds of
-features](https://zulip.com/features) both larger and small, and
+team to tens of thousands of users. It has [hundreds of
+features](https://zulip.com/features/) both large and small, and
 supports dedicated apps for iOS, Android, Linux, Windows, and macOS,
 all modern web browsers, several cross-protocol chat clients, and
-numerous dedicated [Zulip API](https://zulip.com/api) clients
-(e.g. bots).
+numerous dedicated [Zulip API](https://zulip.com/api/) clients
+(e.g., bots).
 
 A server can host multiple Zulip _realms_ (organizations), each on its
 own (sub)domain. While most installations host only one organization, some
-such as zulip.com host thousands. Each organization is a private
-chamber with its own users, streams, customizations, and so on. This
+host thousands, such as zulip.com. Each organization is a private
+chamber with its own users, channels, customizations, and so on. This
 means that one person might be a user of multiple Zulip realms. The
 administrators of an organization have a great deal of control over
 who can register an account, what permissions new users have, etc. For
 more on security considerations and options, see [the security model
 section](../production/security-model.md) and the [Zulip Help
-Center](https://zulip.com/help).
+Center](https://zulip.com/help/).
 
 ## Components
 
@@ -87,10 +87,10 @@ database queries inside the Tornado code paths, since those blocking
 requests carry a very high performance penalty for a single-threaded,
 asynchronous server system. (In principle, we could do non-blocking
 requests to those services, but the Django-based database libraries we
-use in most of our codebase using don't support that, and in any case,
+use in most of our codebase don't support that, and in any case,
 our architecture doesn't require Tornado to do that).
 
-The parts that are activated relatively rarely (e.g. when people type or
+The parts that are activated relatively rarely (e.g., when people type or
 click on something) are processed by the Django application server.
 
 There is detailed documentation on the
@@ -108,9 +108,9 @@ feed.
 
 For more details on the frontend, see our documentation on
 [translation](../translating/translating.md),
-[templates](../subsystems/html-css.html#html-templates),
-[directory structure](../overview/directory-structure.md), and
-[the static asset pipeline](../subsystems/html-css.html#static-asset-pipeline).
+[templates](../subsystems/html-css.md#html-templates),
+[directory structure](directory-structure.md), and
+[the static asset pipeline](../subsystems/html-css.md#static-asset-pipeline).
 
 [jinja2]: http://jinja.pocoo.org/
 [handlebars]: https://handlebarsjs.com/
@@ -120,9 +120,9 @@ For more details on the frontend, see our documentation on
 nginx is the front-end web server to all Zulip traffic; it serves static
 assets and proxies to Django and Tornado. It handles HTTP requests
 according to the rules laid down in the many config files found in
-`zulip/puppet/zulip/files/nginx/`.
+`puppet/zulip/files/nginx/` and `puppet/zulip/templates/nginx/`.
 
-`zulip/puppet/zulip/files/nginx/zulip-include-frontend/app` is the most
+`puppet/zulip/files/nginx/zulip-include-frontend/app` is the most
 important of these files. It explains what happens when requests come in
 from outside.
 
@@ -150,7 +150,7 @@ We use [supervisord](http://supervisord.org/) to start server processes,
 restart them automatically if they crash, and direct logging.
 
 The config file is
-`zulip/puppet/zulip/templates/supervisor/zulip.conf.template.erb`. This
+`puppet/zulip/templates/supervisor/zulip.conf.template.erb`. This
 is where Tornado and Django are set up, as well as a number of background
 processes that process event queues. We use event queues for the kinds
 of tasks that are best run in the background because they are
@@ -164,7 +164,7 @@ memcached is used to cache database model
 objects. `zerver/lib/cache.py` and `zerver/lib/cache_helpers.py`
 manage putting things into memcached, and invalidating the cache when
 values change. The memcached configuration is in
-`puppet/zulip/files/memcached.conf`. See our
+`puppet/zulip/templates/memcached.conf.template.erb`. See our
 [caching guide](../subsystems/caching.md) to learn how this works in
 detail.
 
@@ -173,12 +173,11 @@ detail.
 Redis is used for a few very short-term data stores, primarily
 our rate-limiting system.
 
-Redis is configured in `zulip/puppet/zulip/files/redis` and it's a
-pretty standard configuration except for the last line, which turns off
-persistence:
+Redis is configured in `puppet/zulip/templates/zulip-redis.template.erb` and
+the main contents are the following, which turns off persistence:
 
 ```text
-# Zulip-specific configuration: disable saving to disk.
+# Disable saving to disk to optimize performance
 save ""
 ```
 
@@ -206,21 +205,21 @@ materialize:
 ### RabbitMQ
 
 RabbitMQ is a queueing system. Its config files live in
-`zulip/puppet/zulip/files/rabbitmq`. Initial configuration happens in
-`zulip/scripts/setup/configure-rabbitmq`.
+`puppet/zulip/files/rabbitmq`. Initial configuration happens in
+`scripts/setup/configure-rabbitmq`.
 
-We use RabbitMQ for queuing expensive work (e.g. sending emails
+We use RabbitMQ for queuing expensive work (e.g., sending emails
 triggered by a message, push notifications, some analytics, etc.) that
 require reliable delivery but which we don't want to do on the main
 thread. It's also used for communication between the application server
 and the Tornado push system.
 
 Two simple wrappers around `pika` (the Python RabbitMQ client) are in
-`zulip/zerver/lib/queue.py`. There's an asynchronous client for use in
+`zerver/lib/queue.py`. There's an asynchronous client for use in
 Tornado and a more general client for use elsewhere. Most of the
 processes started by Supervisor are queue processors that continually
 pull things out of a RabbitMQ queue and handle them; they are defined
-in `zerver/worker/queue_processors.py`.
+in `zerver/worker/`.
 
 Also see [the queuing guide](../subsystems/queuing.md).
 
@@ -250,15 +249,15 @@ to create the actual database with its schema.
 Nagios is an optional component used for notifications to the system
 administrator, e.g., in case of outages.
 
-`zulip/puppet/zulip/manifests/nagios.pp` installs Nagios plugins from
+`puppet/zulip/manifests/nagios_plugins.pp` installs Nagios plugins from
 `puppet/zulip/files/nagios_plugins/`.
 
 This component is intended to install Nagios plugins intended to be run
 on a Nagios server; most of the Zulip Nagios plugins are intended to be
 run on the Zulip servers themselves, and are included with the relevant
-component of the Zulip server (e.g.
-`puppet/zulip/manifests/postgresql_backups.pp` installs a few under
-`/usr/lib/nagios/plugins/zulip_backups`).
+component of the Zulip server (e.g.,
+`puppet/zulip/manifests/app_frontend_base.pp` installs a few under
+`/usr/lib/nagios/plugins/zulip_app_frontend`).
 
 ## Glossary
 
@@ -280,23 +279,23 @@ self-explanatory names.
 
 - **ellipsis**: A small vertical three dot icon (technically called
   as ellipsis-v), present in sidebars as a menu icon.
-  It offers contextual options for global filters (All messages
-  and Starred messages), stream filters and topics in left
+  It offers contextual options for global filters (Combined feed
+  and Starred messages), channel filters and topics in left
   sidebar and users in right sidebar. To avoid visual clutter
   ellipsis only appears in the web UI upon hover.
 
-- **huddle**: What the codebase calls a "group private message".
+- **huddle**: What the codebase calls a "group direct message".
 
 - **message editing**: If the realm admin allows it, then after a user
   posts a message, the user has a few minutes to click "Edit" and
   change the content of their message. If they do, Zulip adds a
-  marker such as "(EDITED)" at the top of the message, visible to
+  marker such as "EDITED" at the top of the message, visible to
   anyone who can see the message.
 
 - **realm**: What the codebase calls an "organization" in the UI.
 
 - **recipient bar**: A visual indication of the context of a message
-  or group of messages, displaying the stream and topic or private
+  or group of messages, displaying the channel and topic or direct
   message recipient list, at the top of a group of messages. A
   typical 1-line message to a new recipient shows to the user as
   three lines of content: first the recipient bar, second the

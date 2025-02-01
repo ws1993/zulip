@@ -8,34 +8,34 @@ be used to deep-link into the application and allow the browser's
 Some examples are:
 
 - `/#settings/your-bots`: Bots section of the settings overlay.
-- `/#streams`: Streams overlay, where the user manages streams
+- `/#channels`: Channels overlay, where the user manages channels
   (subscription etc.)
-- `/#streams/11/announce`: Streams overlay with stream ID 11 (called
+- `/#channels/11/announce`: Channels overlay with channel ID 11 (called
   "announce") selected.
-- `/#narrow/stream/42-android/topic/fun`: Message feed showing stream
+- `/#narrow/channel/42-android/topic/fun`: Message feed showing channel
   "android" and topic "fun". (The `42` represents the id of the
-  stream.
+  channel.)
 
 The main module in the frontend that manages this all is
-`static/js/hashchange.js` (plus `hash_util.js` for all the parsing
+`web/src/hashchange.ts` (plus `hash_util.js` for all the parsing
 code), which is unfortunately one of our thorniest modules. Part of
 the reason that it's thorny is that it needs to support a lot of
 different flows:
 
 - The user clicking on an in-app link, which in turn opens an overlay.
-  For example the streams overlay opens when the user clicks the small
+  For example the channels overlay opens when the user clicks the small
   cog symbol on the left sidebar, which is in fact a link to
-  `/#streams`. This makes it easy to have simple links around the app
+  `/#channels`. This makes it easy to have simple links around the app
   without custom click handlers for each one.
 - The user uses the "back" button in their browser (basically
   equivalent to the previous one, as a _link_ out of the browser history
   will be visited).
-- The user clicking some in-app click handler (e.g. "Stream settings"
-  for an individual stream), that potentially does
-  several UI-manipulating things including e.g. loading the streams
-  overlay, and needs to update the hash without re-triggering the open
-  animation (etc.).
-- Within an overlay like the streams overlay, the user clicks to
+- The user clicking some in-app click handler (e.g., "Channel settings"
+  for an individual channel), that potentially does
+  several UI-manipulating things including, for example, loading the
+  channels overlay, and needs to update the hash without re-triggering
+  the open animation (etc.).
+- Within an overlay like the channels overlay, the user clicks to
   another part of the overlay, which should update the hash but not
   re-trigger loading the overlay (which would result in a confusing
   animation experience).
@@ -45,7 +45,7 @@ different flows:
 - A server-initiated browser reload (done after a new version is
   deployed, or when a user comes back after being idle for a while,
   see [notes below][self-server-reloads]), where we try to preserve
-  extra state (e.g. content of compose box, scroll position within a
+  extra state (e.g., content of compose box, scroll position within a
   narrow) using the `/#reload` hash prefix.
 
 When making changes to the hashchange system, it is **essential** to
@@ -54,7 +54,7 @@ all of this (would be a good project to add them to the
 [Puppeteer suite][testing-with-puppeteer]) and there's enough complexity
 that it's easy to accidentally break something.
 
-The main external API lives in `static/js/browser_history.js`:
+The main external API lives in `web/src/browser_history.js`:
 
 - `browser_history.update` is used to update the browser
   history, and it should be called when the app code is taking care
@@ -65,11 +65,11 @@ The main external API lives in `static/js/browser_history.js`:
 Internally you have these functions:
 
 - `hashchange.hashchanged` is the function used to handle the hash,
-  whether it's changed by the browser (e.g. by clicking on a link to
+  whether it's changed by the browser (e.g., by clicking on a link to
   a hash or using the back button) or triggered internally.
 - `hashchange.do_hashchange_normal` handles most cases, like loading the main
   page (but maybe with a specific URL if you are narrowed to a
-  stream or topic or PMs, etc.).
+  channel or topic or direct messages, etc.).
 - `hashchange.do_hashchange_overlay` handles overlay cases. Overlays have
   some minor complexity related to remembering the page from
   which the overlay was launched, as well as optimizing in-page
@@ -97,7 +97,7 @@ reload itself:
   start looking for a good time to reload, based on when the user is
   idle (ideally, we'd reload when they're not looking and restore
   state so that the user never knew it happened!). The logic for
-  doing this is in `static/js/reload.js`; but regardless we'll reload
+  doing this is in `web/src/reload.ts`; but regardless we'll reload
   within 30 minutes unconditionally.
 
   An important detail in server-initiated reloads is that we
@@ -109,7 +109,7 @@ Here are some key functions in the reload system:
 - `reload.preserve_state` is called when a server-initiated browser
   reload happens, and encodes a bunch of data like the current scroll
   position into the hash.
-- `reload.initialize` handles restoring the preserved state after a
+- `reload_setup.initialize` handles restoring the preserved state after a
   reload where the hash starts with `/#reload`.
 
 ## All reloads
@@ -121,4 +121,4 @@ box as a draft).
 
 [testing-with-puppeteer]: ../testing/testing-with-puppeteer.md
 [self-server-reloads]: #server-initiated-reloads
-[events-system]: ../subsystems/events-system.md
+[events-system]: events-system.md

@@ -17,7 +17,7 @@ sanity_check.check_venv(__file__)
 from scripts.lib.zulip_tools import ENDC, FAIL, WARNING
 from tools.lib.capitalization import check_capitalization
 
-DJANGO_PO_REGEX = re.compile('msgid "(.*?)"')
+DJANGO_PO_REGEX = re.compile(r'msgid "(.*?)"')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -32,7 +32,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if not args.no_generate:
-        subprocess.call(["./manage.py", "makemessages", "--locale", "en"], stderr=subprocess.STDOUT)
+        subprocess.check_call(
+            ["./manage.py", "makemessages", "--locale", "en"], stderr=subprocess.STDOUT
+        )
 
     with open("locale/en/translations.json") as f:
         data = json.load(f)

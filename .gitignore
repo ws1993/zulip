@@ -17,22 +17,24 @@
 # See `git help ignore` for details on the format.
 
 ## Config files for the dev environment
+/zproject/apns-dev.pem
+/zproject/apns-dev-key.p8
 /zproject/dev-secrets.conf
+/zproject/custom_dev_settings.py
 /tools/conf.ini
 /tools/custom_provision
 /tools/droplets/conf.ini
 
 ## Byproducts of setting up and using the dev environment
 *.pyc
+*.tsbuildinfo
 package-lock.json
 
 /.vagrant
-/var/*
-!/var/puppeteer
-/var/puppeteer/*
-!/var/puppeteer/test_credentials.d.ts
+/var
 
 /.dmypy.json
+/.ruff_cache
 
 # Generated i18n data
 /locale/en
@@ -43,11 +45,11 @@ package-lock.json
 # Static build
 *.mo
 npm-debug.log
+/.pnpm-store
 /node_modules
 /prod-static
 /staticfiles.json
 /webpack-stats-production.json
-/yarn-error.log
 zulip-git-version
 
 # Test / analysis tools
@@ -81,6 +83,9 @@ zulip.kdev4
 
 # Core dump files
 core
+
+# Static generated files for landing page.
+/static/images/landing-page/hello/generated
 
 ## Miscellaneous
 # (Ideally this section is empty.)

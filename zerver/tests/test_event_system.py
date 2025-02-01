@@ -1,88 +1,106 @@
 import time
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from collections.abc import Callable
+from typing import Any
 from unittest import mock
+from urllib.parse import urlsplit
 
 import orjson
 from django.conf import settings
 from django.http import HttpRequest, HttpResponse
+from django.test import override_settings
 from django.utils.timezone import now as timezone_now
+from typing_extensions import override
 
-from version import API_FEATURE_LEVEL, ZULIP_MERGE_BASE, ZULIP_VERSION
-from zerver.lib.actions import (
-    check_send_message,
-    do_change_user_role,
-    do_set_realm_property,
-    do_update_user_presence,
-)
-from zerver.lib.event_schema import check_restart_event
-from zerver.lib.events import fetch_initial_state_data
+from zerver.actions.custom_profile_fields import try_update_realm_custom_profile_field
+from zerver.actions.message_send import check_send_message
+from zerver.actions.presence import do_update_user_presence
+from zerver.actions.user_settings import do_change_user_setting
+from zerver.actions.users import do_change_user_role
+from zerver.lib.event_schema import check_web_reload_client_event
+from zerver.lib.events import fetch_initial_state_data, post_process_state
 from zerver.lib.exceptions import AccessDeniedError
+from zerver.lib.request import RequestVariableMissingError
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.test_helpers import HostRequestMock, queries_captured, stub_event_queue_user_events
-from zerver.lib.users import get_api_key, get_raw_user_data
-from zerver.models import (
-    Realm,
-    UserMessage,
-    UserPresence,
-    UserProfile,
-    flush_per_request_caches,
-    get_client,
-    get_realm,
-    get_stream,
-    get_system_bot,
+from zerver.lib.test_helpers import (
+    HostRequestMock,
+    dummy_handler,
+    reset_email_visibility_to_everyone_in_zulip_realm,
+    stub_event_queue_user_events,
 )
+from zerver.lib.users import get_api_key, get_users_for_api
+from zerver.models import CustomProfileField, UserMessage, UserPresence, UserProfile
+from zerver.models.clients import get_client
+from zerver.models.realms import get_realm, get_realm_with_settings
+from zerver.models.streams import get_stream
+from zerver.models.users import get_system_bot
 from zerver.tornado.event_queue import (
     allocate_client_descriptor,
     clear_client_event_queues_for_testing,
     get_client_info_for_message_event,
+    mark_clients_to_reload,
     process_message_event,
-    send_restart_events,
+    send_web_reload_client_events,
 )
-from zerver.tornado.views import get_events, get_events_backend
-from zerver.views.events_register import (
-    _default_all_public_streams,
-    _default_narrow,
-    events_register_backend,
-)
+from zerver.tornado.exceptions import BadEventQueueIdError
+from zerver.tornado.views import get_events
+from zerver.views.events_register import _default_all_public_streams, _default_narrow
 
 
 class EventsEndpointTest(ZulipTestCase):
-    def test_events_register_endpoint(self) -> None:
+    def test_events_register_without_user_agent(self) -> None:
+        result = self.client_post("/json/register", skip_user_agent=True)
+        self.assert_json_success(result)
 
+    def test_narrows(self) -> None:
+        user = self.example_user("hamlet")
+        with mock.patch("zerver.lib.events.request_event_queue", return_value=None) as m:
+            munge = lambda obj: orjson.dumps(obj).decode()
+            narrow = [["stream", "devel"], ["is", "mentioned"]]
+            payload = dict(narrow=munge(narrow))
+            result = self.api_post(user, "/api/v1/register", payload)
+
+        # We want the test to abort before actually fetching data.
+        self.assert_json_error(result, "Could not allocate event queue")
+
+        self.assertEqual(m.call_args.kwargs["narrow"], [["stream", "devel"], ["is", "mentioned"]])
+
+    def test_events_register_endpoint(self) -> None:
         # This test is intended to get minimal coverage on the
         # events_register code paths
         user = self.example_user("hamlet")
         with mock.patch("zerver.views.events_register.do_events_register", return_value={}):
-            result = self.api_post(user, "/json/register")
+            result = self.api_post(user, "/api/v1/register")
         self.assert_json_success(result)
 
         with mock.patch("zerver.lib.events.request_event_queue", return_value=None):
-            result = self.api_post(user, "/json/register")
+            result = self.api_post(user, "/api/v1/register")
         self.assert_json_error(result, "Could not allocate event queue")
 
         return_event_queue = "15:11"
-        return_user_events: List[Dict[str, Any]] = []
+        return_user_events: list[dict[str, Any]] = []
 
         # We choose realm_emoji somewhat randomly--we want
         # a "boring" event type for the purpose of this test.
         event_type = "realm_emoji"
-        test_event = dict(id=6, type=event_type, realm_emoji=[])
+        empty_realm_emoji_dict: dict[str, Any] = {}
+        test_event = dict(id=6, type=event_type, realm_emoji=empty_realm_emoji_dict)
 
         # Test that call is made to deal with a returning soft deactivated user.
-        with mock.patch("zerver.lib.events.reactivate_user_if_soft_deactivated") as fa:
-            with stub_event_queue_user_events(return_event_queue, return_user_events):
-                result = self.api_post(
-                    user, "/json/register", dict(event_types=orjson.dumps([event_type]).decode())
-                )
-                self.assertEqual(fa.call_count, 1)
+        with (
+            mock.patch("zerver.lib.events.reactivate_user_if_soft_deactivated") as fa,
+            stub_event_queue_user_events(return_event_queue, return_user_events),
+        ):
+            result = self.api_post(
+                user, "/api/v1/register", dict(event_types=orjson.dumps([event_type]).decode())
+            )
+            self.assertEqual(fa.call_count, 1)
 
         with stub_event_queue_user_events(return_event_queue, return_user_events):
             result = self.api_post(
-                user, "/json/register", dict(event_types=orjson.dumps([event_type]).decode())
+                user, "/api/v1/register", dict(event_types=orjson.dumps([event_type]).decode())
             )
 
-        self.assert_json_success(result)
-        result_dict = result.json()
+        result_dict = self.assert_json_success(result)
         self.assertEqual(result_dict["last_event_id"], -1)
         self.assertEqual(result_dict["queue_id"], "15:11")
 
@@ -92,30 +110,28 @@ class EventsEndpointTest(ZulipTestCase):
 
         with stub_event_queue_user_events(return_event_queue, return_user_events):
             result = self.api_post(
-                user, "/json/register", dict(event_types=orjson.dumps([event_type]).decode())
+                user, "/api/v1/register", dict(event_types=orjson.dumps([event_type]).decode())
             )
 
-        self.assert_json_success(result)
-        result_dict = result.json()
+        result_dict = self.assert_json_success(result)
         self.assertEqual(result_dict["last_event_id"], 6)
         self.assertEqual(result_dict["queue_id"], "15:12")
 
         # sanity check the data relevant to our event
-        self.assertEqual(result_dict["realm_emoji"], [])
+        self.assertEqual(result_dict["realm_emoji"], {})
 
         # Now test with `fetch_event_types` not matching the event
         return_event_queue = "15:13"
         with stub_event_queue_user_events(return_event_queue, return_user_events):
             result = self.api_post(
                 user,
-                "/json/register",
+                "/api/v1/register",
                 dict(
                     event_types=orjson.dumps([event_type]).decode(),
                     fetch_event_types=orjson.dumps(["message"]).decode(),
                 ),
             )
-        self.assert_json_success(result)
-        result_dict = result.json()
+        result_dict = self.assert_json_success(result)
         self.assertEqual(result_dict["last_event_id"], 6)
         # Check that the message event types data is in there
         self.assertIn("max_message_id", result_dict)
@@ -128,22 +144,59 @@ class EventsEndpointTest(ZulipTestCase):
         with stub_event_queue_user_events(return_event_queue, return_user_events):
             result = self.api_post(
                 user,
-                "/json/register",
+                "/api/v1/register",
                 dict(
                     fetch_event_types=orjson.dumps([event_type]).decode(),
                     event_types=orjson.dumps(["message"]).decode(),
                 ),
             )
-        self.assert_json_success(result)
-        result_dict = result.json()
+        result_dict = self.assert_json_success(result)
         self.assertEqual(result_dict["last_event_id"], 6)
         # Check that we didn't fetch the messages data
         self.assertNotIn("max_message_id", result_dict)
 
         # Check that the realm_emoji data is in there.
         self.assertIn("realm_emoji", result_dict)
-        self.assertEqual(result_dict["realm_emoji"], [])
+        self.assertEqual(result_dict["realm_emoji"], {})
         self.assertEqual(result_dict["queue_id"], "15:13")
+
+    def test_events_register_spectators(self) -> None:
+        # Verify that POST /register works for spectators, but not for
+        # normal users.
+        with self.settings(WEB_PUBLIC_STREAMS_ENABLED=False), self.assert_database_query_count(2):
+            result = self.client_post("/json/register")
+            self.assert_json_error(
+                result,
+                "Not logged in: API authentication or user session required",
+                status_code=401,
+            )
+
+        with self.assert_database_query_count(17):
+            result = self.client_post("/json/register")
+            result_dict = self.assert_json_success(result)
+            self.assertEqual(result_dict["queue_id"], None)
+            self.assertEqual(result_dict["realm_url"], "http://zulip.testserver")
+            self.assertEqual(result_dict["realm_uri"], "http://zulip.testserver")
+
+        result = self.client_post("/json/register")
+        self.assertEqual(result.status_code, 200)
+
+        result = self.client_post("/json/register", dict(client_gravatar="false"))
+        self.assertEqual(result.status_code, 200)
+
+        result = self.client_post("/json/register", dict(client_gravatar="true"))
+        self.assert_json_error(
+            result,
+            "Invalid 'client_gravatar' parameter for anonymous request",
+            status_code=400,
+        )
+
+        result = self.client_post("/json/register", dict(include_subscribers="true"))
+        self.assert_json_error(
+            result,
+            "Invalid 'include_subscribers' parameter for anonymous request",
+            status_code=400,
+        )
 
     def test_events_register_endpoint_all_public_streams_access(self) -> None:
         guest_user = self.example_user("polonius")
@@ -152,11 +205,11 @@ class EventsEndpointTest(ZulipTestCase):
         self.assertEqual(normal_user.role, UserProfile.ROLE_MEMBER)
 
         with mock.patch("zerver.views.events_register.do_events_register", return_value={}):
-            result = self.api_post(normal_user, "/json/register", dict(all_public_streams="true"))
+            result = self.api_post(normal_user, "/api/v1/register", dict(all_public_streams="true"))
         self.assert_json_success(result)
 
         with mock.patch("zerver.views.events_register.do_events_register", return_value={}):
-            result = self.api_post(guest_user, "/json/register", dict(all_public_streams="true"))
+            result = self.api_post(guest_user, "/api/v1/register", dict(all_public_streams="true"))
         self.assert_json_error(result, "User not authorized for this query")
 
     def test_events_get_events_endpoint_guest_cant_use_all_public_streams_param(self) -> None:
@@ -175,10 +228,10 @@ class EventsEndpointTest(ZulipTestCase):
         self.assert_json_error(result, "User not authorized for this query")
 
     def test_tornado_endpoint(self) -> None:
-
-        # This test is mostly intended to get minimal coverage on
-        # the /notify_tornado endpoint, so we can have 100% URL coverage,
-        # but it does exercise a little bit of the codepath.
+        # This test is mostly intended to get minimal coverage on the
+        # /api/internal/notify_tornado endpoint (only used in
+        # puppeteer tests), so we can have 100% URL coverage, but it
+        # does exercise a little bit of the codepath.
         post_data = dict(
             data=orjson.dumps(
                 dict(
@@ -189,18 +242,47 @@ class EventsEndpointTest(ZulipTestCase):
                 ),
             ).decode(),
         )
+        req = HostRequestMock(post_data)
+        req.META["REMOTE_ADDR"] = "127.0.0.1"
+        with self.assertRaises(RequestVariableMissingError) as context:
+            result = self.client_post_request("/api/internal/notify_tornado", req)
+        self.assertEqual(str(context.exception), "Missing 'secret' argument")
+        self.assertEqual(context.exception.http_status_code, 400)
+
+        post_data["secret"] = "random"
         req = HostRequestMock(post_data, user_profile=None)
         req.META["REMOTE_ADDR"] = "127.0.0.1"
-        with self.assertRaises(AccessDeniedError) as context:
-            result = self.client_post_request("/notify_tornado", req)
-        self.assertEqual(str(context.exception), "Access denied")
-        self.assertEqual(context.exception.http_status_code, 403)
+        with self.assertRaises(AccessDeniedError) as access_denied_error:
+            result = self.client_post_request("/api/internal/notify_tornado", req)
+        self.assertEqual(str(access_denied_error.exception), "Access denied")
+        self.assertEqual(access_denied_error.exception.http_status_code, 403)
 
         post_data["secret"] = settings.SHARED_SECRET
-        req = HostRequestMock(post_data, user_profile=None)
+        req = HostRequestMock(post_data, tornado_handler=dummy_handler)
         req.META["REMOTE_ADDR"] = "127.0.0.1"
-        result = self.client_post_request("/notify_tornado", req)
+        result = self.client_post_request("/api/internal/notify_tornado", req)
         self.assert_json_success(result)
+
+        post_data = dict(secret=settings.SHARED_SECRET)
+        req = HostRequestMock(post_data, tornado_handler=dummy_handler)
+        req.META["REMOTE_ADDR"] = "127.0.0.1"
+        with self.assertRaises(RequestVariableMissingError) as context:
+            result = self.client_post_request("/api/internal/notify_tornado", req)
+        self.assertEqual(str(context.exception), "Missing 'data' argument")
+        self.assertEqual(context.exception.http_status_code, 400)
+
+    def test_web_reload_clients(self) -> None:
+        # Minimal testing of the /api/internal/web_reload_clients endpoint
+        post_data = {
+            "client_count": "1",
+            "immediate": orjson.dumps(False).decode(),
+            "secret": settings.SHARED_SECRET,
+        }
+        req = HostRequestMock(post_data, tornado_handler=dummy_handler)
+        req.META["REMOTE_ADDR"] = "127.0.0.1"
+        result = self.client_post_request("/api/internal/web_reload_clients", req)
+        self.assert_json_success(result)
+        self.assertEqual(orjson.loads(result.content)["sent_events"], 0)
 
 
 class GetEventsTest(ZulipTestCase):
@@ -208,9 +290,9 @@ class GetEventsTest(ZulipTestCase):
         self,
         view_func: Callable[[HttpRequest, UserProfile], HttpResponse],
         user_profile: UserProfile,
-        post_data: Dict[str, Any],
+        post_data: dict[str, Any],
     ) -> HttpResponse:
-        request = HostRequestMock(post_data, user_profile)
+        request = HostRequestMock(post_data, user_profile, tornado_handler=dummy_handler)
         return view_func(request, user_profile)
 
     def test_get_events(self) -> None:
@@ -263,16 +345,17 @@ class GetEventsTest(ZulipTestCase):
         self.assert_length(events, 0)
 
         local_id = "10.01"
-        check_send_message(
-            sender=user_profile,
-            client=get_client("whatever"),
-            message_type_name="private",
-            message_to=[recipient_email],
-            topic_name=None,
-            message_content="hello",
-            local_id=local_id,
-            sender_queue_id=queue_id,
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            check_send_message(
+                sender=user_profile,
+                client=get_client("whatever"),
+                recipient_type_name="private",
+                message_to=[recipient_email],
+                topic_name=None,
+                message_content="hello",
+                local_id=local_id,
+                sender_queue_id=queue_id,
+            )
 
         result = self.tornado_call(
             get_events,
@@ -292,20 +375,22 @@ class GetEventsTest(ZulipTestCase):
         self.assertEqual(events[0]["local_message_id"], local_id)
         self.assertEqual(events[0]["message"]["display_recipient"][0]["is_mirror_dummy"], False)
         self.assertEqual(events[0]["message"]["display_recipient"][1]["is_mirror_dummy"], False)
+        self.assertEqual(events[0]["message"]["recipient_id"], recipient_user_profile.recipient_id)
 
         last_event_id = events[0]["id"]
         local_id = "10.02"
 
-        check_send_message(
-            sender=user_profile,
-            client=get_client("whatever"),
-            message_type_name="private",
-            message_to=[recipient_email],
-            topic_name=None,
-            message_content="hello",
-            local_id=local_id,
-            sender_queue_id=queue_id,
-        )
+        with self.captureOnCommitCallbacks(execute=True):
+            check_send_message(
+                sender=user_profile,
+                client=get_client("whatever"),
+                recipient_type_name="private",
+                message_to=[recipient_email],
+                topic_name=None,
+                message_content="hello",
+                local_id=local_id,
+                sender_queue_id=queue_id,
+            )
 
         result = self.tornado_call(
             get_events,
@@ -323,6 +408,7 @@ class GetEventsTest(ZulipTestCase):
         self.assertEqual(events[0]["type"], "message")
         self.assertEqual(events[0]["message"]["sender_email"], email)
         self.assertEqual(events[0]["local_message_id"], local_id)
+        self.assertEqual(events[0]["message"]["recipient_id"], recipient_user_profile.recipient_id)
 
         # Test that the received message in the receiver's event queue
         # exists and does not contain a local id
@@ -342,15 +428,18 @@ class GetEventsTest(ZulipTestCase):
         self.assertEqual(recipient_events[0]["type"], "message")
         self.assertEqual(recipient_events[0]["message"]["sender_email"], email)
         self.assertTrue("local_message_id" not in recipient_events[0])
+        # Incoming DMs show the recipient_id that outgoing DMs would.
+        self.assertEqual(recipient_events[0]["message"]["recipient_id"], user_profile.recipient_id)
         self.assertEqual(recipient_events[1]["type"], "message")
         self.assertEqual(recipient_events[1]["message"]["sender_email"], email)
         self.assertTrue("local_message_id" not in recipient_events[1])
+        self.assertEqual(recipient_events[1]["message"]["recipient_id"], user_profile.recipient_id)
 
     def test_get_events_narrow(self) -> None:
         user_profile = self.example_user("hamlet")
         self.login_user(user_profile)
 
-        def get_message(apply_markdown: bool, client_gravatar: bool) -> Dict[str, Any]:
+        def get_message(apply_markdown: bool, client_gravatar: bool) -> dict[str, Any]:
             result = self.tornado_call(
                 get_events,
                 user_profile,
@@ -403,12 +492,19 @@ class GetEventsTest(ZulipTestCase):
         message = get_message(apply_markdown=False, client_gravatar=False)
         self.assertEqual(message["display_recipient"], "Denmark")
         self.assertEqual(message["content"], "**hello**")
-        self.assertTrue(message["avatar_url"].startswith("https://secure.gravatar.com"))
+        self.assertEqual(urlsplit(message["avatar_url"]).hostname, "secure.gravatar.com")
 
         message = get_message(apply_markdown=True, client_gravatar=False)
         self.assertEqual(message["display_recipient"], "Denmark")
         self.assertEqual(message["content"], "<p><strong>hello</strong></p>")
         self.assertIn("gravatar.com", message["avatar_url"])
+
+        do_change_user_setting(
+            user_profile,
+            "email_address_visibility",
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
+            acting_user=None,
+        )
 
         message = get_message(apply_markdown=False, client_gravatar=True)
         self.assertEqual(message["display_recipient"], "Denmark")
@@ -420,13 +516,114 @@ class GetEventsTest(ZulipTestCase):
         self.assertEqual(message["content"], "<p><strong>hello</strong></p>")
         self.assertEqual(message["avatar_url"], None)
 
+    def test_bogus_queue_id(self) -> None:
+        user = self.example_user("hamlet")
+
+        with self.assertRaises(BadEventQueueIdError):
+            self.tornado_call(
+                get_events,
+                user,
+                {
+                    "queue_id": "hamster",
+                    "user_client": "website",
+                    "last_event_id": -1,
+                    "dont_block": orjson.dumps(True).decode(),
+                },
+            )
+
+    def test_wrong_user_queue_id(self) -> None:
+        user = self.example_user("hamlet")
+        wrong_user = self.example_user("othello")
+
+        result = self.tornado_call(
+            get_events,
+            user,
+            {
+                "apply_markdown": orjson.dumps(True).decode(),
+                "client_gravatar": orjson.dumps(True).decode(),
+                "event_types": orjson.dumps(["message"]).decode(),
+                "user_client": "website",
+                "dont_block": orjson.dumps(True).decode(),
+            },
+        )
+        self.assert_json_success(result)
+        queue_id = orjson.loads(result.content)["queue_id"]
+
+        with self.assertLogs(level="WARNING") as cm, self.assertRaises(BadEventQueueIdError):
+            self.tornado_call(
+                get_events,
+                wrong_user,
+                {
+                    "queue_id": queue_id,
+                    "user_client": "website",
+                    "last_event_id": -1,
+                    "dont_block": orjson.dumps(True).decode(),
+                },
+            )
+        self.assertIn("not authorized for queue", cm.output[0])
+
+    def test_get_events_custom_profile_fields(self) -> None:
+        user_profile = self.example_user("iago")
+        self.login_user(user_profile)
+        profile_field = CustomProfileField.objects.get(realm=user_profile.realm, name="Pronouns")
+
+        def check_pronouns_type_field_supported(
+            pronouns_field_type_supported: bool, new_name: str
+        ) -> None:
+            clear_client_event_queues_for_testing()
+
+            queue_data = dict(
+                apply_markdown=True,
+                all_public_streams=True,
+                client_type_name="ZulipMobile",
+                event_types=["custom_profile_fields"],
+                last_connection_time=time.time(),
+                queue_timeout=0,
+                realm_id=user_profile.realm.id,
+                user_profile_id=user_profile.id,
+                pronouns_field_type_supported=pronouns_field_type_supported,
+            )
+
+            client = allocate_client_descriptor(queue_data)
+
+            with self.captureOnCommitCallbacks(execute=True):
+                try_update_realm_custom_profile_field(
+                    realm=user_profile.realm, field=profile_field, name=new_name
+                )
+
+            result = self.tornado_call(
+                get_events,
+                user_profile,
+                {
+                    "queue_id": client.event_queue.id,
+                    "user_client": "ZulipAndroid",
+                    "last_event_id": -1,
+                    "dont_block": orjson.dumps(True).decode(),
+                },
+            )
+            events = orjson.loads(result.content)["events"]
+            self.assert_json_success(result)
+            self.assert_length(events, 1)
+
+            [pronouns_field] = (
+                field for field in events[0]["fields"] if field["id"] == profile_field.id
+            )
+            if pronouns_field_type_supported:
+                expected_type = CustomProfileField.PRONOUNS
+            else:
+                expected_type = CustomProfileField.SHORT_TEXT
+            self.assertEqual(pronouns_field["type"], expected_type)
+
+        check_pronouns_type_field_supported(False, "Pronouns field")
+        check_pronouns_type_field_supported(True, "Pronouns")
+
 
 class FetchInitialStateDataTest(ZulipTestCase):
     # Non-admin users don't have access to all bots
     def test_realm_bots_non_admin(self) -> None:
         user_profile = self.example_user("cordelia")
         self.assertFalse(user_profile.is_realm_admin)
-        result = fetch_initial_state_data(user_profile)
+        result = fetch_initial_state_data(user_profile, realm=user_profile.realm)
         self.assert_length(result["realm_bots"], 0)
 
         # additionally the API key for a random bot is not present in the data
@@ -438,65 +635,70 @@ class FetchInitialStateDataTest(ZulipTestCase):
         user_profile = self.example_user("hamlet")
         do_change_user_role(user_profile, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
         self.assertTrue(user_profile.is_realm_admin)
-        result = fetch_initial_state_data(user_profile)
+        result = fetch_initial_state_data(user_profile, realm=user_profile.realm)
         self.assertGreater(len(result["realm_bots"]), 2)
 
     def test_max_message_id_with_no_history(self) -> None:
         user_profile = self.example_user("aaron")
         # Delete all historical messages for this user
         UserMessage.objects.filter(user_profile=user_profile).delete()
-        result = fetch_initial_state_data(user_profile)
+        result = fetch_initial_state_data(user_profile, realm=user_profile.realm)
         self.assertEqual(result["max_message_id"], -1)
 
     def test_delivery_email_presence_for_non_admins(self) -> None:
         user_profile = self.example_user("aaron")
+        hamlet = self.example_user("hamlet")
         self.assertFalse(user_profile.is_realm_admin)
+        hamlet = self.example_user("hamlet")
 
-        do_set_realm_property(
-            user_profile.realm,
+        do_change_user_setting(
+            hamlet,
             "email_address_visibility",
-            Realm.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
             acting_user=None,
         )
-        result = fetch_initial_state_data(user_profile)
+        result = fetch_initial_state_data(user_profile, realm=user_profile.realm)
 
-        for key, value in result["raw_users"].items():
-            self.assertNotIn("delivery_email", value)
+        (hamlet_obj,) = (value for key, value in result["raw_users"].items() if key == hamlet.id)
+        self.assertEqual(hamlet_obj["delivery_email"], hamlet.delivery_email)
 
-        do_set_realm_property(
-            user_profile.realm,
+        do_change_user_setting(
+            hamlet,
             "email_address_visibility",
-            Realm.EMAIL_ADDRESS_VISIBILITY_ADMINS,
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_ADMINS,
             acting_user=None,
         )
-        result = fetch_initial_state_data(user_profile)
+        result = fetch_initial_state_data(user_profile, realm=user_profile.realm)
 
-        for key, value in result["raw_users"].items():
-            self.assertNotIn("delivery_email", value)
+        (hamlet_obj,) = (value for key, value in result["raw_users"].items() if key == hamlet.id)
+        self.assertIsNone(hamlet_obj["delivery_email"])
 
     def test_delivery_email_presence_for_admins(self) -> None:
         user_profile = self.example_user("iago")
+        hamlet = self.example_user("hamlet")
         self.assertTrue(user_profile.is_realm_admin)
+        hamlet = self.example_user("hamlet")
 
-        do_set_realm_property(
-            user_profile.realm,
+        do_change_user_setting(
+            hamlet,
             "email_address_visibility",
-            Realm.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
             acting_user=None,
         )
-        result = fetch_initial_state_data(user_profile)
-        for key, value in result["raw_users"].items():
-            self.assertNotIn("delivery_email", value)
+        result = fetch_initial_state_data(user_profile, realm=user_profile.realm)
 
-        do_set_realm_property(
-            user_profile.realm,
+        (hamlet_obj,) = (value for key, value in result["raw_users"].items() if key == hamlet.id)
+        self.assertEqual(hamlet_obj["delivery_email"], hamlet.delivery_email)
+
+        do_change_user_setting(
+            hamlet,
             "email_address_visibility",
-            Realm.EMAIL_ADDRESS_VISIBILITY_ADMINS,
+            UserProfile.EMAIL_ADDRESS_VISIBILITY_ADMINS,
             acting_user=None,
         )
-        result = fetch_initial_state_data(user_profile)
-        for key, value in result["raw_users"].items():
-            self.assertIn("delivery_email", value)
+        result = fetch_initial_state_data(user_profile, realm=user_profile.realm)
+        (hamlet_obj,) = (value for key, value in result["raw_users"].items() if key == hamlet.id)
+        self.assertIn("delivery_email", hamlet_obj)
 
     def test_user_avatar_url_field_optional(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -515,6 +717,7 @@ class FetchInitialStateDataTest(ZulipTestCase):
 
         result = fetch_initial_state_data(
             user_profile=hamlet,
+            realm=hamlet.realm,
             user_avatar_url_field_optional=True,
         )
 
@@ -529,12 +732,16 @@ class FetchInitialStateDataTest(ZulipTestCase):
         gravatar_users_id = [
             user_dict["user_id"]
             for user_dict in raw_users.values()
-            if "avatar_url" in user_dict and "gravatar.com" in user_dict["avatar_url"]
+            if "avatar_url" in user_dict
+            and urlsplit(user_dict["avatar_url"]).hostname == "secure.gravatar.com"
         ]
+
+        reset_email_visibility_to_everyone_in_zulip_realm()
 
         # Test again with client_gravatar = True
         result = fetch_initial_state_data(
             user_profile=hamlet,
+            realm=hamlet.realm,
             client_gravatar=True,
             user_avatar_url_field_optional=True,
         )
@@ -551,6 +758,7 @@ class FetchInitialStateDataTest(ZulipTestCase):
         hamlet = self.example_user("hamlet")
         result = fetch_initial_state_data(
             user_profile=hamlet,
+            realm=hamlet.realm,
             user_settings_object=True,
         )
         self.assertIn("user_settings", result)
@@ -560,6 +768,7 @@ class FetchInitialStateDataTest(ZulipTestCase):
 
         result = fetch_initial_state_data(
             user_profile=hamlet,
+            realm=hamlet.realm,
             user_settings_object=False,
         )
         self.assertIn("user_settings", result)
@@ -571,6 +780,75 @@ class FetchInitialStateDataTest(ZulipTestCase):
                 # Only legacy settings are included in the top level.
                 self.assertIn(prop, result)
             self.assertIn(prop, result["user_settings"])
+
+    def test_realm_linkifiers_based_on_client_capabilities(self) -> None:
+        user = self.example_user("iago")
+        self.login_user(user)
+
+        data = {
+            "pattern": "#(?P<id>[123])",
+            "url_template": "https://realm.com/my_realm_filter/{id}",
+        }
+        post_result = self.client_post("/json/realm/filters", info=data)
+        self.assert_json_success(post_result)
+
+        result = fetch_initial_state_data(
+            user_profile=user,
+            realm=user.realm,
+            linkifier_url_template=True,
+        )
+        self.assertEqual(result["realm_filters"], [])
+        self.assertEqual(result["realm_linkifiers"][-1]["pattern"], "#(?P<id>[123])")
+        self.assertEqual(
+            result["realm_linkifiers"][-1]["url_template"],
+            "https://realm.com/my_realm_filter/{id}",
+        )
+
+        # The default behavior should be `linkifier_url_template=False`
+        result = fetch_initial_state_data(
+            user_profile=user,
+            realm=user.realm,
+        )
+        self.assertEqual(result["realm_filters"], [])
+        self.assertEqual(result["realm_linkifiers"], [])
+
+    def test_pronouns_field_type_support(self) -> None:
+        hamlet = self.example_user("hamlet")
+        result = fetch_initial_state_data(
+            user_profile=hamlet,
+            realm=hamlet.realm,
+            pronouns_field_type_supported=False,
+        )
+        self.assertIn("custom_profile_fields", result)
+        custom_profile_fields = result["custom_profile_fields"]
+        [pronouns_field] = (field for field in custom_profile_fields if field["name"] == "Pronouns")
+        self.assertEqual(pronouns_field["type"], CustomProfileField.SHORT_TEXT)
+
+        result = fetch_initial_state_data(
+            user_profile=hamlet,
+            realm=hamlet.realm,
+            pronouns_field_type_supported=True,
+        )
+        self.assertIn("custom_profile_fields", result)
+        custom_profile_fields = result["custom_profile_fields"]
+        [pronouns_field] = (field for field in custom_profile_fields if field["name"] == "Pronouns")
+        self.assertEqual(pronouns_field["type"], CustomProfileField.PRONOUNS)
+
+    def test_unreads_case_insensitive_topics(self) -> None:
+        sender = self.example_user("hamlet")
+        self.login_user(sender)
+        self.send_stream_message(sender, "Denmark", "**hello**", topic_name="case DOES not MATTER")
+        self.send_stream_message(sender, "Denmark", "**bye**", topic_name="CASE does NOT matter")
+
+        reader = self.example_user("othello")
+        result = fetch_initial_state_data(
+            user_profile=reader,
+            realm=reader.realm,
+        )
+        post_process_state(reader, result, False, True)
+        self.assert_length(result["unread_msgs"]["streams"], 1)
+        self.assertEqual(result["unread_msgs"]["streams"][0]["topic"], "case DOES not MATTER")
+        self.assert_length(result["unread_msgs"]["streams"][0]["unread_message_ids"], 2)
 
 
 class ClientDescriptorsTest(ZulipTestCase):
@@ -588,6 +866,7 @@ class ClientDescriptorsTest(ZulipTestCase):
             queue_timeout=0,
             realm_id=realm.id,
             user_profile_id=hamlet.id,
+            user_recipient_id=hamlet.recipient_id,
         )
 
         client = allocate_client_descriptor(queue_data)
@@ -642,6 +921,7 @@ class ClientDescriptorsTest(ZulipTestCase):
                 queue_timeout=0,
                 realm_id=realm.id,
                 user_profile_id=hamlet.id,
+                user_recipient_id=hamlet.recipient_id,
             )
 
             client = allocate_client_descriptor(queue_data)
@@ -686,44 +966,55 @@ class ClientDescriptorsTest(ZulipTestCase):
 
         class MockClient:
             def __init__(
-                self, user_profile_id: int, apply_markdown: bool, client_gravatar: bool
+                self,
+                *,
+                user_profile_id: int,
+                user_recipient_id: int | None,
+                apply_markdown: bool,
+                client_gravatar: bool,
             ) -> None:
                 self.user_profile_id = user_profile_id
+                self.user_recipient_id = user_recipient_id
                 self.apply_markdown = apply_markdown
                 self.client_gravatar = client_gravatar
                 self.client_type_name = "whatever"
-                self.events: List[Dict[str, Any]] = []
+                self.events: list[dict[str, Any]] = []
+                self.empty_topic_name = True
 
             def accepts_messages(self) -> bool:
                 return True
 
-            def accepts_event(self, event: Dict[str, Any]) -> bool:
+            def accepts_event(self, event: dict[str, Any]) -> bool:
                 assert event["type"] == "message"
                 return True
 
-            def add_event(self, event: Dict[str, Any]) -> None:
+            def add_event(self, event: dict[str, Any]) -> None:
                 self.events.append(event)
 
         client1 = MockClient(
             user_profile_id=hamlet.id,
+            user_recipient_id=hamlet.recipient_id,
             apply_markdown=True,
             client_gravatar=False,
         )
 
         client2 = MockClient(
             user_profile_id=hamlet.id,
+            user_recipient_id=hamlet.recipient_id,
             apply_markdown=False,
             client_gravatar=False,
         )
 
         client3 = MockClient(
             user_profile_id=hamlet.id,
+            user_recipient_id=hamlet.recipient_id,
             apply_markdown=True,
             client_gravatar=True,
         )
 
         client4 = MockClient(
             user_profile_id=hamlet.id,
+            user_recipient_id=hamlet.recipient_id,
             apply_markdown=False,
             client_gravatar=True,
         )
@@ -755,17 +1046,20 @@ class ClientDescriptorsTest(ZulipTestCase):
                 content="**hello**",
                 rendered_content="<b>hello</b>",
                 sender_id=sender.id,
+                recipient_id=1111,
                 type="stream",
                 client="website",
                 # NOTE: Some of these fields are clutter, but some
                 #       will be useful when we let clients specify
                 #       that they can compute their own gravatar URLs.
+                sender_recipient_id=sender.recipient_id,
                 sender_email=sender.email,
                 sender_delivery_email=sender.delivery_email,
                 sender_realm_id=sender.realm_id,
                 sender_avatar_source=UserProfile.AVATAR_FROM_GRAVATAR,
                 sender_avatar_version=1,
                 sender_is_mirror_dummy=None,
+                sender_email_address_visibility=UserProfile.EMAIL_ADDRESS_VISIBILITY_EVERYONE,
                 recipient_type=None,
                 recipient_type_id=None,
             ),
@@ -774,7 +1068,7 @@ class ClientDescriptorsTest(ZulipTestCase):
         # Setting users to `[]` bypasses code we don't care about
         # for this test--we assume client_info is correct in our mocks,
         # and we are interested in how messages are put on event queue.
-        users: List[Dict[str, Any]] = []
+        users: list[dict[str, Any]] = []
 
         with mock.patch(
             "zerver.tornado.event_queue.get_client_info_for_message_event", return_value=client_info
@@ -799,6 +1093,7 @@ class ClientDescriptorsTest(ZulipTestCase):
                         sender_id=sender.id,
                         sender_email=sender.email,
                         id=999,
+                        recipient_id=1111,
                         content="<b>hello</b>",
                         content_type="text/html",
                         client="website",
@@ -818,6 +1113,7 @@ class ClientDescriptorsTest(ZulipTestCase):
                         sender_id=sender.id,
                         sender_email=sender.email,
                         id=999,
+                        recipient_id=1111,
                         content="**hello**",
                         content_type="text/x-markdown",
                         client="website",
@@ -838,6 +1134,7 @@ class ClientDescriptorsTest(ZulipTestCase):
                         sender_email=sender.email,
                         avatar_url=None,
                         id=999,
+                        recipient_id=1111,
                         content="<b>hello</b>",
                         content_type="text/html",
                         client="website",
@@ -858,6 +1155,7 @@ class ClientDescriptorsTest(ZulipTestCase):
                         sender_email=sender.email,
                         avatar_url=None,
                         id=999,
+                        recipient_id=1111,
                         content="**hello**",
                         content_type="text/x-markdown",
                         client="website",
@@ -868,18 +1166,8 @@ class ClientDescriptorsTest(ZulipTestCase):
         )
 
 
-class RestartEventsTest(ZulipTestCase):
-    def tornado_call(
-        self,
-        view_func: Callable[[HttpRequest, UserProfile], HttpResponse],
-        user_profile: UserProfile,
-        post_data: Dict[str, Any],
-        client_name: Optional[str] = None,
-    ) -> HttpResponse:
-        request = HostRequestMock(post_data, user_profile, client_name=client_name)
-        return view_func(request, user_profile)
-
-    def test_restart(self) -> None:
+class ReloadWebClientsTest(ZulipTestCase):
+    def test_web_reload_clients(self) -> None:
         hamlet = self.example_user("hamlet")
         realm = hamlet.realm
 
@@ -895,104 +1183,27 @@ class RestartEventsTest(ZulipTestCase):
             queue_timeout=0,
             realm_id=realm.id,
             user_profile_id=hamlet.id,
+            user_recipient_id=hamlet.recipient_id,
         )
         client = allocate_client_descriptor(queue_data)
 
-        send_restart_events(immediate=True)
+        send_web_reload_client_events()
+        self.assert_length(client.event_queue.queue, 0)
 
-        # For now we only verify that a virtual event
-        # gets added to the client's event_queue.  We
-        # may decide to write a deeper test in the future
-        # that exercises the finish_handler.
-        virtual_events = client.event_queue.virtual_events
-        self.assert_length(virtual_events, 1)
-        restart_event = virtual_events["restart"]
+        mark_clients_to_reload([client.event_queue.id])
+        send_web_reload_client_events()
+        self.assert_length(client.event_queue.queue, 1)
+        reload_event = client.event_queue.queue[0]
 
-        check_restart_event("restart_event", restart_event)
+        check_web_reload_client_event("web_reload_client_event", reload_event)
         self.assertEqual(
-            restart_event,
+            reload_event,
             dict(
-                type="restart",
-                zulip_version=ZULIP_VERSION,
-                zulip_merge_base=ZULIP_MERGE_BASE,
-                zulip_feature_level=API_FEATURE_LEVEL,
-                server_generation=settings.SERVER_GENERATION,
-                immediate=True,
+                type="web_reload_client",
+                immediate=False,
                 id=0,
             ),
         )
-
-    def test_restart_event_recursive_call_logic(self) -> None:
-        # This is a test for a subtle corner case; see the comments
-        # around RestartEventError for details.
-        hamlet = self.example_user("hamlet")
-        realm = hamlet.realm
-
-        # Setup an empty event queue
-        clear_client_event_queues_for_testing()
-
-        queue_data = dict(
-            all_public_streams=False,
-            apply_markdown=True,
-            client_gravatar=True,
-            client_type_name="website",
-            event_types=None,
-            last_connection_time=time.time(),
-            queue_timeout=0,
-            realm_id=realm.id,
-            user_profile_id=hamlet.id,
-        )
-        client = allocate_client_descriptor(queue_data)
-
-        # Add a restart event to it.
-        send_restart_events(immediate=True)
-
-        # Make a second queue after the restart events were sent.
-        second_client = allocate_client_descriptor(queue_data)
-
-        # Fetch the restart event just sent above, without removing it
-        # from the queue. We will use this as a mock return value in
-        # get_user_events.
-        restart_event = orjson.loads(
-            self.tornado_call(
-                get_events_backend,
-                hamlet,
-                post_data={
-                    "queue_id": client.event_queue.id,
-                    "last_event_id": -1,
-                    "dont_block": "true",
-                    "user_profile_id": hamlet.id,
-                    "secret": settings.SHARED_SECRET,
-                    "client": "internal",
-                },
-                client_name="internal",
-            ).content
-        )["events"]
-
-        # Now the tricky part: We call events_register_backend,
-        # arranging it so that the first `get_user_events` call
-        # returns our restart event (triggering the recursive
-        # behavior), but the second (with a new queue) returns no
-        # events.
-        #
-        # Because get_user_events always returns [] in tests, we need
-        # to mock its return value as well; in an ideal world, we
-        # would only need to mock client / second_client.
-        with mock.patch(
-            "zerver.lib.events.request_event_queue",
-            side_effect=[client.event_queue.id, second_client.event_queue.id],
-        ), mock.patch("zerver.lib.events.get_user_events", side_effect=[restart_event, []]):
-            self.tornado_call(
-                events_register_backend,
-                hamlet,
-                {
-                    "queue_id": client.event_queue.id,
-                    "user_client": "website",
-                    "last_event_id": -1,
-                    "dont_block": orjson.dumps(True).decode(),
-                },
-                client_name="website",
-            )
 
 
 class FetchQueriesTest(ZulipTestCase):
@@ -1001,12 +1212,16 @@ class FetchQueriesTest(ZulipTestCase):
 
         self.login_user(user)
 
-        flush_per_request_caches()
-        with queries_captured() as queries:
-            with mock.patch("zerver.lib.events.always_want") as want_mock:
-                fetch_initial_state_data(user)
+        # Fetch realm like it is done when calling fetch_initial_state_data
+        # in production to match the query counts with the actual query
+        # count in production.
+        realm = get_realm_with_settings(realm_id=user.realm_id)
 
-        self.assert_length(queries, 35)
+        with (
+            self.assert_database_query_count(45),
+            mock.patch("zerver.lib.events.always_want") as want_mock,
+        ):
+            fetch_initial_state_data(user, realm=realm)
 
         expected_counts = dict(
             alert_words=1,
@@ -1014,33 +1229,36 @@ class FetchQueriesTest(ZulipTestCase):
             default_streams=1,
             default_stream_groups=1,
             drafts=1,
-            hotspots=0,
             message=1,
             muted_topics=1,
             muted_users=1,
+            onboarding_steps=1,
             presence=1,
-            realm=0,
+            realm=1,
             realm_bot=1,
             realm_domains=1,
             realm_embedded_bots=0,
             realm_incoming_webhook_bots=0,
             realm_emoji=1,
-            realm_filters=1,
-            realm_linkifiers=1,
+            realm_filters=0,
+            realm_linkifiers=0,
             realm_playgrounds=1,
-            realm_user=3,
-            realm_user_groups=2,
+            realm_user=4,
+            realm_user_groups=3,
             realm_user_settings_defaults=1,
             recent_private_conversations=1,
+            saved_snippets=1,
+            scheduled_messages=1,
             starred_messages=1,
-            stream=2,
+            stream=5,
             stop_words=0,
-            subscription=4,
+            subscription=7,
             update_display_settings=0,
             update_global_notifications=0,
             update_message_flags=5,
             user_settings=0,
             user_status=1,
+            user_topic=1,
             video_calls=0,
             giphy=0,
         )
@@ -1049,20 +1267,24 @@ class FetchQueriesTest(ZulipTestCase):
 
         self.assertEqual(wanted_event_types, set(expected_counts))
 
+        # Fetch realm again here so that the cached foreign key fields
+        # while testing the above case does not reduce the query count
+        # and we test the actual query count for each event type.
+        realm = get_realm_with_settings(realm_id=user.realm_id)
+
         for event_type in sorted(wanted_event_types):
             count = expected_counts[event_type]
-            flush_per_request_caches()
-            with queries_captured() as queries:
+            with self.assert_database_query_count(count):
                 if event_type == "update_message_flags":
                     event_types = ["update_message_flags", "message"]
                 else:
                     event_types = [event_type]
 
-                fetch_initial_state_data(user, event_types=event_types)
-            self.assert_length(queries, count)
+                fetch_initial_state_data(user, realm=realm, event_types=event_types)
 
 
 class TestEventsRegisterAllPublicStreamsDefaults(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("hamlet")
@@ -1106,6 +1328,7 @@ class TestEventsRegisterAllPublicStreamsDefaults(ZulipTestCase):
 
 
 class TestEventsRegisterNarrowDefaults(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.user_profile = self.example_user("hamlet")
@@ -1137,10 +1360,10 @@ class TestEventsRegisterNarrowDefaults(ZulipTestCase):
         self.assertEqual(result, [])
 
 
-class TestGetRawUserDataSystemBotRealm(ZulipTestCase):
-    def test_get_raw_user_data_on_system_bot_realm(self) -> None:
+class TestGetUserAPIDataSystemBotRealm(ZulipTestCase):
+    def test_get_users_api_data_on_system_bot_realm(self) -> None:
         realm = get_realm(settings.SYSTEM_BOT_REALM)
-        result = get_raw_user_data(
+        result = get_users_for_api(
             realm,
             self.example_user("hamlet"),
             client_gravatar=True,
@@ -1154,24 +1377,26 @@ class TestGetRawUserDataSystemBotRealm(ZulipTestCase):
 
 
 class TestUserPresenceUpdatesDisabled(ZulipTestCase):
-    def test_presence_events_diabled_on_larger_realm(self) -> None:
-        # First check that normally the mocked function gets called.
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+    # For this test, we verify do_update_user_presence doesn't send
+    # events for organizations with more than
+    # USER_LIMIT_FOR_SENDING_PRESENCE_UPDATE_EVENTS users, unless
+    # force_send_update is passed.
+    @override_settings(USER_LIMIT_FOR_SENDING_PRESENCE_UPDATE_EVENTS=3)
+    def test_presence_events_disabled_on_larger_realm(self) -> None:
+        with self.capture_send_event_calls(expected_num_events=1):
             do_update_user_presence(
                 self.example_user("cordelia"),
                 get_client("website"),
                 timezone_now(),
-                UserPresence.ACTIVE,
+                UserPresence.LEGACY_STATUS_ACTIVE_INT,
+                force_send_update=True,
             )
 
-        # Now check that if the realm has more than the USER_LIMIT_FOR_SENDING_PRESENCE_UPDATE_EVENTS
-        # amount of active users, send_event doesn't get called.
-        with self.tornado_redirected_to_list(events, expected_num_events=0):
-            with self.settings(USER_LIMIT_FOR_SENDING_PRESENCE_UPDATE_EVENTS=1):
-                do_update_user_presence(
-                    self.example_user("hamlet"),
-                    get_client("website"),
-                    timezone_now(),
-                    UserPresence.ACTIVE,
-                )
+        with self.capture_send_event_calls(expected_num_events=0):
+            do_update_user_presence(
+                self.example_user("hamlet"),
+                get_client("website"),
+                timezone_now(),
+                UserPresence.LEGACY_STATUS_ACTIVE_INT,
+                force_send_update=False,
+            )

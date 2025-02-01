@@ -6,7 +6,6 @@ from django.db import migrations, models
 
 
 class Migration(migrations.Migration):
-
     dependencies = [
         ("zerver", "0330_linkifier_pattern_validator"),
     ]
@@ -25,10 +24,20 @@ class Migration(migrations.Migration):
                     "trigger",
                     models.TextField(
                         choices=[
-                            ("private_message", "Private message"),
+                            ("direct_message", "Direct message"),
                             ("mentioned", "Mention"),
-                            ("wildcard_mentioned", "Wildcard mention"),
+                            ("topic_wildcard_mentioned", "Topic wildcard mention"),
+                            ("stream_wildcard_mentioned", "Stream wildcard mention"),
                             ("stream_email_notify", "Stream notifications enabled"),
+                            ("followed_topic_email_notify", "Followed topic notifications enabled"),
+                            (
+                                "topic_wildcard_mentioned_in_followed_topic",
+                                "Topic wildcard mention in followed topic",
+                            ),
+                            (
+                                "stream_wildcard_mentioned_in_followed_topic",
+                                "Stream wildcard mention in followed topic",
+                            ),
                         ]
                     ),
                 ),

@@ -1,54 +1,51 @@
-from typing import Optional
-
 from django.db import transaction
 from django.http import HttpRequest, HttpResponse
 from django.utils.translation import gettext as _
 
-from zerver.lib.actions import check_add_reaction, do_remove_reaction
-from zerver.lib.emoji import emoji_name_to_emoji_code
-from zerver.lib.exceptions import JsonableError
+from zerver.actions.reactions import check_add_reaction, do_remove_reaction
+from zerver.lib.emoji import get_emoji_data
+from zerver.lib.exceptions import JsonableError, ReactionDoesNotExistError
 from zerver.lib.message import access_message
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
+from zerver.lib.typed_endpoint import typed_endpoint
 from zerver.models import Reaction, UserProfile
 
 
 # transaction.atomic is required since we use FOR UPDATE queries in access_message
-@transaction.atomic
-@has_request_variables
+@transaction.atomic(durable=True)
+@typed_endpoint
 def add_reaction(
     request: HttpRequest,
     user_profile: UserProfile,
     message_id: int,
-    emoji_name: str = REQ(),
-    emoji_code: Optional[str] = REQ(default=None),
-    reaction_type: Optional[str] = REQ(default=None),
+    *,
+    emoji_name: str,
+    emoji_code: str | None = None,
+    reaction_type: str | None = None,
 ) -> HttpResponse:
     check_add_reaction(user_profile, message_id, emoji_name, emoji_code, reaction_type)
 
-    return json_success()
+    return json_success(request)
 
 
 # transaction.atomic is required since we use FOR UPDATE queries in access_message
-@transaction.atomic
-@has_request_variables
+@transaction.atomic(durable=True)
+@typed_endpoint
 def remove_reaction(
     request: HttpRequest,
     user_profile: UserProfile,
     message_id: int,
-    emoji_name: Optional[str] = REQ(default=None),
-    emoji_code: Optional[str] = REQ(default=None),
-    reaction_type: str = REQ(default="unicode_emoji"),
+    *,
+    emoji_name: str | None = None,
+    emoji_code: str | None = None,
+    reaction_type: str = "unicode_emoji",
 ) -> HttpResponse:
-    message, user_message = access_message(user_profile, message_id, lock_message=True)
+    message = access_message(user_profile, message_id, lock_message=True)
 
     if emoji_code is None:
         if emoji_name is None:
             raise JsonableError(
-                _(
-                    "At least one of the following arguments "
-                    "must be present: emoji_name, emoji_code"
-                )
+                _("At least one of the following arguments must be present: emoji_name, emoji_code")
             )
         # A correct full Zulip client implementation should always
         # pass an emoji_code, because of the corner cases discussed in
@@ -57,7 +54,7 @@ def remove_reaction(
         # without needing the mapping between emoji names and codes,
         # we allow instead passing the emoji_name and looking up the
         # corresponding code using the current data.
-        emoji_code = emoji_name_to_emoji_code(message.sender.realm, emoji_name)[0]
+        emoji_code = get_emoji_data(message.realm_id, emoji_name).emoji_code
 
     if not Reaction.objects.filter(
         user_profile=user_profile,
@@ -65,7 +62,7 @@ def remove_reaction(
         emoji_code=emoji_code,
         reaction_type=reaction_type,
     ).exists():
-        raise JsonableError(_("Reaction doesn't exist."))
+        raise ReactionDoesNotExistError
 
     # Unlike adding reactions, while deleting a reaction, we don't
     # check whether the provided (emoji_type, emoji_code) pair is
@@ -77,4 +74,4 @@ def remove_reaction(
     # deactivated by an administrator in the meantime).
     do_remove_reaction(user_profile, message, emoji_code, reaction_type)
 
-    return json_success()
+    return json_success(request)

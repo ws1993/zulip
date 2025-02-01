@@ -1,6 +1,5 @@
 import re
-import urllib
-from typing import Optional
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.http import HttpRequest
@@ -10,7 +9,6 @@ from zerver.models import Realm, UserProfile
 
 
 def get_subdomain(request: HttpRequest) -> str:
-
     # The HTTP spec allows, but doesn't require, a client to omit the
     # port in the `Host` header if it's "the default port for the
     # service requested", i.e. typically either 443 or 80; and
@@ -28,7 +26,7 @@ def get_subdomain(request: HttpRequest) -> str:
 
 
 def get_subdomain_from_hostname(host: str) -> str:
-    m = re.search(fr"\.{settings.EXTERNAL_HOST}(:\d+)?$", host)
+    m = re.search(rf"\.{settings.EXTERNAL_HOST}(:\d+)?$", host)
     if m:
         subdomain = host[: m.start()]
         if subdomain in settings.ROOT_SUBDOMAIN_ALIASES:
@@ -36,7 +34,7 @@ def get_subdomain_from_hostname(host: str) -> str:
         return subdomain
 
     for subdomain, realm_host in settings.REALM_HOSTS.items():
-        if re.search(fr"^{realm_host}(:\d+)?$", host):
+        if re.search(rf"^{realm_host}(:\d+)?$", host):
             return subdomain
 
     return Realm.SUBDOMAIN_FOR_ROOT_DOMAIN
@@ -46,9 +44,7 @@ def is_subdomain_root_or_alias(request: HttpRequest) -> bool:
     return get_subdomain(request) == Realm.SUBDOMAIN_FOR_ROOT_DOMAIN
 
 
-def user_matches_subdomain(realm_subdomain: Optional[str], user_profile: UserProfile) -> bool:
-    if realm_subdomain is None:
-        return True  # nocoverage # This state may no longer be possible.
+def user_matches_subdomain(realm_subdomain: str, user_profile: UserProfile) -> bool:
     return user_profile.realm.subdomain == realm_subdomain
 
 
@@ -58,9 +54,10 @@ def is_root_domain_available() -> bool:
     return not Realm.objects.filter(string_id=Realm.SUBDOMAIN_FOR_ROOT_DOMAIN).exists()
 
 
-def is_static_or_current_realm_url(url: str, realm: Realm) -> bool:
-    split_url = urllib.parse.urlsplit(url)
-    split_static_url = urllib.parse.urlsplit(settings.STATIC_URL)
+def is_static_or_current_realm_url(url: str, realm: Realm | None) -> bool:
+    assert settings.STATIC_URL is not None
+    split_url = urlsplit(url)
+    split_static_url = urlsplit(settings.STATIC_URL)
 
     # The netloc check here is important to correctness if STATIC_URL
     # does not contain a `/`; see the tests for why.
@@ -70,7 +67,11 @@ def is_static_or_current_realm_url(url: str, realm: Realm) -> bool:
     # HTTPS access to this Zulip organization's domain; our existing
     # HTTPS protects this request, and there's no privacy benefit to
     # using camo in front of the Zulip server itself.
-    if split_url.netloc == realm.host and f"{split_url.scheme}://" == settings.EXTERNAL_URI_SCHEME:
+    if (
+        realm is not None
+        and split_url.netloc == realm.host
+        and f"{split_url.scheme}://" == settings.EXTERNAL_URI_SCHEME
+    ):
         return True
 
     # Relative URLs will be processed by the browser the same way as the above.

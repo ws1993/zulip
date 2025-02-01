@@ -3,6 +3,7 @@ class zulip::profile::postgresql {
   include zulip::profile::base
   include zulip::postgresql_base
 
+  $version = $zulip::postgresql_common::version
   $work_mem = $zulip::common::total_memory_mb / 512
   $shared_buffers = $zulip::common::total_memory_mb / 8
   $effective_cache_size = $zulip::common::total_memory_mb * 10 / 32
@@ -13,13 +14,15 @@ class zulip::profile::postgresql {
 
   $listen_addresses = zulipconf('postgresql', 'listen_addresses', undef)
 
-  $replication = zulipconf('postgresql', 'replication', undef)
+  $s3_backups_bucket = zulipsecret('secrets', 's3_backups_bucket', '')
   $replication_primary = zulipconf('postgresql', 'replication_primary', undef)
   $replication_user = zulipconf('postgresql', 'replication_user', undef)
+  $replication_password = zulipsecret('secrets', 'postgresql_replication_password', '')
 
   $ssl_cert_file = zulipconf('postgresql', 'ssl_cert_file', undef)
   $ssl_key_file = zulipconf('postgresql', 'ssl_key_file', undef)
   $ssl_ca_file = zulipconf('postgresql', 'ssl_ca_file', undef)
+  $ssl_mode = zulipconf('postgresql', 'ssl_mode', undef)
 
   file { $zulip::postgresql_base::postgresql_confdirs:
     ensure => directory,
@@ -27,44 +30,54 @@ class zulip::profile::postgresql {
     group  => 'postgres',
   }
 
-  $postgresql_conf_file = "${zulip::postgresql_base::postgresql_confdir}/postgresql.conf"
-  file { $postgresql_conf_file:
-    ensure  => file,
-    require => Package[$zulip::postgresql_base::postgresql],
-    owner   => 'postgres',
-    group   => 'postgres',
-    mode    => '0644',
-    content => template("zulip/postgresql/${zulip::postgresql_common::version}/postgresql.conf.template.erb"),
+  if $version in ['13','14'] {
+    $postgresql_conf_file = "${zulip::postgresql_base::postgresql_confdir}/postgresql.conf"
+    file { $postgresql_conf_file:
+      ensure  => file,
+      require => Package[$zulip::postgresql_base::postgresql],
+      owner   => 'postgres',
+      group   => 'postgres',
+      mode    => '0644',
+      content => template("zulip/postgresql/${version}/postgresql.conf.template.erb"),
+    }
+  } elsif $version in ['15', '16'] {
+    $postgresql_conf_file = "${zulip::postgresql_base::postgresql_confdir}/conf.d/zulip.conf"
+    file { $postgresql_conf_file:
+      ensure  => file,
+      require => Package[$zulip::postgresql_base::postgresql],
+      owner   => 'postgres',
+      group   => 'postgres',
+      mode    => '0644',
+      content => template('zulip/postgresql/zulip.conf.template.erb'),
+    }
+  } else {
+    fail("PostgreSQL ${version} not supported")
   }
 
-  if $replication_primary != '' and $replication_user != '' {
-    if $zulip::postgresql_common::version in ['10', '11'] {
-      # PostgreSQL 11 and below used a recovery.conf file for replication
-      file { "${zulip::postgresql_base::postgresql_confdir}/recovery.conf":
-        ensure  => file,
-        require => Package[$zulip::postgresql_base::postgresql],
-        owner   => 'postgres',
-        group   => 'postgres',
-        mode    => '0644',
-        content => template('zulip/postgresql/recovery.conf.template.erb'),
-      }
-    } else {
-      # PostgreSQL 12 and above use the presence of a standby.signal
-      # file to trigger replication
-      file { "${zulip::postgresql_base::postgresql_confdir}/standby.signal":
-        ensure  => file,
-        require => Package[$zulip::postgresql_base::postgresql],
-        owner   => 'postgres',
-        group   => 'postgres',
-        mode    => '0644',
-        content => '',
-      }
+  if $replication_primary != undef and $replication_user != undef {
+    # The presence of a standby.signal file triggers replication
+    file { "${zulip::postgresql_base::postgresql_datadir}/standby.signal":
+      ensure  => file,
+      require => Package[$zulip::postgresql_base::postgresql],
+      before  => Exec[$zulip::postgresql_base::postgresql_restart],
+      owner   => 'postgres',
+      group   => 'postgres',
+      mode    => '0644',
+      content => '',
     }
   }
 
+  $backups_s3_bucket = zulipsecret('secrets', 's3_backups_bucket', '')
+  $backups_directory = zulipconf('postgresql', 'backups_directory', '')
+  if $backups_s3_bucket != '' or $backups_directory != '' {
+    $require = [File['/usr/local/bin/env-wal-g'], Package[$zulip::postgresql_base::postgresql]]
+  } else {
+    $require = [Package[$zulip::postgresql_base::postgresql]]
+  }
   exec { $zulip::postgresql_base::postgresql_restart:
-    require     => Package[$zulip::postgresql_base::postgresql],
+    require     => $require,
     refreshonly => true,
     subscribe   => [ File[$postgresql_conf_file] ],
+    onlyif      => "test -d ${zulip::postgresql_base::postgresql_datadir}",
   }
 }

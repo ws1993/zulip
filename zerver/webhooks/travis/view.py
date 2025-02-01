@@ -1,12 +1,13 @@
 # Webhooks for external integrations.
-from typing import Dict
+
+from typing import Annotated
 
 from django.http import HttpRequest, HttpResponse
+from pydantic import BaseModel, Json
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import check_bool, check_dict, check_string
+from zerver.lib.typed_endpoint import ApiParamConfig, typed_endpoint
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -24,27 +25,24 @@ Build status: {} {}
 Details: [changes]({}), [build log]({})"""
 
 
+class TravisPayload(BaseModel):
+    author_name: str
+    status_message: str
+    compare_url: str
+    build_url: str
+    type: str
+
+
 @webhook_view("Travis", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_travis_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    ignore_pull_requests: bool = REQ(json_validator=check_bool, default=True),
-    message: Dict[str, object] = REQ(
-        "payload",
-        json_validator=check_dict(
-            [
-                ("author_name", check_string),
-                ("status_message", check_string),
-                ("compare_url", check_string),
-            ]
-        ),
-    ),
+    *,
+    message: Annotated[Json[TravisPayload], ApiParamConfig("payload")],
 ) -> HttpResponse:
-    event = str(message["type"])
-    message_status = message["status_message"]
-    if ignore_pull_requests and message["type"] == "pull_request":
-        return json_success()
+    event = message.type
+    message_status = message.status_message
 
     if message_status in GOOD_STATUSES:
         emoji = ":thumbs_up:"
@@ -56,13 +54,13 @@ def api_travis_webhook(
         emoji = f"(No emoji specified for status '{message_status}'.)"
 
     body = MESSAGE_TEMPLATE.format(
-        message["author_name"],
+        message.author_name,
         message_status,
         emoji,
-        message["compare_url"],
-        message["build_url"],
+        message.compare_url,
+        message.build_url,
     )
-    topic = "builds"
+    topic_name = "builds"
 
-    check_send_webhook_message(request, user_profile, topic, body, event)
-    return json_success()
+    check_send_webhook_message(request, user_profile, topic_name, body, event)
+    return json_success(request)

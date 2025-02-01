@@ -15,7 +15,7 @@ to receive updates to the Zulip data. The simplest example is a new
 message being sent by one client; other clients must be notified in
 order to display the message. But a complete application like Zulip
 has dozens of different types of data that need to be synced to other
-clients, whether it be new streams, changes in a user's name or
+clients, whether it be new channels, changes in a user's name or
 avatar, settings changes, etc. In Zulip, we call these updates that
 need to be sent to other clients **events**.
 
@@ -51,31 +51,36 @@ problems in a scalable, correct, and predictable way.
 ## Generation system
 
 Zulip's generation system is built around a Python function,
-`send_event(realm, event, users)`. It accepts the realm (used for
+`send_event_on_commit(realm, event, users)`. It accepts the realm (used for
 sharding), the event data structure (just a Python dictionary with
 some keys and value; `type` is always one of the keys but the rest
 depends on the specific event) and a list of user IDs for the users
 whose clients should receive the event. In special cases such as
 message delivery, the list of users will instead be a list of dicts
 mapping user IDs to user-specific data like whether that user was
-mentioned in that message. The data passed to `send_event` are simply
-marshalled as JSON and placed in the `notify_tornado` RabbitMQ queue
-to be consumed by the delivery system.
+mentioned in that message. The data passed to `send_event_on_commit` are
+simply marshalled as JSON and placed in the `notify_tornado` RabbitMQ
+queue to be consumed by the delivery system.
 
 Usually, this list of users is one of 3 things:
 
-- A single user (e.g. for user-level settings changes).
-- Everyone in the realm (e.g. for organization-level settings changes,
+- A single user (e.g., for user-level settings changes).
+- Everyone in the realm (e.g., for organization-level settings changes,
   like new realm emoji).
 - Everyone who would receive a given message (for messages, emoji
-  reactions, message editing, etc.); i.e. the subscribers to a stream
-  or the people on a private message thread.
+  reactions, message editing, etc.); i.e. the subscribers to a channel
+  or the people on a direct message thread.
 
-It is the responsibility of the caller of `send_event` to choose the
-list of user IDs correctly. There can be security problems if e.g. an
-event containing private message content is sent to the entire
-organization. However, if an event isn't sent to enough clients,
+It is the responsibility of the caller of `send_event_on_commit` to choose
+the list of user IDs correctly. There can be security problems if, for
+example, an event containing direct message content is sent to the
+entire organization. However, if an event isn't sent to enough clients,
 there will likely be user-visible real-time sync bugs.
+
+As indicated in the name, `send_event_on_commit` is intended to be
+called inside the database transaction that is changing the state
+itself; this design ensures that the event is only sent if the
+transaction successfully commits.
 
 Most of the hard work in event generation is about defining consistent
 event dictionaries that are clear, readable, will be useful to the
@@ -162,7 +167,7 @@ its data, clients would recover, just as if they had lost Internet
 access briefly (there is some DoS risk to manage, though).
 
 Note that the garbage-collection system has hooks that are important
-for the implementation of [notifications](../subsystems/notifications.md).
+for the implementation of [notifications](notifications.md).
 
 (The event queue server is designed to save any event queues to disk
 and reload them when the server is restarted, and catches exceptions
@@ -175,8 +180,8 @@ anyway).
 When a client starts up, it usually wants to get 2 things from the
 server:
 
-- The "current state" of various pieces of data, e.g. the current
-  settings, set of users in the organization (for typeahead), stream,
+- The "current state" of various pieces of data, e.g., the current
+  settings, set of users in the organization (for typeahead), channel,
   messages, etc. (aka the "initial state").
 - A subscription to receive updates to those data when they are
   changed by a client (aka an event queue).
@@ -212,7 +217,7 @@ request; the logic is in `zerver/views/events_register.py` and
   that had been added to the Tornado event queue since it
   was created.
 - Finally, Django "applies" the events (see the `apply_events`
-  function) to the initial state that it fetched. E.g. for a name
+  function) to the initial state that it fetched. E.g., for a name
   change event, it finds the user data in the `realm_user` data
   structure, and updates it to have the new name.
 
@@ -259,14 +264,14 @@ The `verify_action` function simulates the possible race condition in
 order to verify that the `apply_events` logic works correctly in the
 context of some action function. To use our concrete example above,
 we are seeing that applying the events from the
-`do_remove_default_stream` action inside of `apply_events` to a stale
+`do_add_default_stream` action inside of `apply_events` to a stale
 copy of your state results in the same state dictionary as doing the
 action and then fetching a fresh copy of the state.
 
 In particular, `verify_action` does the following:
 
 - Call `fetch_initial_state_data` to get the current state.
-- Call the action function (e.g. `do_add_default_stream`).
+- Call the action function (e.g., `do_add_default_stream`).
 - Capture the events generated by the action function.
 - Check the events generated are documented in the [OpenAPI
   schema](../documentation/api.md) defined in
@@ -304,7 +309,7 @@ There are some notable optional parameters for `verify_action`:
   doesn't actually require state changes for some reason; otherwise,
   `verify_action` will complain that your test doesn't really
   exercise any `apply_events` logic. Typing notifications (which
-  are ephemereal) are a common place where we use this.
+  are ephemeral) are a common place where we use this.
 
 - `num_events` will tell `verify_action` how many events the
   `hamlet` user will receive after the action (the default is 1).
@@ -376,9 +381,9 @@ node test fixtures and our OpenAPI documentation.
 #### Node testing
 
 Once you've completed backend testing, be sure to add an example event
-in `frontend_tests/node_tests/lib/events.js`, a test of the
+in `web/tests/lib/events.cjs`, a test of the
 `server_events_dispatch.js` code for that event in
-`frontend_tests/node_tests/dispatch.js`, and verify your example
+`web/tests/dispatch.test.cjs`, and verify your example
 against the two versions of the schema that you declared above using
 `tools/check-schemas`.
 
@@ -388,9 +393,9 @@ The final detail we need to ensure that `apply_events` always works
 correctly is to make sure that we have relevant tests for
 every event type that can be generated by Zulip. This can be tested
 manually using `test-backend --coverage BaseAction` and then
-checking that all the calls to `send_event` are covered. Someday
-we'll add automation that verifies this directly by inspecting the
-coverage data.
+checking that all the calls to `send_event_on_commit` are covered.
+Someday we'll add automation that verifies this directly by inspecting
+the coverage data.
 
 #### page_params
 
@@ -407,7 +412,7 @@ correctly, clients are responsible for discarding events related to
 messages that the client has not yet fetched.
 
 Additionally, see
-[the main documentation on sending messages](../subsystems/sending-messages.md).
+[the main documentation on sending messages](sending-messages.md).
 
 ## Schema changes
 
@@ -421,7 +426,7 @@ to make sure we handle backwards-compatibility properly.
   `GET /events` API documentation. It's also a good idea to and open
   issues with the mobile and terminal projects to notify them.
 - If we're making changes that could confuse existing client app logic
-  that parses events (E.g. changing the type/meaning of an existing
+  that parses events (e.g., changing the type/meaning of an existing
   field, or removing a field), we need to be very careful, since Zulip
   supports old clients connecting to a modern server. See our
   [release lifecycle](../overview/release-lifecycle.md) documentation
@@ -441,14 +446,14 @@ to make sure we handle backwards-compatibility properly.
   format, or Tornado may crash when upgrading past the relevant
   commit. We attempt to contain that sort of logic in the `from_dict`
   function (which is used for changing event queue formats) and
-  `client_capabilities` conditionals (E.g. in
+  `client_capabilities` conditionals (e.g., in
   `process_deletion_event`). Compatibility code not related to a
   `client_capabilities` entry should be marked with a
   `# TODO/compatibility: ...` comment noting when it can be safely deleted;
   we grep for these comments entries during major releases.
 - Schema changes are a sensitive operation, and like with database
   schema changes, it's critical to do thoughtful manual testing.
-  E.g. run the mobile app against your test server and verify it
+  E.g., run the mobile app against your test server and verify it
   handles the new event properly, or arrange for your new Tornado code
   to actually process a pre-upgrade event and verify via the browser
   console what came out.

@@ -1,6 +1,6 @@
 import filecmp
 import os
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Optional
 from unittest.mock import MagicMock, patch
 
 import orjson
@@ -8,31 +8,32 @@ from django.core import mail
 from django.test import override_settings
 from zulip_bots.custom_exceptions import ConfigValidationError
 
-from zerver.lib.actions import (
-    do_change_stream_invite_only,
-    do_deactivate_user,
-    do_set_realm_property,
+from zerver.actions.bots import do_change_bot_owner, do_change_default_sending_stream
+from zerver.actions.realm_settings import (
+    do_change_realm_permission_group_setting,
+    do_set_realm_user_default_setting,
 )
+from zerver.actions.streams import do_change_stream_permission
+from zerver.actions.user_groups import check_add_user_group
+from zerver.actions.users import do_change_can_create_users, do_change_user_role, do_deactivate_user
 from zerver.lib.bot_config import ConfigError, get_bot_config
 from zerver.lib.bot_lib import get_bot_handler
 from zerver.lib.integrations import EMBEDDED_BOTS, WebhookIntegration
 from zerver.lib.test_classes import UploadSerializeMixin, ZulipTestCase
-from zerver.lib.test_helpers import avatar_disk_path, get_test_image_file, queries_captured
-from zerver.models import (
-    Realm,
-    Service,
-    UserProfile,
-    get_bot_services,
-    get_realm,
-    get_stream,
-    get_user,
-    is_cross_realm_bot_email,
-)
+from zerver.lib.test_helpers import avatar_disk_path, get_test_image_file
+from zerver.lib.utils import assert_is_not_none
+from zerver.lib.webhooks.common import WebhookConfigOption
+from zerver.models import RealmUserDefault, Service, Subscription, UserProfile
+from zerver.models.bots import get_bot_services
+from zerver.models.groups import NamedUserGroup, SystemGroups
+from zerver.models.realms import get_realm
+from zerver.models.streams import get_stream
+from zerver.models.users import bot_owner_user_ids, get_user, is_cross_realm_bot_email
 
 
 # A test validator
-def _check_string(var_name: str, val: object) -> Optional[str]:
-    if str(val).startswith("_"):
+def _check_string(var_name: str, val: str) -> str | None:
+    if val.startswith("_"):
         return f'{var_name} starts with a "_" and is hence invalid.'
     return None
 
@@ -42,7 +43,11 @@ stripe_sample_config_options = [
         "stripe",
         ["financial"],
         display_name="Stripe",
-        config_options=[("Stripe API key", "stripe_api_key", _check_string)],
+        config_options=[
+            WebhookConfigOption(
+                name="stripe_api_key", description="Stripe API key", validator=_check_string
+            )
+        ],
     ),
 ]
 
@@ -55,10 +60,10 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
 
     def assert_num_bots_equal(self, count: int) -> None:
         result = self.client_get("/json/bots")
-        self.assert_json_success(result)
-        self.assert_length(result.json()["bots"], count)
+        response_dict = self.assert_json_success(result)
+        self.assert_length(response_dict["bots"], count)
 
-    def create_bot(self, **extras: Any) -> Dict[str, Any]:
+    def create_bot(self, **extras: Any) -> dict[str, Any]:
         bot_info = {
             "full_name": "The Bot of Hamlet",
             "short_name": "hambot",
@@ -66,8 +71,8 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         bot_info.update(extras)
         result = self.client_post("/json/bots", bot_info)
-        self.assert_json_success(result)
-        return result.json()
+        response_dict = self.assert_json_success(result)
+        return response_dict
 
     def test_bot_domain(self) -> None:
         self.login("hamlet")
@@ -75,7 +80,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.assertTrue(UserProfile.objects.filter(email="hambot-bot@zulip.testserver").exists())
         # The other cases are hard to test directly, since we don't allow creating bots from
         # the wrong subdomain, and because 'testserver.example.com' is not a valid domain for the bot's email.
-        # So we just test the Raelm.get_bot_domain function.
+        # So we just test the Realm.get_bot_domain function.
         realm = get_realm("zulip")
         self.assertEqual(realm.get_bot_domain(), "zulip.testserver")
 
@@ -91,7 +96,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         # Invalid username
         bot_info = dict(
             full_name="My bot name",
-            short_name="@",
+            short_name="my\nbot",
         )
         result = self.client_post("/json/bots", bot_info)
         self.assert_json_error(result, "Bad name or username")
@@ -119,7 +124,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
 
         error_message = (
             "Can't create bots until FAKE_EMAIL_DOMAIN is correctly configured.\n"
-            + "Please contact your server administrator."
+            "Please contact your server administrator."
         )
         self.assert_json_error(result, error_message)
         self.assert_num_bots_equal(0)
@@ -154,19 +159,16 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
 
         self.assert_num_bots_equal(num_bots)
 
-        with queries_captured() as queries:
+        with self.assert_database_query_count(4):
             users_result = self.client_get("/json/users")
 
         self.assert_json_success(users_result)
-
-        self.assert_length(queries, 3)
 
     def test_add_bot(self) -> None:
         hamlet = self.example_user("hamlet")
         self.login("hamlet")
         self.assert_num_bots_equal(0)
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=2):
+        with self.capture_send_event_calls(expected_num_events=4) as events:
             result = self.create_bot()
         self.assert_num_bots_equal(1)
 
@@ -200,9 +202,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
 
         users_result = self.client_get("/json/users")
         members = orjson.loads(users_result.content)["members"]
-        [bot] = [m for m in members if m["email"] == "hambot-bot@zulip.testserver"]
-        self.assertEqual(bot["bot_owner_id"], self.example_user("hamlet").id)
-        self.assertEqual(bot["user_id"], self.get_bot_user(email).id)
+        [bot_dict] = [m for m in members if m["email"] == "hambot-bot@zulip.testserver"]
+        self.assertEqual(bot_dict["bot_owner_id"], self.example_user("hamlet").id)
+        self.assertEqual(bot_dict["user_id"], self.get_bot_user(email).id)
 
     @override_settings(FAKE_EMAIL_DOMAIN="fakedomain.com", REALM_HOSTS={"zulip": "127.0.0.1"})
     def test_add_bot_with_fake_email_domain(self) -> None:
@@ -319,20 +321,20 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
 
     def test_add_bot_email_address_visibility(self) -> None:
         # Test that we don't mangle the email field with
-        # email_address_visiblity limited to admins
+        # email_address_visibility limited to admins
         user = self.example_user("hamlet")
-        do_set_realm_property(
-            user.realm,
+        realm_user_default = RealmUserDefault.objects.get(realm=user.realm)
+        do_set_realm_user_default_setting(
+            realm_user_default,
             "email_address_visibility",
-            Realm.EMAIL_ADDRESS_VISIBILITY_ADMINS,
+            RealmUserDefault.EMAIL_ADDRESS_VISIBILITY_ADMINS,
             acting_user=None,
         )
         user.refresh_from_db()
 
         self.login_user(user)
         self.assert_num_bots_equal(0)
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=2):
+        with self.capture_send_event_calls(expected_num_events=4) as events:
             result = self.create_bot()
         self.assert_num_bots_equal(1)
 
@@ -364,9 +366,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
 
         users_result = self.client_get("/json/users")
         members = orjson.loads(users_result.content)["members"]
-        [bot] = [m for m in members if m["email"] == "hambot-bot@zulip.testserver"]
-        self.assertEqual(bot["bot_owner_id"], user.id)
-        self.assertEqual(bot["user_id"], self.get_bot_user(email).id)
+        [bot_dict] = [m for m in members if m["email"] == "hambot-bot@zulip.testserver"]
+        self.assertEqual(bot_dict["bot_owner_id"], user.id)
+        self.assertEqual(bot_dict["user_id"], self.get_bot_user(email).id)
 
     def test_bot_add_subscription(self) -> None:
         """
@@ -385,9 +387,8 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         request_data = {
             "principals": '["' + iago.email + '"]',
         }
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=3):
-            result = self.common_subscribe_to_streams(hamlet, ["Rome"], request_data)
+        with self.capture_send_event_calls(expected_num_events=3) as events:
+            result = self.subscribe_via_post(hamlet, ["Rome"], request_data)
             self.assert_json_success(result)
 
         msg_event = [e for e in events if e["event"]["type"] == "message"]
@@ -402,9 +403,8 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         bot_request_data = {
             "principals": '["hambot-bot@zulip.testserver"]',
         }
-        events_bot: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events_bot, expected_num_events=2):
-            result = self.common_subscribe_to_streams(hamlet, ["Rome"], bot_request_data)
+        with self.capture_send_event_calls(expected_num_events=2) as events_bot:
+            result = self.subscribe_via_post(hamlet, ["Rome"], bot_request_data)
             self.assert_json_success(result)
 
         # No notification message event or invitation email is sent because of bot.
@@ -420,11 +420,16 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         user_profile = self.example_user("hamlet")
         stream = get_stream("Denmark", user_profile.realm)
         self.subscribe(user_profile, stream.name)
-        do_change_stream_invite_only(stream, True)
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=user_profile,
+        )
 
         self.assert_num_bots_equal(0)
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=2):
+        with self.capture_send_event_calls(expected_num_events=4) as events:
             result = self.create_bot(default_sending_stream="Denmark")
         self.assert_num_bots_equal(1)
         self.assertEqual(result["default_sending_stream"], "Denmark")
@@ -464,7 +469,13 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         realm = self.example_user("hamlet").realm
         stream = get_stream("Denmark", realm)
         self.unsubscribe(self.example_user("hamlet"), "Denmark")
-        do_change_stream_invite_only(stream, True)
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=self.example_user("hamlet"),
+        )
 
         bot_info = {
             "full_name": "The Bot of Hamlet",
@@ -472,7 +483,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
             "default_sending_stream": "Denmark",
         }
         result = self.client_post("/json/bots", bot_info)
-        self.assert_json_error(result, "Invalid stream name 'Denmark'")
+        self.assert_json_error(result, "Invalid channel name 'Denmark'")
 
     def test_add_bot_with_default_events_register_stream(self) -> None:
         bot_email = "hambot-bot@zulip.testserver"
@@ -492,11 +503,16 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.login("hamlet")
         user_profile = self.example_user("hamlet")
         stream = self.subscribe(user_profile, "Denmark")
-        do_change_stream_invite_only(stream, True)
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=user_profile,
+        )
 
         self.assert_num_bots_equal(0)
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=2):
+        with self.capture_send_event_calls(expected_num_events=4) as events:
             result = self.create_bot(default_events_register_stream="Denmark")
         self.assert_num_bots_equal(1)
         self.assertEqual(result["default_events_register_stream"], "Denmark")
@@ -536,7 +552,13 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         realm = self.example_user("hamlet").realm
         stream = get_stream("Denmark", realm)
         self.unsubscribe(self.example_user("hamlet"), "Denmark")
-        do_change_stream_invite_only(stream, True)
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=self.example_user("hamlet"),
+        )
 
         self.assert_num_bots_equal(0)
         bot_info = {
@@ -545,7 +567,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
             "default_events_register_stream": "Denmark",
         }
         result = self.client_post("/json/bots", bot_info)
-        self.assert_json_error(result, "Invalid stream name 'Denmark'")
+        self.assert_json_error(result, "Invalid channel name 'Denmark'")
 
     def test_add_bot_with_default_all_public_streams(self) -> None:
         self.login("hamlet")
@@ -569,16 +591,41 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.deactivate_bot()
         self.assert_num_bots_equal(0)
 
-    def test_deactivate_bogus_bot(self) -> None:
-        """Deleting a bogus bot will succeed silently."""
+    def test_deactivate_bot_invalid_id(self) -> None:
         self.login("hamlet")
         self.assert_num_bots_equal(0)
         self.create_bot()
         self.assert_num_bots_equal(1)
-        invalid_user_id = 1000
-        result = self.client_delete(f"/json/bots/{invalid_user_id}")
+        invalid_bot_id = 1000
+        result = self.client_delete(f"/json/bots/{invalid_bot_id}")
         self.assert_json_error(result, "No such bot")
         self.assert_num_bots_equal(1)
+
+    def test_deactivate_bot_with_no_owners(self) -> None:
+        iago = self.example_user("iago")
+        self.login("iago")
+        self.create_bot()
+        self.assert_num_bots_equal(1)
+
+        # Set up the bot to be a private bot, as otherwise realm admins
+        # are used as default owners in the absence of .bot_owner_id.
+        stream = get_stream("Denmark", get_realm("zulip"))
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=iago,
+        )
+
+        new_bot = assert_is_not_none(UserProfile.objects.last())
+        do_change_default_sending_stream(new_bot, stream, acting_user=iago)
+        new_bot.bot_owner_id = None
+        new_bot.save()
+
+        result = self.client_delete(f"/json/bots/{new_bot.id}")
+        self.assert_json_success(result)
+        self.assert_num_bots_equal(0)
 
     def test_deactivate_bot_with_owner_deactivation(self) -> None:
         user = self.example_user("hamlet")
@@ -623,7 +670,8 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         result = self.client_post("/json/bots", bot_info, subdomain="zephyr")
         self.assert_json_success(result)
         result = self.client_get("/json/bots", subdomain="zephyr")
-        bot_email = result.json()["bots"][0]["username"]
+        response_dict = self.assert_json_success(result)
+        bot_email = response_dict["bots"][0]["username"]
         bot = get_user(bot_email, user.realm)
         self.login("iago")
         result = self.client_delete(f"/json/bots/{bot.id}")
@@ -657,6 +705,36 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.assert_json_error(result, "No such user")
         self.assert_num_bots_equal(1)
 
+    def test_activate_bot_with_duplicate_name(self) -> None:
+        self.login("iago")
+        # Create a bot and then deactivate it
+        original_name = "Hamlet"
+        bot_info = {
+            "full_name": original_name,
+            "short_name": "hambot",
+        }
+        result = self.client_post("/json/bots", bot_info)
+        self.assert_json_success(result)
+        bot_email = "hambot-bot@zulip.testserver"
+        bot = self.get_bot_user(bot_email)
+        do_deactivate_user(bot, False, acting_user=None)
+        self.assertFalse(
+            UserProfile.objects.filter(is_bot=True, id=bot.id, is_active=True).exists()
+        )
+
+        # Create another bot with the same name
+        bot_info2 = {
+            "full_name": original_name,
+            "short_name": "hambot2",
+        }
+        result = self.client_post("/json/bots", bot_info2)
+        self.assert_json_success(result)
+        result = self.client_post(f"/json/users/{bot.id}/reactivate")
+        self.assert_json_error(
+            result,
+            'There is already an active bot named "Hamlet" in this organization. To reactivate this bot, you must rename or deactivate the other one first.',
+        )
+
     def test_bot_permissions(self) -> None:
         self.login("hamlet")
         self.assert_num_bots_equal(0)
@@ -676,10 +754,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
         self.assert_json_error(result, "Insufficient permission")
 
-    def get_bot(self) -> Dict[str, Any]:
+    def get_bot(self) -> dict[str, Any]:
         result = self.client_get("/json/bots")
-        bots = result.json()["bots"]
-        return bots[0]
+        return self.assert_json_success(result)["bots"][0]
 
     def test_update_api_key(self) -> None:
         self.login("hamlet")
@@ -688,8 +765,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         old_api_key = bot["api_key"]
         email = "hambot-bot@zulip.testserver"
         result = self.client_post(f"/json/bots/{self.get_bot_user(email).id}/api_key/regenerate")
-        self.assert_json_success(result)
-        new_api_key = result.json()["api_key"]
+        new_api_key = self.assert_json_success(result)["api_key"]
         self.assertNotEqual(old_api_key, new_api_key)
         bot = self.get_bot()
         self.assertEqual(new_api_key, bot["api_key"])
@@ -737,101 +813,291 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.assert_num_bots_equal(0)
         self.assert_json_error(result, "Invalid bot type")
 
-    def test_no_generic_bots_allowed_for_non_admins(self) -> None:
+    def check_user_can_create_bot(
+        self, user: str, bot_name: str, bot_type: int, error_msg: Optional["str"] = None
+    ) -> None:
         bot_info = {
-            "full_name": "The Bot of Hamlet",
-            "short_name": "hambot",
-            "bot_type": 1,
+            "full_name": bot_name,
+            "short_name": bot_name,
+            "bot_type": bot_type,
         }
-        bot_email = "hambot-bot@zulip.testserver"
+        bot_email = f"{bot_name}-bot@zulip.testserver"
         bot_realm = get_realm("zulip")
-        bot_realm.bot_creation_policy = Realm.BOT_CREATION_LIMIT_GENERIC_BOTS
-        bot_realm.save(update_fields=["bot_creation_policy"])
-
-        # A regular user cannot create a generic bot
-        self.login("hamlet")
-        self.assert_num_bots_equal(0)
+        self.login(user)
         result = self.client_post("/json/bots", bot_info)
-        self.assert_num_bots_equal(0)
-        self.assert_json_error(result, "Must be an organization administrator")
+        if error_msg is not None:
+            self.assert_json_error(result, error_msg)
+        else:
+            self.assert_json_success(result)
+            profile = get_user(bot_email, bot_realm)
+            self.assertEqual(profile.bot_type, bot_type)
+            self.assertEqual(profile.bot_owner, self.example_user(user))
 
-        # But can create an incoming webhook
-        self.assert_num_bots_equal(0)
-        self.create_bot(bot_type=UserProfile.INCOMING_WEBHOOK_BOT)
-        self.assert_num_bots_equal(1)
-        profile = get_user(bot_email, bot_realm)
-        self.assertEqual(profile.bot_type, UserProfile.INCOMING_WEBHOOK_BOT)
+    def test_can_create_write_only_bots_group(self) -> None:
+        """
+        The `can_create_write_only_bots_group` realm setting works properly.
+        """
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
 
-    def test_no_generic_bot_reactivation_allowed_for_non_admins(self) -> None:
+        administrators_system_group = NamedUserGroup.objects.get(
+            name=SystemGroups.ADMINISTRATORS, realm=realm, is_system_group=True
+        )
+        moderators_system_group = NamedUserGroup.objects.get(
+            name=SystemGroups.MODERATORS, realm=realm, is_system_group=True
+        )
+        members_system_group = NamedUserGroup.objects.get(
+            name=SystemGroups.MEMBERS, realm=realm, is_system_group=True
+        )
+
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_bots_group",
+            administrators_system_group,
+            acting_user=None,
+        )
+
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_write_only_bots_group",
+            members_system_group,
+            acting_user=None,
+        )
+
+        self.check_user_can_create_bot("hamlet", "testbot-1", UserProfile.INCOMING_WEBHOOK_BOT)
+        self.check_user_can_create_bot(
+            "polonius", "testbot-2", UserProfile.INCOMING_WEBHOOK_BOT, "Not allowed for guest users"
+        )
+
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_write_only_bots_group",
+            moderators_system_group,
+            acting_user=None,
+        )
+        self.check_user_can_create_bot("shiva", "testbot-3", UserProfile.INCOMING_WEBHOOK_BOT)
+        self.check_user_can_create_bot("iago", "testbot-4", UserProfile.INCOMING_WEBHOOK_BOT)
+        self.check_user_can_create_bot(
+            "hamlet", "testbot-5", UserProfile.INCOMING_WEBHOOK_BOT, "Insufficient permission"
+        )
+
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_write_only_bots_group",
+            administrators_system_group,
+            acting_user=None,
+        )
+        self.check_user_can_create_bot("iago", "testbot-5", UserProfile.INCOMING_WEBHOOK_BOT)
+        self.check_user_can_create_bot(
+            "shiva", "testbot-6", UserProfile.INCOMING_WEBHOOK_BOT, "Insufficient permission"
+        )
+
+        # Test for checking setting for non-system user group.
+        user_group = check_add_user_group(
+            realm, "new_group", [hamlet, cordelia], acting_user=hamlet
+        )
+        do_change_realm_permission_group_setting(
+            realm, "can_create_write_only_bots_group", user_group, acting_user=None
+        )
+
+        # Hamlet and Cordelia are in the allowed user group, so can create bots.
+        self.check_user_can_create_bot("hamlet", "testbot-6", UserProfile.INCOMING_WEBHOOK_BOT)
+        self.check_user_can_create_bot("cordelia", "testbot-7", UserProfile.INCOMING_WEBHOOK_BOT)
+
+        # Shiva is not in the allowed user group, so cannot create bots.
+        self.check_user_can_create_bot(
+            "shiva", "testbot-8", UserProfile.INCOMING_WEBHOOK_BOT, "Insufficient permission"
+        )
+        # Iago is not in `can_create_write_only_bots_group` but is in `can_create_bots_group`,
+        # so can create any bot.
+        self.check_user_can_create_bot("iago", "testbot-8", UserProfile.INCOMING_WEBHOOK_BOT)
+
+        # Test for checking the setting for anonymous user group.
+        anonymous_user_group = self.create_or_update_anonymous_group_for_setting(
+            [hamlet],
+            [administrators_system_group],
+        )
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_write_only_bots_group",
+            anonymous_user_group,
+            acting_user=None,
+        )
+
+        # Hamlet is the direct member of the anonymous user group, so can create bots.
+        self.check_user_can_create_bot("hamlet", "testbot-9", UserProfile.INCOMING_WEBHOOK_BOT)
+        # Iago is in the `administrators_system_group` subgroup, so can create bots.
+        self.check_user_can_create_bot("iago", "testbot-10", UserProfile.INCOMING_WEBHOOK_BOT)
+        # Shiva is not in the anonymous user group, so cannot create bots.
+        self.check_user_can_create_bot(
+            "shiva", "testbot-11", UserProfile.INCOMING_WEBHOOK_BOT, "Insufficient permission"
+        )
+
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_write_only_bots_group",
+            moderators_system_group,
+            acting_user=None,
+        )
+
+        # Iago is in `can_create_bots_group`, so can create any bot.
+        self.check_user_can_create_bot("iago", "testbot-11", UserProfile.DEFAULT_BOT)
+        self.check_user_can_create_bot("iago", "testbot-12", UserProfile.INCOMING_WEBHOOK_BOT)
+        # Shiva is only in `can_create_write_only_bots_group`, so can only create
+        # "INCOMING_WEBHOOK_BOT".
+        self.check_user_can_create_bot(
+            "shiva", "testbot-13", UserProfile.DEFAULT_BOT, "Insufficient permission"
+        )
+        self.check_user_can_create_bot("shiva", "testbot-13", UserProfile.INCOMING_WEBHOOK_BOT)
+        # Hamlet is in neither of the group, so cannot create any bot.
+        self.check_user_can_create_bot(
+            "hamlet", "testbot-14", UserProfile.DEFAULT_BOT, "Insufficient permission"
+        )
+        self.check_user_can_create_bot(
+            "hamlet", "testbot-14", UserProfile.INCOMING_WEBHOOK_BOT, "Insufficient permission"
+        )
+
+    def test_can_create_bots_group(self) -> None:
+        """
+        The `can_create_bots_group` realm setting works properly.
+        """
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        cordelia = self.example_user("cordelia")
+
+        administrators_system_group = NamedUserGroup.objects.get(
+            name=SystemGroups.ADMINISTRATORS, realm=realm, is_system_group=True
+        )
+        moderators_system_group = NamedUserGroup.objects.get(
+            name=SystemGroups.MODERATORS, realm=realm, is_system_group=True
+        )
+        members_system_group = NamedUserGroup.objects.get(
+            name=SystemGroups.MEMBERS, realm=realm, is_system_group=True
+        )
+
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_bots_group",
+            members_system_group,
+            acting_user=None,
+        )
+
+        self.check_user_can_create_bot("hamlet", "testbot-1", UserProfile.DEFAULT_BOT)
+        self.check_user_can_create_bot(
+            "polonius", "testbot-2", UserProfile.DEFAULT_BOT, "Not allowed for guest users"
+        )
+
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_bots_group",
+            moderators_system_group,
+            acting_user=None,
+        )
+        self.check_user_can_create_bot("shiva", "testbot-3", UserProfile.DEFAULT_BOT)
+        self.check_user_can_create_bot("iago", "testbot-4", UserProfile.DEFAULT_BOT)
+        self.check_user_can_create_bot(
+            "hamlet", "testbot-5", UserProfile.DEFAULT_BOT, "Insufficient permission"
+        )
+
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_bots_group",
+            administrators_system_group,
+            acting_user=None,
+        )
+        self.check_user_can_create_bot("iago", "testbot-5", UserProfile.DEFAULT_BOT)
+        self.check_user_can_create_bot(
+            "shiva", "testbot-6", UserProfile.DEFAULT_BOT, "Insufficient permission"
+        )
+
+        # Test for checking setting for non-system user group.
+        user_group = check_add_user_group(
+            realm, "new_group", [hamlet, cordelia], acting_user=hamlet
+        )
+        do_change_realm_permission_group_setting(
+            realm, "can_create_bots_group", user_group, acting_user=None
+        )
+
+        # Hamlet and Cordelia are in the allowed user group, so can create bots.
+        self.check_user_can_create_bot("hamlet", "testbot-6", UserProfile.DEFAULT_BOT)
+        self.check_user_can_create_bot("cordelia", "testbot-7", UserProfile.DEFAULT_BOT)
+
+        # Iago is not in the allowed user group, so cannot create bots.
+        self.check_user_can_create_bot(
+            "iago", "testbot-8", UserProfile.DEFAULT_BOT, "Insufficient permission"
+        )
+
+        # Test for checking the setting for anonymous user group.
+        anonymous_user_group = self.create_or_update_anonymous_group_for_setting(
+            [hamlet],
+            [administrators_system_group],
+        )
+        do_change_realm_permission_group_setting(
+            realm,
+            "can_create_bots_group",
+            anonymous_user_group,
+            acting_user=None,
+        )
+
+        # Hamlet is the direct member of the anonymous user group, so can create bots.
+        self.check_user_can_create_bot("hamlet", "testbot-8", UserProfile.DEFAULT_BOT)
+        # Iago is in the `administrators_system_group` subgroup, so can create bots.
+        self.check_user_can_create_bot("iago", "testbot-9", UserProfile.DEFAULT_BOT)
+        # Shiva is not in the anonymous user group, so cannot create bots.
+        self.check_user_can_create_bot(
+            "shiva", "testbot-10", UserProfile.DEFAULT_BOT, "Insufficient permission"
+        )
+
+    def test_reactivating_bot_with_deactivated_owner(self) -> None:
         self.login("hamlet")
-        self.create_bot(bot_type=UserProfile.DEFAULT_BOT)
-
-        bot_realm = get_realm("zulip")
-        bot_realm.bot_creation_policy = Realm.BOT_CREATION_LIMIT_GENERIC_BOTS
-        bot_realm.save(update_fields=["bot_creation_policy"])
-
-        bot_email = "hambot-bot@zulip.testserver"
-        bot_user = get_user(bot_email, bot_realm)
-        do_deactivate_user(bot_user, acting_user=None)
-
-        # A regular user cannot reactivate a generic bot
-        self.assert_num_bots_equal(0)
-        result = self.client_post(f"/json/users/{bot_user.id}/reactivate")
-        self.assert_json_error(result, "Must be an organization administrator")
-        self.assert_num_bots_equal(0)
-
-    def test_no_generic_bots_allowed_for_admins(self) -> None:
-        bot_email = "hambot-bot@zulip.testserver"
-        bot_realm = get_realm("zulip")
-        bot_realm.bot_creation_policy = Realm.BOT_CREATION_LIMIT_GENERIC_BOTS
-        bot_realm.save(update_fields=["bot_creation_policy"])
-
-        # An administrator can create any type of bot
-        self.login("iago")
-        self.assert_num_bots_equal(0)
-        self.create_bot(bot_type=UserProfile.DEFAULT_BOT)
-        self.assert_num_bots_equal(1)
-        profile = get_user(bot_email, bot_realm)
-        self.assertEqual(profile.bot_type, UserProfile.DEFAULT_BOT)
-
-    def test_no_bots_allowed_for_non_admins(self) -> None:
         bot_info = {
-            "full_name": "The Bot of Hamlet",
-            "short_name": "hambot",
-            "bot_type": 1,
+            "full_name": "Test bot",
+            "short_name": "testbot",
+            "bot_type": "1",
         }
-        bot_realm = get_realm("zulip")
-        bot_realm.bot_creation_policy = Realm.BOT_CREATION_ADMINS_ONLY
-        bot_realm.save(update_fields=["bot_creation_policy"])
-
-        # A regular user cannot create a generic bot
-        self.login("hamlet")
-        self.assert_num_bots_equal(0)
         result = self.client_post("/json/bots", bot_info)
-        self.assert_num_bots_equal(0)
-        self.assert_json_error(result, "Must be an organization administrator")
+        bot_id = result.json()["user_id"]
 
-        # Also, a regular user cannot create a incoming bot
-        bot_info["bot_type"] = 2
-        self.login("hamlet")
-        self.assert_num_bots_equal(0)
-        result = self.client_post("/json/bots", bot_info)
-        self.assert_num_bots_equal(0)
-        self.assert_json_error(result, "Must be an organization administrator")
+        test_bot = UserProfile.objects.get(id=bot_id, is_bot=True)
+        private_stream = self.make_stream("private_stream", invite_only=True)
+        public_stream = self.make_stream("public_stream")
+        self.subscribe(test_bot, "private_stream")
+        self.subscribe(self.example_user("hamlet"), "private_stream")
+        self.subscribe(test_bot, "public_stream")
+        self.subscribe(self.example_user("hamlet"), "public_stream")
 
-    def test_no_bots_allowed_for_admins(self) -> None:
-        bot_email = "hambot-bot@zulip.testserver"
-        bot_realm = get_realm("zulip")
-        bot_realm.bot_creation_policy = Realm.BOT_CREATION_ADMINS_ONLY
-        bot_realm.save(update_fields=["bot_creation_policy"])
+        private_stream_test = self.make_stream("private_stream_test", invite_only=True)
+        self.subscribe(self.example_user("iago"), "private_stream_test")
+        self.subscribe(test_bot, "private_stream_test")
 
-        # An administrator can create any type of bot
+        do_deactivate_user(test_bot, acting_user=None)
+
+        # Deactivate the bot owner
+        do_deactivate_user(self.example_user("hamlet"), acting_user=None)
+
         self.login("iago")
-        self.assert_num_bots_equal(0)
-        self.create_bot(bot_type=UserProfile.DEFAULT_BOT)
-        self.assert_num_bots_equal(1)
-        profile = get_user(bot_email, bot_realm)
-        self.assertEqual(profile.bot_type, UserProfile.DEFAULT_BOT)
+        result = self.client_post(f"/json/users/{bot_id}/reactivate")
+        self.assert_json_success(result)
+        test_bot = UserProfile.objects.get(id=bot_id, is_bot=True)
+        assert test_bot.bot_owner is not None
+        self.assertEqual(test_bot.bot_owner.id, self.example_user("iago").id)
+
+        self.assertFalse(
+            Subscription.objects.filter(
+                user_profile=test_bot, recipient__type_id=private_stream.id, active=True
+            ).exists()
+        )
+        self.assertTrue(
+            Subscription.objects.filter(
+                user_profile=test_bot, recipient__type_id=private_stream_test.id, active=True
+            ).exists()
+        )
+        self.assertTrue(
+            Subscription.objects.filter(
+                user_profile=test_bot, recipient__type_id=public_stream.id, active=True
+            ).exists()
+        )
 
     def test_patch_bot_full_name(self) -> None:
         self.login("hamlet")
@@ -846,9 +1112,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
-        self.assertEqual("Fred", result.json()["full_name"])
+        self.assertEqual("Fred", response_dict["full_name"])
 
         bot = self.get_bot()
         self.assertEqual("Fred", bot["full_name"])
@@ -915,7 +1181,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.login("hamlet")
         othello = self.example_user("othello")
 
-        bot_info: Dict[str, object] = {
+        bot_info: dict[str, object] = {
             "full_name": "The Bot of Hamlet",
             "short_name": "hambot",
         }
@@ -926,10 +1192,10 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
         # Test bot's owner has been changed successfully.
-        self.assertEqual(result.json()["bot_owner"], othello.email)
+        self.assertEqual(response_dict["bot_owner"], othello.email)
 
         self.login("othello")
         bot = self.get_bot()
@@ -1008,7 +1274,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.create_bot()
         self.assert_num_bots_equal(1)
 
-        bot_info: Dict[str, object] = {
+        bot_info: dict[str, object] = {
             "full_name": "Another Bot of Hamlet",
             "short_name": "hamelbot",
         }
@@ -1023,6 +1289,93 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.assert_json_error(result, "Failed to change owner, bots can't own other bots")
         profile = get_user(email, get_realm("zulip"))
         self.assertEqual(profile.bot_owner, self.example_user("hamlet"))
+
+    def test_patch_bot_owner_of_bot_with_can_create_users(self) -> None:
+        """
+        can_create_users is granted to organizations upon approval, and thus
+        should be thought of as something that only organization owners should
+        have control over.
+        """
+        cordelia = self.example_user("cordelia")
+
+        self.login("hamlet")
+        self.create_bot()
+
+        bot_realm = get_realm("zulip")
+        bot_email = "hambot-bot@zulip.testserver"
+        bot_user = get_user(bot_email, bot_realm)
+
+        do_change_can_create_users(bot_user, True)
+
+        self.logout()
+        # iago is an ordinary organization administrator, and thus doesn't have
+        # sufficient permissions to change ownership of this bot.
+        self.login("iago")
+        bot_info = {
+            "bot_owner_id": cordelia.id,
+        }
+        result = self.client_patch(f"/json/bots/{bot_user.id}", bot_info)
+        self.assert_json_error(
+            result,
+            "Must be an organization owner",
+        )
+
+        self.logout()
+        # desdemona is the organization owner and should be allowed to change the bot's ownership.
+        self.login("desdemona")
+        result = self.client_patch(f"/json/bots/{bot_user.id}", bot_info)
+        self.assert_json_success(result)
+
+        bot_user.refresh_from_db()
+        self.assertEqual(bot_user.bot_owner, cordelia)
+
+    def test_patch_bot_owner_with_private_streams(self) -> None:
+        self.login("iago")
+        hamlet = self.example_user("hamlet")
+        self.create_bot()
+
+        bot_realm = get_realm("zulip")
+        bot_email = "hambot-bot@zulip.testserver"
+        bot_user = get_user(bot_email, bot_realm)
+
+        private_stream = self.make_stream("private_stream", invite_only=True)
+        public_stream = self.make_stream("public_stream")
+        self.subscribe(bot_user, "private_stream")
+        self.subscribe(self.example_user("iago"), "private_stream")
+        self.subscribe(bot_user, "public_stream")
+        self.subscribe(self.example_user("iago"), "public_stream")
+
+        private_stream_test = self.make_stream("private_stream_test", invite_only=True)
+        self.subscribe(self.example_user("hamlet"), "private_stream_test")
+        self.subscribe(bot_user, "private_stream_test")
+
+        bot_info = {
+            "bot_owner_id": hamlet.id,
+        }
+        result = self.client_patch(f"/json/bots/{bot_user.id}", bot_info)
+        self.assert_json_success(result)
+        bot_user = get_user(bot_email, bot_realm)
+        assert bot_user.bot_owner is not None
+        self.assertEqual(bot_user.bot_owner.id, hamlet.id)
+
+        assert private_stream.recipient_id is not None
+        self.assertFalse(
+            Subscription.objects.filter(
+                user_profile=bot_user, recipient_id=private_stream.recipient_id, active=True
+            ).exists()
+        )
+        assert private_stream_test.recipient_id is not None
+        self.assertTrue(
+            Subscription.objects.filter(
+                user_profile=bot_user, recipient_id=private_stream_test.recipient_id, active=True
+            ).exists()
+        )
+        assert public_stream.recipient_id is not None
+        self.assertTrue(
+            Subscription.objects.filter(
+                user_profile=bot_user, recipient_id=public_stream.recipient_id, active=True
+            ).exists()
+        )
 
     def test_patch_bot_avatar(self) -> None:
         self.login("hamlet")
@@ -1078,9 +1431,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
-        self.assertEqual("Denmark", result.json()["default_sending_stream"])
+        self.assertEqual("Denmark", response_dict["default_sending_stream"])
 
         bot = self.get_bot()
         self.assertEqual("Denmark", bot["default_sending_stream"])
@@ -1098,9 +1451,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
-        self.assertEqual("Rome", result.json()["default_sending_stream"])
+        self.assertEqual("Rome", response_dict["default_sending_stream"])
 
         bot = self.get_bot()
         self.assertEqual("Rome", bot["default_sending_stream"])
@@ -1128,11 +1481,59 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         bot = self.get_bot()
         self.assertEqual(None, bot["default_sending_stream"])
 
+    def test_patch_bot_role(self) -> None:
+        self.login("desdemona")
+
+        email = "default-bot@zulip.com"
+        user_profile = self.get_bot_user(email)
+
+        do_change_user_role(user_profile, UserProfile.ROLE_MEMBER, acting_user=user_profile)
+
+        req = dict(role=UserProfile.ROLE_GUEST)
+
+        result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", req)
+        self.assert_json_success(result)
+
+        user_profile = self.get_bot_user(email)
+        self.assertEqual(user_profile.role, UserProfile.ROLE_GUEST)
+
+        # Test for not allowing a non-owner user to make assign a bot an owner role
+        desdemona = self.example_user("desdemona")
+        do_change_user_role(desdemona, UserProfile.ROLE_REALM_ADMINISTRATOR, acting_user=None)
+
+        req = dict(role=UserProfile.ROLE_REALM_OWNER)
+
+        result = self.client_patch(f"/json/users/{user_profile.id}", req)
+        self.assert_json_error(result, "Must be an organization owner")
+
+        result = self.client_patch(f"/json/bots/{user_profile.id}", req)
+        self.assert_json_error(result, "Must be an organization owner")
+
+        # Test for not allowing a non-administrator user to assign a bot an administrator role
+        shiva = self.example_user("shiva")
+        self.assertEqual(shiva.role, UserProfile.ROLE_MODERATOR)
+        self.login_user(shiva)
+        do_change_bot_owner(user_profile, shiva, acting_user=None)
+
+        req = dict(role=UserProfile.ROLE_REALM_ADMINISTRATOR)
+
+        result = self.client_patch(f"/json/users/{user_profile.id}", req)
+        self.assert_json_error(result, "Must be an organization administrator")
+
+        result = self.client_patch(f"/json/bots/{user_profile.id}", req)
+        self.assert_json_error(result, "Must be an organization administrator")
+
     def test_patch_bot_to_stream_private_allowed(self) -> None:
         self.login("hamlet")
         user_profile = self.example_user("hamlet")
         stream = self.subscribe(user_profile, "Denmark")
-        do_change_stream_invite_only(stream, True)
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=user_profile,
+        )
 
         bot_info = {
             "full_name": "The Bot of Hamlet",
@@ -1146,9 +1547,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
-        self.assertEqual("Denmark", result.json()["default_sending_stream"])
+        self.assertEqual("Denmark", response_dict["default_sending_stream"])
 
         bot = self.get_bot()
         self.assertEqual("Denmark", bot["default_sending_stream"])
@@ -1158,7 +1559,13 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         realm = self.example_user("hamlet").realm
         stream = get_stream("Denmark", realm)
         self.unsubscribe(self.example_user("hamlet"), "Denmark")
-        do_change_stream_invite_only(stream, True)
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=self.example_user("hamlet"),
+        )
 
         bot_info = {
             "full_name": "The Bot of Hamlet",
@@ -1172,7 +1579,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_error(result, "Invalid stream name 'Denmark'")
+        self.assert_json_error(result, "Invalid channel name 'Denmark'")
 
     def test_patch_bot_to_stream_not_found(self) -> None:
         self.login("hamlet")
@@ -1187,7 +1594,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_error(result, "Invalid stream name 'missing'")
+        self.assert_json_error(result, "Invalid channel name 'missing'")
 
     def test_patch_bot_events_register_stream(self) -> None:
         hamlet = self.example_user("hamlet")
@@ -1207,9 +1614,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         stream_name = "Denmark"
         bot_info = dict(default_events_register_stream=stream_name)
         result = self.client_patch(url, bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
-        self.assertEqual(stream_name, result.json()["default_events_register_stream"])
+        self.assertEqual(stream_name, response_dict["default_events_register_stream"])
 
         bot = self.get_bot()
         self.assertEqual(stream_name, bot["default_events_register_stream"])
@@ -1222,7 +1629,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.subscribe(bot_user, stream_name)
         bot_info = dict(default_events_register_stream=stream_name)
         result = self.client_patch(url, bot_info)
-        self.assert_json_error_contains(result, "Invalid stream name")
+        self.assert_json_error_contains(result, "Invalid channel name")
 
         # Subscribing the owner allows us to patch the stream.
         self.subscribe(hamlet, stream_name)
@@ -1239,7 +1646,13 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         self.login("hamlet")
         user_profile = self.example_user("hamlet")
         stream = self.subscribe(user_profile, "Denmark")
-        do_change_stream_invite_only(stream, True)
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=user_profile,
+        )
 
         bot_info = {
             "full_name": "The Bot of Hamlet",
@@ -1252,9 +1665,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
-        self.assertEqual("Denmark", result.json()["default_events_register_stream"])
+        self.assertEqual("Denmark", response_dict["default_events_register_stream"])
 
         bot = self.get_bot()
         self.assertEqual("Denmark", bot["default_events_register_stream"])
@@ -1264,7 +1677,13 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         realm = self.example_user("hamlet").realm
         stream = get_stream("Denmark", realm)
         self.unsubscribe(self.example_user("hamlet"), "Denmark")
-        do_change_stream_invite_only(stream, True)
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=self.example_user("hamlet"),
+        )
 
         bot_info = {
             "full_name": "The Bot of Hamlet",
@@ -1277,7 +1696,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_error(result, "Invalid stream name 'Denmark'")
+        self.assert_json_error(result, "Invalid channel name 'Denmark'")
 
     def test_patch_bot_events_register_stream_none(self) -> None:
         self.login("hamlet")
@@ -1317,7 +1736,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_error(result, "Invalid stream name 'missing'")
+        self.assert_json_error(result, "Invalid channel name 'missing'")
 
     def test_patch_bot_default_all_public_streams_true(self) -> None:
         self.login("hamlet")
@@ -1332,9 +1751,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
-        self.assertEqual(result.json()["default_all_public_streams"], True)
+        self.assertEqual(response_dict["default_all_public_streams"], True)
 
         bot = self.get_bot()
         self.assertEqual(bot["default_all_public_streams"], True)
@@ -1352,9 +1771,9 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         }
         email = "hambot-bot@zulip.testserver"
         result = self.client_patch(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
+        response_dict = self.assert_json_success(result)
 
-        self.assertEqual(result.json()["default_all_public_streams"], False)
+        self.assertEqual(response_dict["default_all_public_streams"], False)
 
         bot = self.get_bot()
         self.assertEqual(bot["default_all_public_streams"], False)
@@ -1374,9 +1793,12 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         email = "hambot-bot@zulip.testserver"
         # Important: We intentionally use the wrong method, post, here.
         result = self.client_post(f"/json/bots/{self.get_bot_user(email).id}", bot_info)
-        self.assert_json_success(result)
 
-        self.assertEqual("Fred", result.json()["full_name"])
+        # TODO: The "method" parameter is not currently tracked as a processed parameter
+        # by typed_endpoint. Assert it is returned as an ignored parameter.
+        response_dict = self.assert_json_success(result, ignored_parameters=["method"])
+
+        self.assertEqual("Fred", response_dict["full_name"])
 
         bot = self.get_bot()
         self.assertEqual("Fred", bot["full_name"])
@@ -1400,7 +1822,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
             "short_name": "hambot",
             "bot_type": UserProfile.OUTGOING_WEBHOOK_BOT,
             "payload_url": orjson.dumps("http://foo.bar.com").decode(),
-            "service_interface": Service.GENERIC,
+            "interface_type": Service.GENERIC,
         }
         result = self.client_post("/json/bots", bot_info)
         self.assert_json_success(result)
@@ -1475,7 +1897,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         # invalid URL test case.
         bot_info["payload_url"] = orjson.dumps("http://127.0.0.:5002").decode()
         result = self.client_post("/json/bots", bot_info)
-        self.assert_json_error(result, "payload_url is not a URL")
+        self.assert_json_error(result, "Invalid payload_url: Value error, Not a URL")
 
     def test_get_bot_handler(self) -> None:
         # Test for valid service.
@@ -1558,7 +1980,7 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
             user_profile=self.example_user("hamlet"),
             service_name="followup",
             config_data=orjson.dumps({"invalid": ["config", "value"]}).decode(),
-            assert_json_error_msg="config_data contains a value that is not a string",
+            assert_json_error_msg='config_data["invalid"] is not a string',
             **extras,
         )
 
@@ -1587,6 +2009,26 @@ class BotTest(ZulipTestCase, UploadSerializeMixin):
         with self.settings(CROSS_REALM_BOT_EMAILS={"random-bot@zulip.com"}):
             self.assertTrue(is_cross_realm_bot_email("random-bot@zulip.com"))
             self.assertFalse(is_cross_realm_bot_email("notification-bot@zulip.com"))
+
+    def test_private_bot_empty_bot_owner_user_ids(self) -> None:
+        hamlet = self.example_user("hamlet")
+        self.login("hamlet")
+        self.create_bot()
+        stream = get_stream("Denmark", get_realm("zulip"))
+        do_change_stream_permission(
+            stream,
+            invite_only=True,
+            history_public_to_subscribers=False,
+            is_web_public=False,
+            acting_user=hamlet,
+        )
+
+        new_bot = assert_is_not_none(UserProfile.objects.last())
+        do_change_default_sending_stream(new_bot, stream, acting_user=hamlet)
+        new_bot.bot_owner_id = None
+        new_bot.save()
+
+        self.assertEqual(bot_owner_user_ids(new_bot), set())
 
     @patch("zerver.lib.integrations.WEBHOOK_INTEGRATIONS", stripe_sample_config_options)
     def test_create_incoming_webhook_bot_with_service_name_and_with_keys(self) -> None:

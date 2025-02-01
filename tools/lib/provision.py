@@ -6,15 +6,15 @@ import os
 import platform
 import subprocess
 import sys
+from typing import NoReturn
 
 os.environ["PYTHONUNBUFFERED"] = "y"
 
 ZULIP_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 sys.path.append(ZULIP_PATH)
-from typing import TYPE_CHECKING, List
 
-from scripts.lib.node_cache import NODE_MODULES_CACHE_PATH, setup_node_modules
+from scripts.lib.node_cache import setup_node_modules
 from scripts.lib.setup_venv import get_venv_dependencies
 from scripts.lib.zulip_tools import (
     ENDC,
@@ -26,9 +26,6 @@ from scripts.lib.zulip_tools import (
     run_as_root,
 )
 from tools.setup import setup_venvs
-
-if TYPE_CHECKING:
-    from typing import NoReturn
 
 VAR_DIR_PATH = os.path.join(ZULIP_PATH, "var")
 
@@ -48,9 +45,7 @@ with open("/proc/meminfo") as meminfo:
 ram_gb = float(ram_size) / 1024.0 / 1024.0
 if ram_gb < 1.5:
     print(
-        "You have insufficient RAM ({} GB) to run the Zulip development environment.".format(
-            round(ram_gb, 2)
-        )
+        f"You have insufficient RAM ({round(ram_gb, 2)} GB) to run the Zulip development environment."
     )
     print("We recommend at least 2 GB of RAM, and require at least 1.5 GB.")
     sys.exit(1)
@@ -67,34 +62,26 @@ try:
     os.remove(os.path.join(VAR_DIR_PATH, "zulip-test-symlink"))
 except OSError:
     print(
-        FAIL + "Error: Unable to create symlinks."
+        FAIL + "Error: Unable to create symlinks. "
         "Make sure you have permission to create symbolic links." + ENDC
     )
     print("See this page for more information:")
     print(
-        "  https://zulip.readthedocs.io/en/latest/development/setup-vagrant.html#os-symlink-error"
+        "  https://zulip.readthedocs.io/en/latest/development/setup-recommended.html#os-symlink-error"
     )
     sys.exit(1)
 
 distro_info = parse_os_release()
 vendor = distro_info["ID"]
 os_version = distro_info["VERSION_ID"]
-if vendor == "debian" and os_version == "10":  # buster
-    POSTGRESQL_VERSION = "11"
-elif vendor == "debian" and os_version == "11":  # bullseye
-    POSTGRESQL_VERSION = "13"
-elif vendor == "ubuntu" and os_version == "18.04":  # bionic
-    POSTGRESQL_VERSION = "10"
-elif vendor == "ubuntu" and os_version == "20.04":  # focal
-    POSTGRESQL_VERSION = "12"
-elif vendor == "ubuntu" and os_version == "21.10":  # impish
-    POSTGRESQL_VERSION = "13"
-elif vendor == "neon" and os_version == "20.04":  # KDE Neon
-    POSTGRESQL_VERSION = "12"
-elif vendor == "fedora" and os_version == "33":
-    POSTGRESQL_VERSION = "13"
-elif vendor == "fedora" and os_version == "34":
-    POSTGRESQL_VERSION = "13"
+if vendor == "debian" and os_version == "12":  # bookworm
+    POSTGRESQL_VERSION = "15"
+elif vendor == "ubuntu" and os_version == "22.04":  # jammy
+    POSTGRESQL_VERSION = "14"
+elif vendor == "ubuntu" and os_version == "24.04":  # noble
+    POSTGRESQL_VERSION = "16"
+elif vendor == "fedora" and os_version == "38":
+    POSTGRESQL_VERSION = "15"
 elif vendor == "rhel" and os_version.startswith("7."):
     POSTGRESQL_VERSION = "10"
 elif vendor == "centos" and os_version == "7":
@@ -114,7 +101,6 @@ COMMON_DEPENDENCIES = [
     "ca-certificates",  # Explicit dependency in case e.g. curl is already installed
     "puppet",  # Used by lint (`puppet parser validate`)
     "gettext",  # Used by makemessages i18n
-    "transifex-client",  # Needed to sync translations from transifex
     "curl",  # Used for testing our API documentation
     "moreutils",  # Used for sponge command
     "unzip",  # Needed for Slack import
@@ -132,11 +118,8 @@ UBUNTU_COMMON_APT_DEPENDENCIES = [
     "default-jre-headless",  # Required by vnu-jar
     # Puppeteer dependencies from here
     "fonts-freefont-ttf",
-    "gconf-service",
-    "libappindicator1",
     "libatk-bridge2.0-0",
     "libgbm1",
-    "libgconf-2-4",
     "libgtk-3-0",
     "libx11-xcb1",
     "libxcb-dri3-0",
@@ -164,8 +147,9 @@ COMMON_YUM_DEPENDENCIES = [
     # Puppeteer dependencies end here.
 ]
 
+BUILD_GROONGA_FROM_SOURCE = False
 BUILD_PGROONGA_FROM_SOURCE = False
-if vendor == "debian" and os_version in [] or vendor == "ubuntu" and os_version in []:
+if (vendor == "debian" and os_version in []) or (vendor == "ubuntu" and os_version in []):
     # For platforms without a PGroonga release, we need to build it
     # from source.
     BUILD_PGROONGA_FROM_SOURCE = True
@@ -176,30 +160,21 @@ if vendor == "debian" and os_version in [] or vendor == "ubuntu" and os_version 
         f"postgresql-server-dev-{POSTGRESQL_VERSION}",
         "libgroonga-dev",
         "libmsgpack-dev",
-        "clang-9",
-        "llvm-9-dev",
+        "clang",
         *VENV_DEPENDENCIES,
     ]
 elif "debian" in os_families():
-    DEBIAN_DEPENDECIES = UBUNTU_COMMON_APT_DEPENDENCIES
-    # The below condition is required since libappindicator is
-    # not available for bullseye (sid). "libgroonga1" is an
-    # additional dependency for postgresql-13-pgdg-pgroonga.
-    #
-    # See https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=895037
-    if vendor == "debian" and os_version == "11":
-        DEBIAN_DEPENDECIES.remove("libappindicator1")
-        DEBIAN_DEPENDECIES.append("libgroonga0")
+    DEBIAN_DEPENDENCIES = UBUNTU_COMMON_APT_DEPENDENCIES
 
     # If we are on an aarch64 processor, ninja will be built from source,
     # so cmake is required
     if platform.machine() == "aarch64":
-        DEBIAN_DEPENDECIES.append("cmake")
+        DEBIAN_DEPENDENCIES.append("cmake")
 
     SYSTEM_DEPENDENCIES = [
-        *DEBIAN_DEPENDECIES,
+        *DEBIAN_DEPENDENCIES,
         f"postgresql-{POSTGRESQL_VERSION}",
-        f"postgresql-{POSTGRESQL_VERSION}-pgdg-pgroonga",
+        f"postgresql-{POSTGRESQL_VERSION}-pgroonga",
         *VENV_DEPENDENCIES,
     ]
 elif "rhel" in os_families():
@@ -218,10 +193,10 @@ elif "fedora" in os_families():
         f"postgresql{POSTGRESQL_VERSION}",
         f"postgresql{POSTGRESQL_VERSION}-devel",
         # Needed to build PGroonga from source
-        "groonga-devel",
         "msgpack-devel",
         *VENV_DEPENDENCIES,
     ]
+    BUILD_GROONGA_FROM_SOURCE = True
     BUILD_PGROONGA_FROM_SOURCE = True
 
 if "fedora" in os_families():
@@ -239,7 +214,6 @@ REPO_STOPWORDS_PATH = os.path.join(
 
 
 def install_system_deps() -> None:
-
     # By doing list -> set -> list conversion, we remove duplicates.
     deps_to_install = sorted(set(SYSTEM_DEPENDENCIES))
 
@@ -252,11 +226,13 @@ def install_system_deps() -> None:
 
     # For some platforms, there aren't published PGroonga
     # packages available, so we build them from source.
+    if BUILD_GROONGA_FROM_SOURCE:
+        run_as_root(["./scripts/lib/build-groonga"])
     if BUILD_PGROONGA_FROM_SOURCE:
         run_as_root(["./scripts/lib/build-pgroonga"])
 
 
-def install_apt_deps(deps_to_install: List[str]) -> None:
+def install_apt_deps(deps_to_install: list[str]) -> None:
     # setup-apt-repo does an `apt-get update` if the sources.list files changed.
     run_as_root(["./scripts/lib/setup-apt-repo"])
 
@@ -272,14 +248,15 @@ def install_apt_deps(deps_to_install: List[str]) -> None:
             "apt-get",
             "-y",
             "install",
+            "--allow-downgrades",
             "--no-install-recommends",
             *deps_to_install,
         ]
     )
 
 
-def install_yum_deps(deps_to_install: List[str]) -> None:
-    print(WARNING + "RedHat support is still experimental.")
+def install_yum_deps(deps_to_install: list[str]) -> None:
+    print(WARNING + "RedHat support is still experimental." + ENDC)
     run_as_root(["./scripts/lib/setup-yum-repo"])
 
     # Hack specific to unregistered RHEL system.  The moreutils
@@ -288,13 +265,18 @@ def install_yum_deps(deps_to_install: List[str]) -> None:
     #
     # Error: Package: moreutils-0.49-2.el7.x86_64 (epel)
     #        Requires: perl(IPC::Run)
-    yum_extra_flags = []  # type: List[str]
+    yum_extra_flags: list[str] = []
     if vendor == "rhel":
-        exitcode, subs_status = subprocess.getstatusoutput("sudo subscription-manager status")
-        if exitcode == 1:
+        proc = subprocess.run(
+            ["sudo", "subscription-manager", "status"],
+            stdout=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 1:
             # TODO this might overkill since `subscription-manager` is already
             # called in setup-yum-repo
-            if "Status" in subs_status:
+            if "Status" in proc.stdout:
                 # The output is well-formed
                 yum_extra_flags = ["--skip-broken"]
             else:
@@ -334,11 +316,16 @@ def install_yum_deps(deps_to_install: List[str]) -> None:
     # Later steps will ensure PostgreSQL is started
 
     # Link in tsearch data files
+    if vendor == "fedora":
+        # Since F36 dictionary files were moved away from /usr/share/myspell
+        tsearch_source_prefix = "/usr/share/hunspell"
+    else:
+        tsearch_source_prefix = "/usr/share/myspell"
     run_as_root(
         [
             "ln",
             "-nsf",
-            "/usr/share/myspell/en_US.dic",
+            os.path.join(tsearch_source_prefix, "en_US.dic"),
             f"/usr/pgsql-{POSTGRESQL_VERSION}/share/tsearch_data/en_us.dict",
         ]
     )
@@ -346,29 +333,33 @@ def install_yum_deps(deps_to_install: List[str]) -> None:
         [
             "ln",
             "-nsf",
-            "/usr/share/myspell/en_US.aff",
+            os.path.join(tsearch_source_prefix, "en_US.aff"),
             f"/usr/pgsql-{POSTGRESQL_VERSION}/share/tsearch_data/en_us.affix",
         ]
     )
 
 
-def main(options: argparse.Namespace) -> "NoReturn":
-
-    # yarn and management commands expect to be run from the root of the
+def main(options: argparse.Namespace) -> NoReturn:
+    # pnpm and management commands expect to be run from the root of the
     # project.
     os.chdir(ZULIP_PATH)
 
     # hash the apt dependencies
     sha_sum = hashlib.sha1()
 
-    for apt_depedency in SYSTEM_DEPENDENCIES:
-        sha_sum.update(apt_depedency.encode())
+    for apt_dependency in SYSTEM_DEPENDENCIES:
+        sha_sum.update(apt_dependency.encode())
     if "debian" in os_families():
         with open("scripts/lib/setup-apt-repo", "rb") as fb:
             sha_sum.update(fb.read())
     else:
         # hash the content of setup-yum-repo*
         with open("scripts/lib/setup-yum-repo", "rb") as fb:
+            sha_sum.update(fb.read())
+
+    # hash the content of build-pgroonga if Groonga is built from source
+    if BUILD_GROONGA_FROM_SOURCE:
+        with open("scripts/lib/build-groonga", "rb") as fb:
             sha_sum.update(fb.read())
 
     # hash the content of build-pgroonga if PGroonga is built from source
@@ -407,32 +398,31 @@ def main(options: argparse.Namespace) -> "NoReturn":
         "no_proxy=" + os.environ.get("no_proxy", ""),
     ]
     run_as_root([*proxy_env, "scripts/lib/install-node"], sudo_args=["-H"])
-    run_as_root([*proxy_env, "scripts/lib/install-yarn"])
 
-    if not os.access(NODE_MODULES_CACHE_PATH, os.W_OK):
-        run_as_root(["mkdir", "-p", NODE_MODULES_CACHE_PATH])
-        run_as_root(["chown", f"{os.getuid()}:{os.getgid()}", NODE_MODULES_CACHE_PATH])
-
-    # This is a wrapper around `yarn`, which we run last since
-    # it can often fail due to network issues beyond our control.
     try:
-        setup_node_modules(prefer_offline=True)
+        setup_node_modules()
     except subprocess.CalledProcessError:
-        print(WARNING + "`yarn install` failed; retrying..." + ENDC)
+        print(WARNING + "`pnpm install` failed; retrying..." + ENDC)
         try:
             setup_node_modules()
         except subprocess.CalledProcessError:
             print(
                 FAIL
-                + "`yarn install` is failing; check your network connection (and proxy settings)."
+                + "`pnpm install` is failing; check your network connection (and proxy settings)."
                 + ENDC
             )
             sys.exit(1)
 
     # Install shellcheck.
-    run_as_root(["tools/setup/install-shellcheck"])
+    run_as_root([*proxy_env, "tools/setup/install-shellcheck"])
     # Install shfmt.
-    run_as_root(["tools/setup/install-shfmt"])
+    run_as_root([*proxy_env, "tools/setup/install-shfmt"])
+
+    # Install transifex-cli.
+    run_as_root([*proxy_env, "tools/setup/install-transifex-cli"])
+
+    # Install tusd
+    run_as_root([*proxy_env, "tools/setup/install-tusd"])
 
     setup_venvs.main()
 
@@ -464,7 +454,7 @@ def main(options: argparse.Namespace) -> "NoReturn":
     activate_this = "/srv/zulip-py3-venv/bin/activate_this.py"
     provision_inner = os.path.join(ZULIP_PATH, "tools", "lib", "provision_inner.py")
     with open(activate_this) as f:
-        exec(f.read(), dict(__file__=activate_this))
+        exec(f.read(), dict(__file__=activate_this))  # noqa: S102
     os.execvp(
         provision_inner,
         [

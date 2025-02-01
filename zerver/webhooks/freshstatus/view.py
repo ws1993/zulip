@@ -1,15 +1,15 @@
-from typing import Any, Dict, List
-
 import dateutil.parser
+from django.core.exceptions import ValidationError
 from django.http import HttpRequest, HttpResponse
-from django.utils.translation import ugettext as _
+from django.utils.translation import gettext as _
 
+from zerver.actions.message_send import send_rate_limited_pm_notification_to_bot_owner
 from zerver.decorator import webhook_view
-from zerver.lib.actions import send_rate_limited_pm_notification_to_bot_owner
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
 from zerver.lib.send_email import FromAddress
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message, get_setup_webhook_message
 from zerver.models import UserProfile
 
@@ -77,17 +77,17 @@ ALL_EVENT_TYPES = [
 
 
 @webhook_view("Freshstatus", all_event_types=ALL_EVENT_TYPES)
-@has_request_variables
+@typed_endpoint
 def api_freshstatus_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: Dict[str, Any] = REQ(argument_type="body"),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
-
     try:
         body = get_body_for_http_request(payload)
-        subject = get_subject_for_http_request(payload)
-    except KeyError:
+        topic_name = get_topic_for_http_request(payload)
+    except ValidationError:
         message = MISCONFIGURED_PAYLOAD_ERROR_MESSAGE.format(
             bot_name=user_profile.full_name,
             support_email=FromAddress.SUPPORT,
@@ -97,12 +97,16 @@ def api_freshstatus_webhook(
         raise JsonableError(_("Invalid payload"))
 
     check_send_webhook_message(
-        request, user_profile, subject, body, payload["event_data"]["event_type"]
+        request,
+        user_profile,
+        topic_name,
+        body,
+        payload["event_data"]["event_type"].tame(check_string),
     )
-    return json_success()
+    return json_success(request)
 
 
-def get_services_content(services_data: List[Dict[str, Any]]) -> str:
+def get_services_content(services_data: list[dict[str, str]]) -> str:
     services_content = ""
     for service in services_data[:FRESHSTATUS_SERVICES_LIMIT]:
         services_content += FRESHSTATUS_SERVICES_ROW_TEMPLATE.format(
@@ -116,62 +120,81 @@ def get_services_content(services_data: List[Dict[str, Any]]) -> str:
     return services_content.rstrip()
 
 
-def get_subject_for_http_request(payload: Dict[str, Any]) -> str:
+def get_topic_for_http_request(payload: WildValue) -> str:
     event_data = payload["event_data"]
-    if event_data["event_type"] == "INCIDENT_OPEN" and payload["id"] == "1":
+    if (
+        event_data["event_type"].tame(check_string) == "INCIDENT_OPEN"
+        and payload["id"].tame(check_string) == "1"
+    ):
         return FRESHSTATUS_TOPIC_TEMPLATE_TEST
     else:
-        return FRESHSTATUS_TOPIC_TEMPLATE.format(title=payload["title"])
+        return FRESHSTATUS_TOPIC_TEMPLATE.format(title=payload["title"].tame(check_string))
 
 
-def get_body_for_maintenance_planned_event(payload: Dict[str, Any]) -> str:
-    services_data = []
-    for service in payload["affected_services"].split(","):
-        services_data.append({"service_name": service})
+def get_body_for_maintenance_planned_event(payload: WildValue) -> str:
+    services_data = [
+        {"service_name": service}
+        for service in payload["affected_services"].tame(check_string).split(",")
+    ]
     data = {
-        "title": payload["title"],
-        "description": payload["description"],
-        "scheduled_start_time": dateutil.parser.parse(payload["scheduled_start_time"]).strftime(
-            "%Y-%m-%d %H:%M %Z"
-        ),
-        "scheduled_end_time": dateutil.parser.parse(payload["scheduled_end_time"]).strftime(
-            "%Y-%m-%d %H:%M %Z"
-        ),
+        "title": payload["title"].tame(check_string),
+        "description": payload["description"].tame(check_string),
+        "scheduled_start_time": dateutil.parser.parse(
+            payload["scheduled_start_time"].tame(check_string)
+        ).strftime("%Y-%m-%d %H:%M %Z"),
+        "scheduled_end_time": dateutil.parser.parse(
+            payload["scheduled_end_time"].tame(check_string)
+        ).strftime("%Y-%m-%d %H:%M %Z"),
         "affected_services": get_services_content(services_data),
     }
     return FRESHSTATUS_MESSAGE_TEMPLATE_SCHEDULED_MAINTENANCE_PLANNED.format(**data)
 
 
-def get_body_for_incident_open_event(payload: Dict[str, Any]) -> str:
-    services_data = []
-    for service in payload["affected_services"].split(","):
-        services_data.append({"service_name": service})
+def get_body_for_incident_open_event(payload: WildValue) -> str:
+    services_data = [
+        {"service_name": service}
+        for service in payload["affected_services"].tame(check_string).split(",")
+    ]
     data = {
-        "title": payload["title"],
-        "description": payload["description"],
-        "start_time": dateutil.parser.parse(payload["start_time"]).strftime("%Y-%m-%d %H:%M %Z"),
+        "title": payload["title"].tame(check_string),
+        "description": payload["description"].tame(check_string),
+        "start_time": dateutil.parser.parse(payload["start_time"].tame(check_string)).strftime(
+            "%Y-%m-%d %H:%M %Z"
+        ),
         "affected_services": get_services_content(services_data),
     }
     return FRESHSTATUS_MESSAGE_TEMPLATE_INCIDENT_OPEN.format(**data)
 
 
-def get_body_for_http_request(payload: Dict[str, Any]) -> str:
+def get_body_for_http_request(payload: WildValue) -> str:
     event_data = payload["event_data"]
-    if event_data["event_type"] == "INCIDENT_OPEN" and payload["id"] == "1":
+    event_type = event_data["event_type"].tame(check_string)
+    if event_type == "INCIDENT_OPEN" and payload["id"].tame(check_string) == "1":
         return get_setup_webhook_message("Freshstatus")
-    elif event_data["event_type"] == "INCIDENT_OPEN":
+    elif event_type == "INCIDENT_OPEN":
         return get_body_for_incident_open_event(payload)
-    elif event_data["event_type"] == "INCIDENT_NOTE_CREATE":
-        if payload["incident_status"] == "Closed":
-            return FRESHSTATUS_MESSAGE_TEMPLATE_INCIDENT_CLOSED.format(**payload)
-        elif payload["incident_status"] == "Open":
-            return FRESHSTATUS_MESSAGE_TEMPLATE_INCIDENT_NOTE_CREATED.format(**payload)
-    elif event_data["event_type"] == "MAINTENANCE_PLANNED":
+    elif event_type == "INCIDENT_NOTE_CREATE":
+        incident_status = payload["incident_status"].tame(check_string)
+        title = payload["title"].tame(check_string)
+        message = payload["message"].tame(check_string)
+        if incident_status == "Closed":
+            return FRESHSTATUS_MESSAGE_TEMPLATE_INCIDENT_CLOSED.format(title=title, message=message)
+        elif incident_status == "Open":
+            return FRESHSTATUS_MESSAGE_TEMPLATE_INCIDENT_NOTE_CREATED.format(
+                title=title, message=message
+            )
+    elif event_type == "MAINTENANCE_PLANNED":
         return get_body_for_maintenance_planned_event(payload)
-    elif event_data["event_type"] == "MAINTENANCE_NOTE_CREATE":
-        if payload["incident_status"] == "Closed":
-            return FRESHSTATUS_MESSAGE_TEMPLATE_SCHEDULED_MAINTENANCE_CLOSED.format(**payload)
+    elif event_type == "MAINTENANCE_NOTE_CREATE":
+        title = payload["title"].tame(check_string)
+        message = payload["message"].tame(check_string)
+        if payload["incident_status"].tame(check_string) == "Closed":
+            return FRESHSTATUS_MESSAGE_TEMPLATE_SCHEDULED_MAINTENANCE_CLOSED.format(
+                title=title, message=message
+            )
         else:
-            return FRESHSTATUS_MESSAGE_TEMPLATE_SCHEDULED_MAINTENANCE_NOTE_CREATED.format(**payload)
+            return FRESHSTATUS_MESSAGE_TEMPLATE_SCHEDULED_MAINTENANCE_NOTE_CREATED.format(
+                title=title, message=message
+            )
 
-    return FRESHSTATUS_MESSAGE_EVENT_NOT_SUPPORTED.format(event_type=event_data["event_type"])
+    return FRESHSTATUS_MESSAGE_EVENT_NOT_SUPPORTED.format(event_type=event_type)

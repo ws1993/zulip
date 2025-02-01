@@ -1,10 +1,9 @@
-from typing import Any, Dict
-
 from django.http import HttpRequest, HttpResponse
 
 from zerver.decorator import webhook_view
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
+from zerver.lib.typed_endpoint import JsonBodyPayload, typed_endpoint
+from zerver.lib.validator import WildValue, check_string
 from zerver.lib.webhooks.common import check_send_webhook_message
 from zerver.models import UserProfile
 
@@ -13,13 +12,13 @@ AMOUNT_TEMPLATE = "{amount}"
 
 
 @webhook_view("OpenCollective")
-@has_request_variables
+@typed_endpoint
 def api_opencollective_webhook(
     request: HttpRequest,
     user_profile: UserProfile,
-    payload: Dict[str, Any] = REQ(argument_type="body"),
+    *,
+    payload: JsonBodyPayload[WildValue],
 ) -> HttpResponse:
-
     name = get_name(payload)
     amount = get_amount(payload)
 
@@ -28,20 +27,24 @@ def api_opencollective_webhook(
 
     if name == "Incognito":  # Incognito donation
         body = f"An **Incognito** member donated **{amount}**! :tada:"
-    else:  # non - Incognito donation
+    else:  # non-Incognito donation
         body = f"@_**{name}** donated **{amount}**! :tada:"
 
-    topic = "New Member"
+    topic_name = "New Member"
 
     # send the message
-    check_send_webhook_message(request, user_profile, topic, body)
+    check_send_webhook_message(request, user_profile, topic_name, body)
 
-    return json_success()
-
-
-def get_name(payload: Dict[str, Any]) -> str:
-    return MEMBER_NAME_TEMPLATE.format(name=payload["data"]["member"]["memberCollective"]["name"])
+    return json_success(request)
 
 
-def get_amount(payload: Dict[str, Any]) -> str:
-    return AMOUNT_TEMPLATE.format(amount=payload["data"]["order"]["formattedAmount"])
+def get_name(payload: WildValue) -> str:
+    return MEMBER_NAME_TEMPLATE.format(
+        name=payload["data"]["member"]["memberCollective"]["name"].tame(check_string)
+    )
+
+
+def get_amount(payload: WildValue) -> str:
+    return AMOUNT_TEMPLATE.format(
+        amount=payload["data"]["order"]["formattedAmount"].tame(check_string)
+    )

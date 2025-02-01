@@ -1,16 +1,19 @@
 import csv
 from timeit import timeit
-from typing import Any, Union
+from typing import Any
 
-from django.core.management.base import BaseCommand, CommandParser
+from django.core.management.base import CommandParser
+from typing_extensions import override
 
-from zerver.lib.queue import SimpleQueueClient, queue_json_publish
-from zerver.worker.queue_processors import BatchNoopWorker, NoopWorker
+from zerver.lib.management import ZulipBaseCommand
+from zerver.lib.queue import SimpleQueueClient, queue_json_publish_rollback_unsafe
+from zerver.worker.test import BatchNoopWorker, NoopWorker
 
 
-class Command(BaseCommand):
+class Command(ZulipBaseCommand):
     help = """Times the overhead of enqueuing and dequeuing messages from RabbitMQ."""
 
+    @override
     def add_arguments(self, parser: CommandParser) -> None:
         parser.add_argument(
             "--count", help="Number of messages to enqueue", default=10000, type=int
@@ -33,6 +36,7 @@ class Command(BaseCommand):
             default=[],
         )
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         print("Purging queue...")
         queue = SimpleQueueClient()
@@ -49,7 +53,7 @@ class Command(BaseCommand):
 
             for prefetch in options["prefetches"]:
                 print(f"Queue size {count}, prefetch {prefetch}...")
-                worker: Union[NoopWorker, BatchNoopWorker] = NoopWorker(count, options["slow"])
+                worker: NoopWorker | BatchNoopWorker = NoopWorker(count, options["slow"])
                 if options["batch"]:
                     worker = BatchNoopWorker(count, options["slow"])
                     if prefetch > 0 and prefetch < worker.batch_size:
@@ -57,7 +61,6 @@ class Command(BaseCommand):
                             f"    Skipping, as prefetch {prefetch} is less than batch size {worker.batch_size}"
                         )
                         continue
-                worker.ENABLE_TIMEOUTS = True
                 worker.setup()
 
                 assert worker.q is not None
@@ -68,13 +71,10 @@ class Command(BaseCommand):
                 for i in range(1, reps + 1):
                     worker.consumed = 0
                     timeit(
-                        lambda: queue_json_publish(queue_name, {}),
+                        lambda: queue_json_publish_rollback_unsafe(queue_name, {}),
                         number=count,
                     )
-                    duration = timeit(
-                        lambda: worker.start(),
-                        number=1,
-                    )
+                    duration = timeit(worker.start, number=1)
                     print(f"    {i}/{reps}: {count}/{duration}s = {count / duration}/s")
                     total_time += duration
                     writer.writerow(

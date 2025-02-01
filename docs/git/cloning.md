@@ -135,6 +135,6 @@ You can check the `Actions` tab of your repository to see the builds.
 [github-zulip]: https://github.com/zulip/
 [github-zulip-zulip]: https://github.com/zulip/zulip/
 [github-actions]: https://docs.github.com/en/actions
-[zulip-rtd-dev-first-time]: ../development/setup-vagrant.md
+[zulip-rtd-dev-first-time]: ../development/setup-recommended.md
 [zulip-rtd-dev-overview]: ../development/overview.md
-[zulip-rtd-tools-setup]: ../git/zulip-tools.html#set-up-git-repo-script
+[zulip-rtd-tools-setup]: zulip-tools.md#set-up-git-repo-script

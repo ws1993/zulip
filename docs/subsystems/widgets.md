@@ -23,7 +23,7 @@ These are the least complex. We use our markdown processors to
 detect if a message is a `/me` message, plumb the flag through
 the message object (as `is_me_message`) and have the clients
 format it correctly. Related code (for the web app) lies in
-`message_list_view.js` in `_maybe_format_me_message`.
+`message_list_view.ts` in `_maybe_get_me_message`.
 
 ## Polls, todo lists, and games
 
@@ -51,11 +51,11 @@ Some important code entities for the widget implementation are:
 
 - `SubMessage` database table
 - `/json/submessage` API endpoint
-- `static/js/submessage.js`
-- `static/js/poll_widget.js`
-- `static/js/widgetize.js`
-- `static/js/zform.js`
-- `static/templates/widgets/`
+- `web/src/submessage.js`
+- `web/src/poll_widget.js`
+- `web/src/widgetize.ts`
+- `web/src/zform.js`
+- `web/templates/widgets/`
 - `zerver/lib/widget.py`
 - `zerver/views/submessage.py`
 
@@ -79,7 +79,7 @@ appropriate widgets.
 The web app client will next collect poll options and votes
 from users. The web app client has
 code in `submessage.js` that dispatches events
-to `widgetize.js`, which in turn sends events to
+to `widgetize.ts`, which in turn sends events to
 individual widgets. The widgets know how to render
 themselves and set up click/input handlers to collect
 data. They can then post back to `/json/submessage`
@@ -105,10 +105,10 @@ is given a parent `elem` when its `activate` function
 is called. This is just a `<div>` inside of the parent
 message in the message pane. The widget has access to
 jQuery and template.render, and the developer can create
-new templates in `static/templates/widgets/`.
+new templates in `web/templates/widgets/`.
 
 A good way to learn the system is to read the code
-in `static/js/poll_widget.js`. It is worth noting that
+in `web/src/poll_widget.js`. It is worth noting that
 writing a new widget requires only minor backend
 changes in the current architecture. This could change
 in the future, but for now, a frontend developer mostly
@@ -299,7 +299,7 @@ When the message gets to the client, the codepath for **zform**
 is actually quite similar to what happens with a more
 customized widget like **poll**. (In fact, **zform** is a
 sibling of **poll** and **zform** just has a somewhat more
-generic job to do.) In `static/js/widgetize.js` you will see
+generic job to do.) In `web/src/widgetize.ts` you will see
 where this code converges, with snippets like this:
 
 ```js
@@ -308,11 +308,11 @@ widgets.todo = todo_widget;
 widgets.zform = zform;
 ```
 
-The code in `static/js/zform.js` renders the form (not
+The code in `web/src/zform.js` renders the form (not
 shown here) and then sets up a click handler like below:
 
 ```js
-    elem.find('button').on('click', function (e) {
+    $elem.find('button').on('click', function (e) {
         e.stopPropagation();
 
         // Grab our index from the markup.

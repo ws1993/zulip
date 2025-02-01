@@ -1,22 +1,33 @@
+# Zulip Sonarr integration
+
 Receive Sonarr notifications in Zulip!
 
-1.  {!create-stream.md!}
+{start_tabs}
 
-1.  {!create-bot-construct-url-indented.md!}
+1. {!create-an-incoming-webhook.md!}
 
-1.  Go to your Sonarr dashboard. Click **Settings** and click **Connect**.
-    Click the **+** icon.
+1. {!generate-webhook-url-basic.md!}
 
-1.  Select **Webhook** and set the name of the webhook to any name of your
-    choice (e.g **Zulip**). Select the scenarios you would like to receive
-    notifications for. You may also enter tags if you would like to be
-    notified about series with specific tags.
+1. Go to your Sonarr dashboard. Open **Settings**, and select **Connect**.
+    Click the plus (**+**) icon.
 
-1.  Set **URL** to the **URL** constructed above. Set **Method** to **POST**
-    and leave the **Username** and **Password** fields blank.
+1. Select **Webhook**, and set the name of the webhook to any name of your
+   choice, such as `Zulip`. Select the scenarios you would like to receive
+   notifications for. You may also enter tags if you would like to be
+   notified about series with specific tags.
 
-1.  Click **Save** and you should receive a test message.
+1. Set **URL** to the URL generated above, and set **Method** to **POST**.
+   Leave the **Username** and **Password** fields blank. Click **Save**,
+   which will send a test message to Zulip.
+
+{end_tabs}
 
 {!congrats.md!}
 
 ![](/static/images/integrations/sonarr/001.png)
+
+{!event-filtering-additional-feature.md!}
+
+### Related documentation
+
+{!webhooks-url-specification.md!}

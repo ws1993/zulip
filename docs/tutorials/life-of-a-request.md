@@ -7,23 +7,22 @@ Zulip codebase, and dive deep into how each part works.
 We will use as our example the creation of users through the API, but we
 will also highlight how alternative requests are handled.
 
-## A request is sent to the server, and handled by [Nginx](https://nginx.org/en/docs/)
+## A request is sent to the server, and handled by [nginx](https://nginx.org/en/docs/)
 
 When Zulip is deployed in production, all requests go through nginx.
 For the most part we don't need to know how this works, except for when
-it isn't working. Nginx does the first level of routing--deciding which
+it isn't working. nginx does the first level of routing--deciding which
 application will serve the request (or deciding to serve the request
 itself for static content).
 
-In development, `tools/run-dev.py` fills the role of nginx. Static files
+In development, `tools/run-dev` fills the role of nginx. Static files
 are in your Git checkout under `static`, and are served unminified.
 
-## Static files are [served directly][served-directly] by Nginx
+## Static files are [served directly][served-directly] by nginx
 
 [served-directly]: https://github.com/zulip/zulip/blob/main/puppet/zulip/files/nginx/zulip-include-frontend/app
 
-Static files include JavaScript, css, static assets (like emoji, avatars),
-and user uploads (if stored locally and not on S3).
+Static files include JavaScript, CSS, and static assets (like emoji, avatars).
 
 File not found errors (404) are served using a Django URL, so that we
 can use configuration variables (like whether the user is logged in)
@@ -37,9 +36,9 @@ location /static/ {
 }
 ```
 
-## Nginx routes other requests [between Django and Tornado][tornado-django]
+## nginx routes other requests [between Django and Tornado][tornado-django]
 
-[tornado-django]: ../overview/architecture-overview.html?highlight=tornado#django-and-tornado
+[tornado-django]: ../overview/architecture-overview.md#django-and-tornado
 
 All our connected clients hold open long-polling connections so that
 they can receive events (messages, presence notifications, and so on) in
@@ -55,15 +54,15 @@ application.
 ## Django routes the request to a view in urls.py files
 
 There are various
-[urls.py](https://docs.djangoproject.com/en/3.2/topics/http/urls/)
+[urls.py](https://docs.djangoproject.com/en/5.0/topics/http/urls/)
 files throughout the server codebase, which are covered in more detail
 in
 [the directory structure doc](../overview/directory-structure.md).
 
 The main Zulip Django app is `zerver`. The routes are found in
-`zproject/urls.py` and `zproject/legacy_urls.py`.
+`zproject/urls.py`.
 
-There are HTML-serving, REST API, legacy, and webhook url patterns. We
+There are HTML-serving, REST API, and webhook url patterns. We
 will look at how each of these types of requests are handled, and focus
 on how the REST API handles our user creation example.
 
@@ -86,7 +85,7 @@ Note the `zh-hans` prefix--that url pattern gets added by `i18n_patterns`.
 Our example is a REST API endpoint. It's a PUT to `/users`.
 
 With the exception of incoming webhooks (which we do not usually control the
-format of), legacy endpoints, and logged-out endpoints, Zulip uses REST
+format of) and logged-out endpoints, Zulip uses REST
 for its API. This means that we use:
 
 - POST for creating something new where we don't have a unique
@@ -133,25 +132,17 @@ The OPTIONS method will yield the allowed methods.
 This request:
 `OPTIONS https://chat.zulip.org/api/v1/users`
 yields a response with this HTTP header:
-`Allow: PUT, GET`
+`Allow: GET, HEAD, POST`
 
 We can see this reflected in [zproject/urls.py](https://github.com/zulip/zulip/blob/main/zproject/urls.py):
 
 ```python
 rest_path('users',
           GET=get_members_backend,
-          PUT=create_user_backend),
+          POST=create_user_backend),
 ```
 
 In this way, the API is partially self-documenting.
-
-### Legacy endpoints are used by the web client
-
-The endpoints from the legacy JSON API are written without REST in
-mind. They are used extensively by the web client, and use POST.
-
-You can see them in
-[zproject/legacy_urls.py](https://github.com/zulip/zulip/blob/main/zproject/legacy_urls.py).
 
 ### Incoming webhook integrations may not be RESTful
 
@@ -180,7 +171,7 @@ PUT=create_user_backend
 ```
 
 are supplied as arguments to `rest_path`, along with the
-[HTTPRequest](https://docs.djangoproject.com/en/3.2/ref/request-response/).
+[HTTPRequest](https://docs.djangoproject.com/en/5.0/ref/request-response/).
 The request has the HTTP verb `PUT`, which `rest_dispatch` can use to
 find the correct view to show:
 `zerver.views.users.create_user_backend`.
@@ -198,13 +189,22 @@ Our API works on JSON requests and responses. Every API endpoint should
 {"result": "error", "msg": "<some error message>", "code": "BAD_REQUEST"}
 ```
 
-in a
-[HTTP response](https://docs.djangoproject.com/en/3.2/ref/request-response/)
-with a content type of 'application/json'.
+in a [Django HttpResponse
+object](https://docs.djangoproject.com/en/5.0/ref/request-response/)
+with a `Content-Type` of 'application/json'.
 
 To pass back data from the server to the calling client, in the event of
-a successfully handled request, we use
-`json_success(data=<some python object which can be converted to a JSON string>)`.
+a successfully handled request, we use `json_success(request, data)`.
+
+The `request` argument is a [Django HttpRequest
+object](https://docs.djangoproject.com/en/5.0/ref/request-response/).
+The `data` argument is a Python object which can be converted to a JSON
+string and has a default value of an empty Python dictionary.
+
+Zulip stores additional metadata it has associated with that HTTP
+request in a `RequestNotes` object, which is primarily accessed in
+common code used in all requests (middleware, logging, rate limiting,
+etc.).
 
 This will result in a JSON string:
 
@@ -212,6 +212,6 @@ This will result in a JSON string:
 {"result": "success", "msg": "", "data": {"var_name1": "var_value1", "var_name2": "var_value2"}}
 ```
 
-with a HTTP 200 status and a content type of 'application/json'.
+with an HTTP 200 status and a `Content-Type` of 'application/json'.
 
 That's it!

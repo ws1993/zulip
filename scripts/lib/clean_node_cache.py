@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
+
+# TODO: After switching from yarn to pnpm, we no longer create
+# /srv/zulip-npm-cache or symlink node_modules, so this script can be
+# replaced with shutil.rmtree("/srv/zulip-npm-cache").
+
 import argparse
 import os
 import sys
-from typing import Set
 
 ZULIP_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(ZULIP_PATH)
@@ -17,7 +21,7 @@ ENV = get_environment()
 NODE_MODULES_CACHE_PATH = "/srv/zulip-npm-cache"
 
 
-def get_caches_in_use(threshold_days: int) -> Set[str]:
+def get_caches_in_use(threshold_days: int) -> set[str]:
     setups_to_check = {ZULIP_PATH}
     caches_in_use = set()
 

@@ -1,45 +1,75 @@
-import datetime
+import json
+import os
+import random
 import re
-from typing import Any, Dict, List, Mapping, Union
-from unittest import mock
+import string
+from datetime import datetime, timedelta
+from typing import Any
+from unittest import mock, skipUnless
 
 import orjson
+import time_machine
 from django.conf import settings
+from django.core import mail
+from django.test import override_settings
 from django.utils.timezone import now as timezone_now
+from typing_extensions import override
 
 from confirmation.models import Confirmation, create_confirmation_link
-from zerver.lib.actions import (
+from zerver.actions.create_realm import do_change_realm_subdomain, do_create_realm
+from zerver.actions.create_user import do_create_user
+from zerver.actions.message_send import (
+    internal_send_group_direct_message,
+    internal_send_private_message,
+    internal_send_stream_message,
+)
+from zerver.actions.realm_settings import (
+    clean_deactivated_realm_data,
     do_add_deactivated_redirect,
+    do_change_realm_max_invites,
     do_change_realm_org_type,
+    do_change_realm_permission_group_setting,
     do_change_realm_plan_type,
-    do_change_realm_subdomain,
-    do_create_realm,
     do_deactivate_realm,
-    do_deactivate_stream,
+    do_delete_all_realm_attachments,
+    do_reactivate_realm,
     do_scrub_realm,
     do_send_realm_reactivation_email,
+    do_set_realm_authentication_methods,
     do_set_realm_property,
     do_set_realm_user_default_setting,
 )
+from zerver.actions.streams import do_deactivate_stream, merge_streams
+from zerver.actions.user_groups import check_add_user_group
 from zerver.lib.realm_description import get_realm_rendered_description, get_realm_text_description
 from zerver.lib.send_email import send_future_email
 from zerver.lib.streams import create_stream_if_needed
 from zerver.lib.test_classes import ZulipTestCase
+from zerver.lib.test_helpers import activate_push_notification_service
+from zerver.lib.upload import delete_message_attachments, upload_message_attachment
 from zerver.models import (
     Attachment,
     CustomProfileField,
     Message,
+    NamedUserGroup,
     Realm,
     RealmAuditLog,
+    RealmReactivationStatus,
     RealmUserDefault,
     ScheduledEmail,
     Stream,
+    UserGroupMembership,
     UserMessage,
     UserProfile,
-    get_realm,
-    get_stream,
-    get_user_profile_by_id,
 )
+from zerver.models.groups import SystemGroups
+from zerver.models.realm_audit_logs import AuditLogEventType
+from zerver.models.realms import get_realm
+from zerver.models.streams import get_stream
+from zerver.models.users import get_system_bot, get_user_profile_by_id
+
+if settings.ZILENCER_ENABLED:
+    from corporate.lib.stripe import get_seat_count
 
 
 class RealmTest(ZulipTestCase):
@@ -49,10 +79,13 @@ class RealmTest(ZulipTestCase):
         self.assertEqual(user_profile.realm.name, new_realm_name)
 
     def test_realm_creation_ensures_internal_realms(self) -> None:
-        with mock.patch("zerver.lib.actions.server_initialized", return_value=False):
-            with mock.patch(
-                "zerver.lib.actions.create_internal_realm"
-            ) as mock_create_internal, self.assertLogs(level="INFO") as info_logs:
+        with mock.patch("zerver.actions.create_realm.server_initialized", return_value=False):
+            with (
+                mock.patch(
+                    "zerver.actions.create_realm.create_internal_realm"
+                ) as mock_create_internal,
+                self.assertLogs(level="INFO") as info_logs,
+            ):
                 do_create_realm("testrealm", "Test Realm")
                 mock_create_internal.assert_called_once()
             self.assertEqual(
@@ -60,10 +93,15 @@ class RealmTest(ZulipTestCase):
                 ["INFO:root:Server not yet initialized. Creating the internal realm first."],
             )
 
-    def test_realm_creation_on_social_auth_subdomain_disallowed(self) -> None:
-        with self.settings(SOCIAL_AUTH_SUBDOMAIN="zulipauth"):
-            with self.assertRaises(AssertionError):
-                do_create_realm("zulipauth", "Test Realm")
+    def test_realm_creation_on_special_subdomains_disallowed(self) -> None:
+        with self.settings(SOCIAL_AUTH_SUBDOMAIN="zulipauth"), self.assertRaises(AssertionError):
+            do_create_realm("zulipauth", "Test Realm")
+
+        with (
+            self.settings(SELF_HOSTING_MANAGEMENT_SUBDOMAIN="zulipselfhosting"),
+            self.assertRaises(AssertionError),
+        ):
+            do_create_realm("zulipselfhosting", "Test Realm")
 
     def test_permission_for_education_non_profit_organization(self) -> None:
         realm = do_create_realm(
@@ -72,12 +110,19 @@ class RealmTest(ZulipTestCase):
             org_type=Realm.ORG_TYPES["education_nonprofit"]["id"],
         )
 
-        self.assertEqual(realm.create_public_stream_policy, Realm.POLICY_ADMINS_ONLY)
-        self.assertEqual(realm.create_private_stream_policy, Realm.POLICY_MEMBERS_ONLY)
-        self.assertEqual(realm.invite_to_realm_policy, Realm.POLICY_ADMINS_ONLY)
-        self.assertEqual(realm.move_messages_between_streams_policy, Realm.POLICY_MODERATORS_ONLY)
-        self.assertEqual(realm.user_group_edit_policy, Realm.POLICY_MODERATORS_ONLY)
-        self.assertEqual(realm.invite_to_stream_policy, Realm.POLICY_MODERATORS_ONLY)
+        admins_group = NamedUserGroup.objects.get(
+            name=SystemGroups.ADMINISTRATORS, realm=realm, is_system_group=True
+        )
+        self.assertEqual(realm.can_create_public_channel_group_id, admins_group.id)
+
+        realm = get_realm("test_education_non_profit")
+        moderators_group = NamedUserGroup.objects.get(
+            name=SystemGroups.MODERATORS, realm=realm, is_system_group=True
+        )
+        self.assertEqual(realm.can_add_subscribers_group.id, moderators_group.id)
+        self.assertEqual(realm.can_create_groups.id, moderators_group.id)
+        self.assertEqual(realm.can_invite_users_group.id, admins_group.id)
+        self.assertEqual(realm.can_move_messages_between_channels_group.id, moderators_group.id)
 
     def test_permission_for_education_for_profit_organization(self) -> None:
         realm = do_create_realm(
@@ -86,19 +131,42 @@ class RealmTest(ZulipTestCase):
             org_type=Realm.ORG_TYPES["education"]["id"],
         )
 
-        self.assertEqual(realm.create_public_stream_policy, Realm.POLICY_ADMINS_ONLY)
-        self.assertEqual(realm.create_private_stream_policy, Realm.POLICY_MEMBERS_ONLY)
-        self.assertEqual(realm.invite_to_realm_policy, Realm.POLICY_ADMINS_ONLY)
-        self.assertEqual(realm.move_messages_between_streams_policy, Realm.POLICY_MODERATORS_ONLY)
-        self.assertEqual(realm.user_group_edit_policy, Realm.POLICY_MODERATORS_ONLY)
-        self.assertEqual(realm.invite_to_stream_policy, Realm.POLICY_MODERATORS_ONLY)
+        admins_group = NamedUserGroup.objects.get(
+            name=SystemGroups.ADMINISTRATORS, realm=realm, is_system_group=True
+        )
+        self.assertEqual(realm.can_create_public_channel_group_id, admins_group.id)
+
+        realm = get_realm("test_education_for_profit")
+        moderators_group = NamedUserGroup.objects.get(
+            name=SystemGroups.MODERATORS, realm=realm, is_system_group=True
+        )
+        self.assertEqual(realm.can_add_subscribers_group.id, moderators_group.id)
+        self.assertEqual(realm.can_create_groups.id, moderators_group.id)
+        self.assertEqual(realm.can_invite_users_group.id, admins_group.id)
+        self.assertEqual(realm.can_move_messages_between_channels_group.id, moderators_group.id)
 
     def test_realm_enable_spectator_access(self) -> None:
-        realm = do_create_realm("test_web_public_true", "Foo", enable_spectator_access=True)
+        realm = do_create_realm(
+            "test_web_public_true",
+            "Foo",
+            plan_type=Realm.PLAN_TYPE_STANDARD,
+            enable_spectator_access=True,
+        )
         self.assertEqual(realm.enable_spectator_access, True)
 
         realm = do_create_realm("test_web_public_false", "Boo", enable_spectator_access=False)
         self.assertEqual(realm.enable_spectator_access, False)
+
+        with self.assertRaises(AssertionError):
+            realm = do_create_realm("test_web_public_false_1", "Foo", enable_spectator_access=True)
+
+        with self.assertRaises(AssertionError):
+            realm = do_create_realm(
+                "test_web_public_false_2",
+                "Foo",
+                plan_type=Realm.PLAN_TYPE_LIMITED,
+                enable_spectator_access=True,
+            )
 
     def test_do_set_realm_name_caching(self) -> None:
         """The main complicated thing about setting realm names is fighting the
@@ -113,8 +181,7 @@ class RealmTest(ZulipTestCase):
     def test_update_realm_name_events(self) -> None:
         realm = get_realm("zulip")
         new_name = "Puliz"
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             do_set_realm_property(realm, "name", new_name, acting_user=None)
         event = events[0]["event"]
         self.assertEqual(
@@ -130,8 +197,7 @@ class RealmTest(ZulipTestCase):
     def test_update_realm_description_events(self) -> None:
         realm = get_realm("zulip")
         new_description = "zulip dev group"
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             do_set_realm_property(realm, "description", new_description, acting_user=None)
         event = events[0]["event"]
         self.assertEqual(
@@ -148,8 +214,7 @@ class RealmTest(ZulipTestCase):
         self.login("iago")
         new_description = "zulip dev group"
         data = dict(description=new_description)
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.client_patch("/json/realm", data)
             self.assert_json_success(result)
             realm = get_realm("zulip")
@@ -192,12 +257,10 @@ class RealmTest(ZulipTestCase):
         data = dict(string_id="lear")
         self.login("desdemona")
         realm = get_realm("zulip")
-        realm.demo_organization_scheduled_deletion_date = timezone_now() + datetime.timedelta(
-            days=30
-        )
+        realm.demo_organization_scheduled_deletion_date = timezone_now() + timedelta(days=30)
         realm.save()
         result = self.client_patch("/json/realm", data)
-        self.assert_json_error(result, "Subdomain unavailable. Please choose a different one.")
+        self.assert_json_error(result, "Subdomain already in use. Please choose a different one.")
 
         # Now try to change the string_id to something available.
         data = dict(string_id="coolrealm")
@@ -205,6 +268,7 @@ class RealmTest(ZulipTestCase):
         self.assert_json_success(result)
         json = orjson.loads(result.content)
         self.assertEqual(json["realm_uri"], "http://coolrealm.testserver")
+        self.assertEqual(json["realm_url"], "http://coolrealm.testserver")
         realm = get_realm("coolrealm")
         self.assertIsNone(realm.demo_organization_scheduled_deletion_date)
         self.assertEqual(realm.string_id, data["string_id"])
@@ -256,7 +320,9 @@ class RealmTest(ZulipTestCase):
         hamlet_id = self.example_user("hamlet").id
         get_user_profile_by_id(hamlet_id)
         realm = get_realm("zulip")
-        do_deactivate_realm(realm, acting_user=None)
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
         user = get_user_profile_by_id(hamlet_id)
         self.assertTrue(user.realm.deactivated)
 
@@ -284,26 +350,28 @@ class RealmTest(ZulipTestCase):
 
         placeholder_realm = get_realm("zulip")
         self.assertTrue(placeholder_realm.deactivated)
-        self.assertEqual(placeholder_realm.deactivated_redirect, user.realm.uri)
+        self.assertEqual(placeholder_realm.deactivated_redirect, user.realm.url)
 
         realm_audit_log = RealmAuditLog.objects.filter(
-            event_type=RealmAuditLog.REALM_SUBDOMAIN_CHANGED, acting_user=iago
+            event_type=AuditLogEventType.REALM_SUBDOMAIN_CHANGED, acting_user=iago
         ).last()
         assert realm_audit_log is not None
         expected_extra_data = {"old_subdomain": "zulip", "new_subdomain": "newzulip"}
-        self.assertEqual(realm_audit_log.extra_data, str(expected_extra_data))
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
         self.assertEqual(realm_audit_log.acting_user, iago)
 
     def test_do_deactivate_realm_clears_scheduled_jobs(self) -> None:
         user = self.example_user("hamlet")
         send_future_email(
-            "zerver/emails/followup_day1",
+            "zerver/emails/onboarding_zulip_topics",
             user.realm,
             to_user_ids=[user.id],
-            delay=datetime.timedelta(hours=1),
+            delay=timedelta(hours=1),
         )
         self.assertEqual(ScheduledEmail.objects.count(), 1)
-        do_deactivate_realm(user.realm, acting_user=None)
+        do_deactivate_realm(
+            user.realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
         self.assertEqual(ScheduledEmail.objects.count(), 0)
 
     def test_do_change_realm_description_clears_cached_descriptions(self) -> None:
@@ -327,10 +395,14 @@ class RealmTest(ZulipTestCase):
         realm = get_realm("zulip")
         self.assertFalse(realm.deactivated)
 
-        do_deactivate_realm(realm, acting_user=None)
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
         self.assertTrue(realm.deactivated)
 
-        do_deactivate_realm(realm, acting_user=None)
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
         self.assertTrue(realm.deactivated)
 
     def test_do_set_deactivated_redirect_on_deactivated_realm(self) -> None:
@@ -338,7 +410,9 @@ class RealmTest(ZulipTestCase):
         realm = get_realm("zulip")
 
         redirect_url = "new_server.zulip.com"
-        do_deactivate_realm(realm, acting_user=None)
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
         self.assertTrue(realm.deactivated)
         do_add_deactivated_redirect(realm, redirect_url)
         self.assertEqual(realm.deactivated_redirect, redirect_url)
@@ -348,11 +422,52 @@ class RealmTest(ZulipTestCase):
         self.assertEqual(realm.deactivated_redirect, new_redirect_url)
         self.assertNotEqual(realm.deactivated_redirect, redirect_url)
 
+    def test_do_reactivate_realm(self) -> None:
+        realm = get_realm("zulip")
+        do_deactivate_realm(
+            realm,
+            acting_user=None,
+            deactivation_reason="owner_request",
+            email_owners=False,
+            deletion_delay_days=15,
+        )
+        self.assertTrue(realm.deactivated)
+
+        do_reactivate_realm(realm)
+        self.assertFalse(realm.deactivated)
+        self.assertEqual(realm.scheduled_deletion_date, None)
+
+        log_entry = RealmAuditLog.objects.last()
+        assert log_entry is not None
+
+        self.assertEqual(log_entry.realm, realm)
+        self.assertEqual(log_entry.event_type, AuditLogEventType.REALM_REACTIVATED)
+        log_entry_id = log_entry.id
+
+        with self.assertLogs(level="WARNING") as m:
+            # do_reactivate_realm on a realm that's not deactivated should be a noop.
+            do_reactivate_realm(realm)
+
+        self.assertEqual(
+            m.output,
+            [f"WARNING:root:Realm {realm.id} cannot be reactivated because it is already active."],
+        )
+
+        self.assertFalse(realm.deactivated)
+
+        latest_log_entry = RealmAuditLog.objects.last()
+        assert latest_log_entry is not None
+        self.assertEqual(latest_log_entry.id, log_entry_id)
+
     def test_realm_reactivation_link(self) -> None:
         realm = get_realm("zulip")
-        do_deactivate_realm(realm, acting_user=None)
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
         self.assertTrue(realm.deactivated)
-        confirmation_url = create_confirmation_link(realm, Confirmation.REALM_REACTIVATION)
+
+        obj = RealmReactivationStatus.objects.create(realm=realm)
+        confirmation_url = create_confirmation_link(obj, Confirmation.REALM_REACTIVATION)
         response = self.client_get(confirmation_url)
         self.assert_in_success_response(
             ["Your organization has been successfully reactivated"], response
@@ -360,30 +475,133 @@ class RealmTest(ZulipTestCase):
         realm = get_realm("zulip")
         self.assertFalse(realm.deactivated)
 
+        # Make sure the link can't be reused.
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
+        response = self.client_get(confirmation_url)
+        self.assertEqual(response.status_code, 404)
+
     def test_realm_reactivation_confirmation_object(self) -> None:
         realm = get_realm("zulip")
-        do_deactivate_realm(realm, acting_user=None)
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
         self.assertTrue(realm.deactivated)
-        create_confirmation_link(realm, Confirmation.REALM_REACTIVATION)
+        obj = RealmReactivationStatus.objects.create(realm=realm)
+        create_confirmation_link(obj, Confirmation.REALM_REACTIVATION)
         confirmation = Confirmation.objects.last()
         assert confirmation is not None
-        self.assertEqual(confirmation.content_object, realm)
+        self.assertEqual(confirmation.content_object, obj)
         self.assertEqual(confirmation.realm, realm)
+
+    def test_do_send_realm_deactivation_email_no_acting_user(self) -> None:
+        realm = get_realm("zulip")
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=True
+        )
+        self.assertEqual(realm.deactivated, True)
+        self.assert_length(mail.outbox, 1)
+        self.assertIn(
+            "Your Zulip organization Zulip Dev has been deactivated", mail.outbox[0].subject
+        )
+        self.assertIn("Your Zulip organization, Zulip Dev, was deactivated on", mail.outbox[0].body)
+
+    def test_do_send_realm_deactivation_email_by_support(self) -> None:
+        realm = get_realm("lear")
+        king = self.lear_user("king")
+        king.role = UserProfile.ROLE_REALM_OWNER
+        king.save()
+        iago = self.example_user("iago")
+        do_deactivate_realm(
+            realm, acting_user=iago, deactivation_reason="owner_request", email_owners=True
+        )
+        self.assertEqual(realm.deactivated, True)
+        self.assert_length(mail.outbox, 1)
+        self.assertIn(
+            "Your Zulip organization Lear & Co. has been deactivated", mail.outbox[0].subject
+        )
+        self.assertIn(
+            "Your Zulip organization, Lear & Co., was deactivated on",
+            mail.outbox[0].body,
+        )
+
+    def test_do_send_realm_deactivation_email_by_owner(self) -> None:
+        realm = get_realm("zulip")
+        iago = self.example_user("iago")
+        iago.role = UserProfile.ROLE_REALM_OWNER
+        iago.save(update_fields=["role"])
+        do_deactivate_realm(
+            realm,
+            acting_user=iago,
+            deactivation_reason="owner_request",
+            deletion_delay_days=14,
+            email_owners=True,
+        )
+        self.assertEqual(realm.deactivated, True)
+        self.assert_length(mail.outbox, 2)
+        for email in mail.outbox:
+            if email.to[0] == "iago@zulip.com":
+                self.assertIn(
+                    "Your Zulip organization Zulip Dev has been deactivated", email.subject
+                )
+                self.assertIn(
+                    "You have deactivated your Zulip organization, Zulip Dev, on", email.body
+                )
+            else:
+                self.assertIn(
+                    "Your Zulip organization Zulip Dev has been deactivated", email.subject
+                )
+                self.assertIn(
+                    "Your Zulip organization, Zulip Dev, was deactivated by Iago on", email.body
+                )
+            self.assertIn(
+                "All data associated with this organization will be permanently deleted on",
+                email.body,
+            )
+
+    def test_do_send_realm_deactivation_email_with_immediate_data_deletion(self) -> None:
+        realm = get_realm("zulip")
+        desdemona = self.example_user("desdemona")
+        with (
+            mock.patch("zerver.actions.realm_settings.do_scrub_realm") as mock_scrub_realm,
+            self.assertLogs(level="INFO"),
+        ):
+            do_deactivate_realm(
+                realm,
+                acting_user=desdemona,
+                deactivation_reason="owner_request",
+                deletion_delay_days=0,
+                email_owners=True,
+            )
+            self.assertEqual(realm.deactivated, True)
+            mock_scrub_realm.assert_called_once_with(realm, acting_user=None)
+            self.assert_length(mail.outbox, 1)
+            email = mail.outbox[0]
+            self.assertIn("Your Zulip organization Zulip Dev has been deactivated", email.subject)
+            self.assertIn("You have deactivated your Zulip organization, Zulip Dev, on", email.body)
+            self.assertIn(
+                "All data associated with this organization has been permanently deleted.",
+                email.body,
+            )
 
     def test_do_send_realm_reactivation_email(self) -> None:
         realm = get_realm("zulip")
+        do_deactivate_realm(
+            realm, acting_user=None, deactivation_reason="owner_request", email_owners=False
+        )
+        self.assertEqual(realm.deactivated, True)
         iago = self.example_user("iago")
         do_send_realm_reactivation_email(realm, acting_user=iago)
-        from django.core.mail import outbox
 
-        self.assert_length(outbox, 1)
-        self.assertEqual(self.email_envelope_from(outbox[0]), settings.NOREPLY_EMAIL_ADDRESS)
+        self.assert_length(mail.outbox, 1)
+        self.assertEqual(self.email_envelope_from(mail.outbox[0]), settings.NOREPLY_EMAIL_ADDRESS)
         self.assertRegex(
-            self.email_display_from(outbox[0]),
-            fr"^Zulip Account Security <{self.TOKENIZED_NOREPLY_REGEX}>\Z",
+            self.email_display_from(mail.outbox[0]),
+            rf"^testserver account security <{self.TOKENIZED_NOREPLY_REGEX}>\Z",
         )
-        self.assertIn("Reactivate your Zulip organization", outbox[0].subject)
-        self.assertIn("Dear former administrators", outbox[0].body)
+        self.assertIn("Reactivate your Zulip organization", mail.outbox[0].subject)
+        self.assertIn("Dear former administrators", mail.outbox[0].body)
         admins = realm.get_human_admin_users()
         confirmation_url = self.get_confirmation_url_from_outbox(admins[0].delivery_email)
         response = self.client_get(confirmation_url)
@@ -394,7 +612,7 @@ class RealmTest(ZulipTestCase):
         self.assertFalse(realm.deactivated)
         self.assertEqual(
             RealmAuditLog.objects.filter(
-                event_type=RealmAuditLog.REALM_REACTIVATION_EMAIL_SENT, acting_user=iago
+                event_type=AuditLogEventType.REALM_REACTIVATION_EMAIL_SENT, acting_user=iago
             ).count(),
             1,
         )
@@ -402,98 +620,292 @@ class RealmTest(ZulipTestCase):
     def test_realm_reactivation_with_random_link(self) -> None:
         random_link = "/reactivate/5e89081eb13984e0f3b130bf7a4121d153f1614b"
         response = self.client_get(random_link)
-        self.assert_in_success_response(
-            ["The organization reactivation link has expired or is not valid."], response
+        self.assertEqual(response.status_code, 404)
+        self.assert_in_response(
+            "The organization reactivation link has expired or is not valid.", response
         )
 
-    def test_change_notifications_stream(self) -> None:
+    def test_change_new_stream_announcements_stream(self) -> None:
         # We need an admin user.
         self.login("iago")
 
         disabled_notif_stream_id = -1
-        req = dict(notifications_stream_id=orjson.dumps(disabled_notif_stream_id).decode())
+        req = dict(
+            new_stream_announcements_stream_id=orjson.dumps(disabled_notif_stream_id).decode()
+        )
         result = self.client_patch("/json/realm", req)
         self.assert_json_success(result)
         realm = get_realm("zulip")
-        self.assertEqual(realm.notifications_stream, None)
+        self.assertEqual(realm.new_stream_announcements_stream, None)
 
         new_notif_stream_id = Stream.objects.get(name="Denmark").id
-        req = dict(notifications_stream_id=orjson.dumps(new_notif_stream_id).decode())
+        req = dict(new_stream_announcements_stream_id=orjson.dumps(new_notif_stream_id).decode())
         result = self.client_patch("/json/realm", req)
         self.assert_json_success(result)
         realm = get_realm("zulip")
-        assert realm.notifications_stream is not None
-        self.assertEqual(realm.notifications_stream.id, new_notif_stream_id)
+        assert realm.new_stream_announcements_stream is not None
+        self.assertEqual(realm.new_stream_announcements_stream.id, new_notif_stream_id)
+
+        # Test that admin can set the setting to an unsubscribed private stream as well.
+        new_notif_stream_id = self.make_stream("private_stream", invite_only=True).id
+        req = dict(new_stream_announcements_stream_id=orjson.dumps(new_notif_stream_id).decode())
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        assert realm.new_stream_announcements_stream is not None
+        self.assertEqual(realm.new_stream_announcements_stream.id, new_notif_stream_id)
 
         invalid_notif_stream_id = 1234
-        req = dict(notifications_stream_id=orjson.dumps(invalid_notif_stream_id).decode())
+        req = dict(
+            new_stream_announcements_stream_id=orjson.dumps(invalid_notif_stream_id).decode()
+        )
         result = self.client_patch("/json/realm", req)
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid channel ID")
         realm = get_realm("zulip")
-        assert realm.notifications_stream is not None
-        self.assertNotEqual(realm.notifications_stream.id, invalid_notif_stream_id)
+        assert realm.new_stream_announcements_stream is not None
+        self.assertNotEqual(realm.new_stream_announcements_stream.id, invalid_notif_stream_id)
 
-    def test_get_default_notifications_stream(self) -> None:
+    def test_get_default_new_stream_announcements_stream(self) -> None:
         realm = get_realm("zulip")
         verona = get_stream("verona", realm)
 
-        notifications_stream = realm.get_notifications_stream()
-        assert notifications_stream is not None
-        self.assertEqual(notifications_stream.id, verona.id)
-        do_deactivate_stream(notifications_stream, acting_user=None)
-        self.assertIsNone(realm.get_notifications_stream())
+        new_stream_announcements_stream = realm.get_new_stream_announcements_stream()
+        assert new_stream_announcements_stream is not None
+        self.assertEqual(new_stream_announcements_stream.id, verona.id)
+        do_deactivate_stream(new_stream_announcements_stream, acting_user=None)
+        self.assertIsNone(realm.get_new_stream_announcements_stream())
 
-    def test_change_signup_notifications_stream(self) -> None:
+    def test_merge_streams(self) -> None:
+        realm = get_realm("zulip")
+        denmark = get_stream("Denmark", realm)
+        cordelia = self.example_user("cordelia")
+        new_stream_announcements_stream = realm.get_new_stream_announcements_stream()
+        assert new_stream_announcements_stream is not None
+        new_stream_announcements_stream_messages_count = Message.objects.filter(
+            realm_id=realm.id, recipient=new_stream_announcements_stream.recipient
+        ).count()
+
+        create_stream_if_needed(realm, "Atlantis")
+        self.subscribe(cordelia, "Atlantis")
+        self.send_stream_message(cordelia, "Atlantis")
+        atlantis = get_stream("Atlantis", realm)
+
+        stats = merge_streams(realm, denmark, denmark)
+        self.assertEqual(stats, (0, 0, 0))
+
+        stats = merge_streams(realm, denmark, atlantis)
+        self.assertEqual(stats, (1, 1, 1))
+
+        self.assertEqual(get_stream("Atlantis", realm).deactivated, True)
+
+        stats = merge_streams(realm, denmark, new_stream_announcements_stream)
+        self.assertEqual(stats, (2, new_stream_announcements_stream_messages_count, 10))
+        self.assertIsNone(realm.get_new_stream_announcements_stream())
+
+    def test_change_signup_announcements_stream(self) -> None:
         # We need an admin user.
         self.login("iago")
 
-        disabled_signup_notifications_stream_id = -1
+        disabled_signup_announcements_stream_id = -1
         req = dict(
-            signup_notifications_stream_id=orjson.dumps(
-                disabled_signup_notifications_stream_id
+            signup_announcements_stream_id=orjson.dumps(
+                disabled_signup_announcements_stream_id
             ).decode()
         )
         result = self.client_patch("/json/realm", req)
         self.assert_json_success(result)
         realm = get_realm("zulip")
-        self.assertEqual(realm.signup_notifications_stream, None)
+        self.assertEqual(realm.signup_announcements_stream, None)
 
-        new_signup_notifications_stream_id = Stream.objects.get(name="Denmark").id
+        new_signup_announcements_stream_id = Stream.objects.get(name="Denmark").id
         req = dict(
-            signup_notifications_stream_id=orjson.dumps(new_signup_notifications_stream_id).decode()
+            signup_announcements_stream_id=orjson.dumps(new_signup_announcements_stream_id).decode()
         )
 
         result = self.client_patch("/json/realm", req)
         self.assert_json_success(result)
         realm = get_realm("zulip")
-        assert realm.signup_notifications_stream is not None
-        self.assertEqual(realm.signup_notifications_stream.id, new_signup_notifications_stream_id)
+        assert realm.signup_announcements_stream is not None
+        self.assertEqual(realm.signup_announcements_stream.id, new_signup_announcements_stream_id)
 
-        invalid_signup_notifications_stream_id = 1234
+        # Test that admin can set the setting to an unsubscribed private stream as well.
+        new_signup_announcements_stream_id = self.make_stream("private_stream", invite_only=True).id
         req = dict(
-            signup_notifications_stream_id=orjson.dumps(
-                invalid_signup_notifications_stream_id
+            signup_announcements_stream_id=orjson.dumps(new_signup_announcements_stream_id).decode()
+        )
+
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        assert realm.signup_announcements_stream is not None
+        self.assertEqual(realm.signup_announcements_stream.id, new_signup_announcements_stream_id)
+
+        invalid_signup_announcements_stream_id = 1234
+        req = dict(
+            signup_announcements_stream_id=orjson.dumps(
+                invalid_signup_announcements_stream_id
             ).decode()
         )
         result = self.client_patch("/json/realm", req)
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid channel ID")
         realm = get_realm("zulip")
-        assert realm.signup_notifications_stream is not None
+        assert realm.signup_announcements_stream is not None
         self.assertNotEqual(
-            realm.signup_notifications_stream.id, invalid_signup_notifications_stream_id
+            realm.signup_announcements_stream.id, invalid_signup_announcements_stream_id
         )
 
-    def test_get_default_signup_notifications_stream(self) -> None:
+    def test_get_default_signup_announcements_stream(self) -> None:
         realm = get_realm("zulip")
         verona = get_stream("verona", realm)
-        realm.signup_notifications_stream = verona
-        realm.save(update_fields=["signup_notifications_stream"])
+        realm.signup_announcements_stream = verona
+        realm.save(update_fields=["signup_announcements_stream"])
 
-        signup_notifications_stream = realm.get_signup_notifications_stream()
-        assert signup_notifications_stream is not None
-        self.assertEqual(signup_notifications_stream, verona)
-        do_deactivate_stream(signup_notifications_stream, acting_user=None)
-        self.assertIsNone(realm.get_signup_notifications_stream())
+        signup_announcements_stream = realm.get_signup_announcements_stream()
+        assert signup_announcements_stream is not None
+        self.assertEqual(signup_announcements_stream, verona)
+        do_deactivate_stream(signup_announcements_stream, acting_user=None)
+        self.assertIsNone(realm.get_signup_announcements_stream())
+
+    def test_change_zulip_update_announcements_stream(self) -> None:
+        # We need an admin user.
+        self.login("iago")
+
+        disabled_zulip_update_announcements_stream_id = -1
+        req = dict(
+            zulip_update_announcements_stream_id=orjson.dumps(
+                disabled_zulip_update_announcements_stream_id
+            ).decode()
+        )
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertEqual(realm.zulip_update_announcements_stream, None)
+
+        new_zulip_update_announcements_stream_id = Stream.objects.get(name="Denmark").id
+        req = dict(
+            zulip_update_announcements_stream_id=orjson.dumps(
+                new_zulip_update_announcements_stream_id
+            ).decode()
+        )
+
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        assert realm.zulip_update_announcements_stream is not None
+        self.assertEqual(
+            realm.zulip_update_announcements_stream.id, new_zulip_update_announcements_stream_id
+        )
+
+        # Test that admin can set the setting to an unsubscribed private stream as well.
+        new_zulip_update_announcements_stream_id = self.make_stream(
+            "private_stream", invite_only=True
+        ).id
+        req = dict(
+            zulip_update_announcements_stream_id=orjson.dumps(
+                new_zulip_update_announcements_stream_id
+            ).decode()
+        )
+
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        assert realm.zulip_update_announcements_stream is not None
+        self.assertEqual(
+            realm.zulip_update_announcements_stream.id, new_zulip_update_announcements_stream_id
+        )
+
+        invalid_zulip_update_announcements_stream_id = 1234
+        req = dict(
+            zulip_update_announcements_stream_id=orjson.dumps(
+                invalid_zulip_update_announcements_stream_id
+            ).decode()
+        )
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "Invalid channel ID")
+        realm = get_realm("zulip")
+        assert realm.zulip_update_announcements_stream is not None
+        self.assertNotEqual(
+            realm.zulip_update_announcements_stream.id, invalid_zulip_update_announcements_stream_id
+        )
+
+    def test_get_default_zulip_update_announcements_stream(self) -> None:
+        realm = get_realm("zulip")
+        verona = get_stream("verona", realm)
+        realm.zulip_update_announcements_stream = verona
+        realm.save(update_fields=["zulip_update_announcements_stream"])
+
+        zulip_update_announcements_stream = realm.get_zulip_update_announcements_stream()
+        assert zulip_update_announcements_stream is not None
+        self.assertEqual(zulip_update_announcements_stream, verona)
+        do_deactivate_stream(zulip_update_announcements_stream, acting_user=None)
+        self.assertIsNone(realm.get_zulip_update_announcements_stream())
+
+    def test_change_moderation_request_channel(self) -> None:
+        # We need an admin user.
+        self.login("iago")
+
+        disabled_moderation_request_channel_id = -1
+        req = dict(
+            moderation_request_channel_id=orjson.dumps(
+                disabled_moderation_request_channel_id
+            ).decode()
+        )
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertEqual(realm.moderation_request_channel, None)
+
+        # Test that admin can set the setting to a private stream.
+        new_moderation_request_channel_id = self.make_stream("private_stream", invite_only=True).id
+        req = dict(
+            moderation_request_channel_id=orjson.dumps(new_moderation_request_channel_id).decode()
+        )
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        assert realm.moderation_request_channel is not None
+        self.assertEqual(realm.moderation_request_channel.id, new_moderation_request_channel_id)
+
+        invalid_moderation_request_channel_id = 4321
+        req = dict(
+            moderation_request_channel_id=orjson.dumps(
+                invalid_moderation_request_channel_id
+            ).decode()
+        )
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "Invalid channel ID")
+        realm = get_realm("zulip")
+        assert realm.moderation_request_channel is not None
+        self.assertNotEqual(
+            realm.moderation_request_channel.id, invalid_moderation_request_channel_id
+        )
+
+        # Test that setting this to public channel should fail.
+        public_moderation_request_channel_id = Stream.objects.get(name="Denmark").id
+        req = dict(
+            moderation_request_channel_id=orjson.dumps(
+                public_moderation_request_channel_id
+            ).decode()
+        )
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "Moderation request channel must be private.")
+        realm = get_realm("zulip")
+        assert realm.moderation_request_channel is not None
+        self.assertNotEqual(
+            realm.moderation_request_channel.id, public_moderation_request_channel_id
+        )
+
+    def test_get_default_moderation_request_channel(self) -> None:
+        realm = get_realm("zulip")
+        verona = get_stream("verona", realm)
+        realm.moderation_request_channel = verona
+        realm.save(update_fields=["moderation_request_channel"])
+
+        moderation_request_channel = realm.get_moderation_request_channel()
+        assert moderation_request_channel is not None
+        self.assertEqual(moderation_request_channel, verona)
+        do_deactivate_stream(moderation_request_channel, acting_user=None)
+        self.assertIsNone(realm.get_moderation_request_channel())
 
     def test_change_realm_default_language(self) -> None:
         # we need an admin user.
@@ -529,29 +941,21 @@ class RealmTest(ZulipTestCase):
         self.assertFalse(realm.deactivated)
 
     def test_invalid_integer_attribute_values(self) -> None:
-
-        integer_values = [key for key, value in Realm.property_types.items() if value is int]
+        integer_values = [
+            key for key, value in Realm.property_types.items() if value in (int, int | None)
+        ]
 
         invalid_values = dict(
-            bot_creation_policy=10,
-            create_public_stream_policy=10,
-            create_private_stream_policy=10,
-            create_web_public_stream_policy=10,
-            invite_to_stream_policy=10,
-            email_address_visibility=10,
             message_retention_days=10,
             video_chat_provider=10,
             giphy_rating=10,
             waiting_period_threshold=-10,
             digest_weekday=10,
-            user_group_edit_policy=10,
-            private_message_policy=10,
             message_content_delete_limit_seconds=-10,
             wildcard_mention_policy=10,
-            invite_to_realm_policy=10,
-            move_messages_between_streams_policy=10,
-            add_custom_emoji_policy=10,
-            delete_own_message_policy=10,
+            message_content_edit_limit_seconds=0,
+            move_messages_within_stream_limit_seconds=0,
+            move_messages_between_streams_limit_seconds=0,
         )
 
         # We need an admin user.
@@ -565,12 +969,13 @@ class RealmTest(ZulipTestCase):
             self.do_test_invalid_integer_attribute_value(name, invalid_value)
 
     def do_test_invalid_integer_attribute_value(self, val_name: str, invalid_val: int) -> None:
-
         possible_messages = {
             f"Invalid {val_name}",
             f"Bad value for '{val_name}'",
             f"Bad value for '{val_name}': {invalid_val}",
             f"Invalid {val_name} {invalid_val}",
+            f"{val_name} is too small",
+            "Must be an organization owner",
         }
 
         req = {val_name: invalid_val}
@@ -588,7 +993,7 @@ class RealmTest(ZulipTestCase):
         req = {"video_chat_provider": orjson.dumps(invalid_video_chat_provider_value).decode()}
         result = self.client_patch("/json/realm", req)
         self.assert_json_error(
-            result, ("Invalid video_chat_provider {}").format(invalid_video_chat_provider_value)
+            result, f"Invalid video_chat_provider {invalid_video_chat_provider_value}"
         )
 
         req = {
@@ -631,6 +1036,99 @@ class RealmTest(ZulipTestCase):
         result = self.client_patch("/json/realm", req)
         self.assert_json_success(result)
 
+    def test_data_deletion_schedule_when_deactivating_realm(self) -> None:
+        self.login("desdemona")
+
+        # settings.MIN_DEACTIVATED_REALM_DELETION_DAYS have default value 14.
+        # So minimum 14 days should be given for data deletion.
+        result = self.client_post("/json/realm/deactivate", {"deletion_delay_days": 12})
+        self.assert_json_error(result, "Data deletion time must be at least 14 days in the future.")
+
+        result = self.client_post("/json/realm/deactivate", {"deletion_delay_days": 17})
+        self.assert_json_success(result)
+
+        do_reactivate_realm(get_realm("zulip"))
+
+        with self.settings(MIN_DEACTIVATED_REALM_DELETION_DAYS=None):
+            self.login("desdemona")
+
+            result = self.client_post("/json/realm/deactivate", {"deletion_delay_days": 12})
+            self.assert_json_success(result)
+
+        do_reactivate_realm(get_realm("zulip"))
+
+        with self.settings(MAX_DEACTIVATED_REALM_DELETION_DAYS=30):
+            self.login("desdemona")
+
+            # None value to deletion_delay_days means data will be never deleted.
+            result = self.client_post(
+                "/json/realm/deactivate", {"deletion_delay_days": orjson.dumps(None).decode()}
+            )
+            self.assert_json_error(
+                result,
+                "Data deletion time must be at most 30 days in the future.",
+            )
+
+            result = self.client_post("/json/realm/deactivate", {"deletion_delay_days": 40})
+            self.assert_json_error(
+                result,
+                "Data deletion time must be at most 30 days in the future.",
+            )
+
+            result = self.client_post("/json/realm/deactivate", {"deletion_delay_days": 25})
+            self.assert_json_success(result)
+
+    def test_scrub_deactivated_realms(self) -> None:
+        zulip = get_realm("zulip")
+        zephyr = get_realm("zephyr")
+        lear = get_realm("lear")
+
+        do_deactivate_realm(
+            zephyr,
+            acting_user=None,
+            deletion_delay_days=3,
+            deactivation_reason="owner_request",
+            email_owners=False,
+        )
+        self.assertTrue(zephyr.deactivated)
+
+        do_deactivate_realm(
+            zulip,
+            acting_user=None,
+            deletion_delay_days=None,
+            deactivation_reason="owner_request",
+            email_owners=False,
+        )
+        self.assertTrue(zulip.deactivated)
+
+        with mock.patch("zerver.actions.realm_settings.do_scrub_realm") as mock_scrub_realm:
+            clean_deactivated_realm_data()
+            mock_scrub_realm.assert_not_called()
+
+        with (
+            mock.patch("zerver.actions.realm_settings.do_scrub_realm") as mock_scrub_realm,
+            self.assertLogs(level="INFO"),
+        ):
+            do_deactivate_realm(
+                lear,
+                acting_user=None,
+                deletion_delay_days=0,
+                deactivation_reason="owner_request",
+                email_owners=False,
+            )
+            self.assertTrue(lear.deactivated)
+            mock_scrub_realm.assert_called_once_with(lear, acting_user=None)
+
+        do_reactivate_realm(lear)
+
+        with (
+            time_machine.travel(timezone_now() + timedelta(days=4), tick=False),
+            mock.patch("zerver.actions.realm_settings.do_scrub_realm") as mock_scrub_realm,
+            self.assertLogs(level="INFO"),
+        ):
+            clean_deactivated_realm_data()
+            mock_scrub_realm.assert_called_once_with(zephyr, acting_user=None)
+
     def test_initial_plan_type(self) -> None:
         with self.settings(BILLING_ENABLED=True):
             self.assertEqual(do_create_realm("hosted", "hosted").plan_type, Realm.PLAN_TYPE_LIMITED)
@@ -652,6 +1150,44 @@ class RealmTest(ZulipTestCase):
             self.assertEqual(get_realm("onpremise").message_visibility_limit, None)
             self.assertEqual(get_realm("onpremise").upload_quota_gb, None)
 
+    def test_initial_auth_methods(self) -> None:
+        with self.settings(
+            BILLING_ENABLED=True,
+            DEVELOPMENT=False,
+            AUTHENTICATION_BACKENDS=(
+                "zproject.backends.EmailAuthBackend",
+                "zproject.backends.AzureADAuthBackend",
+                "zproject.backends.SAMLAuthBackend",
+            ),
+        ):
+            # Test a Cloud-like realm creation.
+            # Only the auth backends available on the free plan should be enabled.
+            realm = do_create_realm("hosted", "hosted")
+            self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_LIMITED)
+
+            self.assertEqual(
+                realm.authentication_methods_dict(),
+                {
+                    "Email": True,
+                    "AzureAD": False,
+                    "SAML": False,
+                },
+            )
+
+            # Now make sure that a self-hosted server creates realms with all auth methods enabled.
+            with self.settings(BILLING_ENABLED=False):
+                realm = do_create_realm("onpremise", "onpremise")
+                self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_SELF_HOSTED)
+
+                self.assertEqual(
+                    realm.authentication_methods_dict(),
+                    {
+                        "Email": True,
+                        "AzureAD": True,
+                        "SAML": True,
+                    },
+                )
+
     def test_change_org_type(self) -> None:
         realm = get_realm("zulip")
         iago = self.example_user("iago")
@@ -660,55 +1196,207 @@ class RealmTest(ZulipTestCase):
         do_change_realm_org_type(realm, Realm.ORG_TYPES["government"]["id"], acting_user=iago)
         realm = get_realm("zulip")
         realm_audit_log = RealmAuditLog.objects.filter(
-            event_type=RealmAuditLog.REALM_ORG_TYPE_CHANGED
+            event_type=AuditLogEventType.REALM_ORG_TYPE_CHANGED
         ).last()
         assert realm_audit_log is not None
         expected_extra_data = {
             "old_value": Realm.ORG_TYPES["business"]["id"],
             "new_value": Realm.ORG_TYPES["government"]["id"],
         }
-        self.assertEqual(realm_audit_log.extra_data, str(expected_extra_data))
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
         self.assertEqual(realm_audit_log.acting_user, iago)
         self.assertEqual(realm.org_type, Realm.ORG_TYPES["government"]["id"])
 
+    def test_change_realm_max_invites(self) -> None:
+        realm = get_realm("zulip")
+        iago = self.example_user("iago")
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_SELF_HOSTED)
+        self.assertEqual(realm.max_invites, settings.INVITES_DEFAULT_REALM_DAILY_MAX)
+
+        do_change_realm_max_invites(realm, 1, acting_user=iago)
+        realm = get_realm("zulip")
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=AuditLogEventType.REALM_PROPERTY_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            "old_value": settings.INVITES_DEFAULT_REALM_DAILY_MAX,
+            "new_value": 1,
+            "property": "max_invites",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+        self.assertEqual(realm_audit_log.acting_user, iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_SELF_HOSTED)
+        self.assertEqual(realm.max_invites, 1)
+
+        do_change_realm_max_invites(realm, 0, acting_user=iago)
+        realm = get_realm("zulip")
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=AuditLogEventType.REALM_PROPERTY_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {"old_value": 1, "new_value": None, "property": "max_invites"}
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+        self.assertEqual(realm_audit_log.acting_user, iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_SELF_HOSTED)
+        self.assertEqual(realm.max_invites, settings.INVITES_DEFAULT_REALM_DAILY_MAX)
+
+        realm.plan_type = Realm.PLAN_TYPE_PLUS
+        realm.save()
+
+        do_change_realm_max_invites(realm, 0, acting_user=iago)
+        realm = get_realm("zulip")
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=AuditLogEventType.REALM_PROPERTY_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            "old_value": settings.INVITES_DEFAULT_REALM_DAILY_MAX,
+            "new_value": Realm.INVITES_STANDARD_REALM_DAILY_MAX,
+            "property": "max_invites",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+        self.assertEqual(realm_audit_log.acting_user, iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_PLUS)
+        self.assertEqual(realm.max_invites, Realm.INVITES_STANDARD_REALM_DAILY_MAX)
+
+        realm.plan_type = Realm.PLAN_TYPE_LIMITED
+        realm.save()
+
+        do_change_realm_max_invites(realm, 0, acting_user=iago)
+        realm = get_realm("zulip")
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=AuditLogEventType.REALM_PROPERTY_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            "old_value": Realm.INVITES_STANDARD_REALM_DAILY_MAX,
+            "new_value": settings.INVITES_DEFAULT_REALM_DAILY_MAX,
+            "property": "max_invites",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+        self.assertEqual(realm_audit_log.acting_user, iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_LIMITED)
+        self.assertEqual(realm.max_invites, settings.INVITES_DEFAULT_REALM_DAILY_MAX)
+
+        realm.plan_type = Realm.PLAN_TYPE_STANDARD
+        realm.save()
+
+        do_change_realm_max_invites(realm, 0, acting_user=iago)
+        realm = get_realm("zulip")
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=AuditLogEventType.REALM_PROPERTY_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            "old_value": settings.INVITES_DEFAULT_REALM_DAILY_MAX,
+            "new_value": Realm.INVITES_STANDARD_REALM_DAILY_MAX,
+            "property": "max_invites",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+        self.assertEqual(realm_audit_log.acting_user, iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_STANDARD)
+        self.assertEqual(realm.max_invites, Realm.INVITES_STANDARD_REALM_DAILY_MAX)
+
+        realm.plan_type = Realm.PLAN_TYPE_STANDARD_FREE
+        realm.save()
+
+        do_change_realm_max_invites(realm, 50000, acting_user=iago)
+        realm = get_realm("zulip")
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=AuditLogEventType.REALM_PROPERTY_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            "old_value": Realm.INVITES_STANDARD_REALM_DAILY_MAX,
+            "new_value": 50000,
+            "property": "max_invites",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+        self.assertEqual(realm_audit_log.acting_user, iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_STANDARD_FREE)
+        self.assertEqual(realm.max_invites, 50000)
+
+        do_change_realm_max_invites(realm, 0, acting_user=iago)
+        realm = get_realm("zulip")
+        realm_audit_log = RealmAuditLog.objects.filter(
+            event_type=AuditLogEventType.REALM_PROPERTY_CHANGED
+        ).last()
+        assert realm_audit_log is not None
+        expected_extra_data = {
+            "old_value": 50000,
+            "new_value": Realm.INVITES_STANDARD_REALM_DAILY_MAX,
+            "property": "max_invites",
+        }
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
+        self.assertEqual(realm_audit_log.acting_user, iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_STANDARD_FREE)
+        self.assertEqual(realm.max_invites, Realm.INVITES_STANDARD_REALM_DAILY_MAX)
+
+    @skipUnless(settings.ZILENCER_ENABLED, "requires zilencer")
     def test_change_realm_plan_type(self) -> None:
         realm = get_realm("zulip")
+
+        # Create additional user, so that the realm has a lot of seats for the purposes
+        # of upload quota calculation.
+        for count in range(10):
+            do_create_user(
+                f"email{count}@example.com",
+                f"password {count}",
+                realm,
+                "name",
+                role=UserProfile.ROLE_MEMBER,
+                acting_user=None,
+            )
+
         iago = self.example_user("iago")
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_SELF_HOSTED)
         self.assertEqual(realm.max_invites, settings.INVITES_DEFAULT_REALM_DAILY_MAX)
         self.assertEqual(realm.message_visibility_limit, None)
         self.assertEqual(realm.upload_quota_gb, None)
 
+        members_system_group = NamedUserGroup.objects.get(name=SystemGroups.MEMBERS, realm=realm)
+        do_change_realm_permission_group_setting(
+            realm, "can_access_all_users_group", members_system_group, acting_user=None
+        )
+        self.assertEqual(realm.can_access_all_users_group_id, members_system_group.id)
+
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_STANDARD, acting_user=iago)
         realm = get_realm("zulip")
         realm_audit_log = RealmAuditLog.objects.filter(
-            event_type=RealmAuditLog.REALM_PLAN_TYPE_CHANGED
+            event_type=AuditLogEventType.REALM_PLAN_TYPE_CHANGED
         ).last()
         assert realm_audit_log is not None
         expected_extra_data = {
             "old_value": Realm.PLAN_TYPE_SELF_HOSTED,
             "new_value": Realm.PLAN_TYPE_STANDARD,
         }
-        self.assertEqual(realm_audit_log.extra_data, str(expected_extra_data))
+        self.assertEqual(realm_audit_log.extra_data, expected_extra_data)
         self.assertEqual(realm_audit_log.acting_user, iago)
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_STANDARD)
         self.assertEqual(realm.max_invites, Realm.INVITES_STANDARD_REALM_DAILY_MAX)
         self.assertEqual(realm.message_visibility_limit, None)
-        self.assertEqual(realm.upload_quota_gb, Realm.UPLOAD_QUOTA_STANDARD)
+        self.assertEqual(
+            realm.upload_quota_gb, get_seat_count(realm) * settings.UPLOAD_QUOTA_PER_USER_GB
+        )
+        everyone_system_group = NamedUserGroup.objects.get(name=SystemGroups.EVERYONE, realm=realm)
+        self.assertEqual(realm.can_access_all_users_group_id, everyone_system_group.id)
 
+        do_set_realm_property(realm, "enable_spectator_access", True, acting_user=None)
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=iago)
         realm = get_realm("zulip")
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_LIMITED)
         self.assertEqual(realm.max_invites, settings.INVITES_DEFAULT_REALM_DAILY_MAX)
         self.assertEqual(realm.message_visibility_limit, Realm.MESSAGE_VISIBILITY_LIMITED)
         self.assertEqual(realm.upload_quota_gb, Realm.UPLOAD_QUOTA_LIMITED)
+        self.assertFalse(realm.enable_spectator_access)
 
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_STANDARD_FREE, acting_user=iago)
         realm = get_realm("zulip")
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_STANDARD_FREE)
         self.assertEqual(realm.max_invites, Realm.INVITES_STANDARD_REALM_DAILY_MAX)
         self.assertEqual(realm.message_visibility_limit, None)
-        self.assertEqual(realm.upload_quota_gb, Realm.UPLOAD_QUOTA_STANDARD)
+        self.assertEqual(realm.upload_quota_gb, Realm.UPLOAD_QUOTA_STANDARD_FREE)
 
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=iago)
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_PLUS, acting_user=iago)
@@ -716,13 +1404,71 @@ class RealmTest(ZulipTestCase):
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_PLUS)
         self.assertEqual(realm.max_invites, Realm.INVITES_STANDARD_REALM_DAILY_MAX)
         self.assertEqual(realm.message_visibility_limit, None)
-        self.assertEqual(realm.upload_quota_gb, Realm.UPLOAD_QUOTA_STANDARD)
+        self.assertEqual(
+            realm.upload_quota_gb, get_seat_count(realm) * settings.UPLOAD_QUOTA_PER_USER_GB
+        )
+
+        do_change_realm_permission_group_setting(
+            realm, "can_access_all_users_group", members_system_group, acting_user=None
+        )
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_STANDARD, acting_user=iago)
+        realm = get_realm("zulip")
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_STANDARD)
+        self.assertEqual(realm.max_invites, Realm.INVITES_STANDARD_REALM_DAILY_MAX)
+        self.assertEqual(realm.message_visibility_limit, None)
+        self.assertEqual(
+            realm.upload_quota_gb, get_seat_count(realm) * settings.UPLOAD_QUOTA_PER_USER_GB
+        )
+        self.assertEqual(realm.can_access_all_users_group_id, everyone_system_group.id)
+
+        # Test that custom_upload_quota_gb overrides the default upload_quota_gb
+        # implied by a plan and makes .upload_quota_gb be unaffacted by plan changes.
+        realm.custom_upload_quota_gb = 100
+        realm.save(update_fields=["custom_upload_quota_gb"])
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_PLUS, acting_user=iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_PLUS)
+        self.assertEqual(realm.upload_quota_gb, 100)
+
+        realm.custom_upload_quota_gb = None
+        realm.save(update_fields=["custom_upload_quota_gb"])
 
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_SELF_HOSTED, acting_user=iago)
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_SELF_HOSTED)
         self.assertEqual(realm.max_invites, settings.INVITES_DEFAULT_REALM_DAILY_MAX)
         self.assertEqual(realm.message_visibility_limit, None)
         self.assertEqual(realm.upload_quota_gb, None)
+
+    @override_settings(
+        BILLING_ENABLED=True,
+        AUTHENTICATION_BACKENDS=(
+            "zproject.backends.EmailAuthBackend",
+            "zproject.backends.AzureADAuthBackend",
+            "zproject.backends.SAMLAuthBackend",
+        ),
+    )
+    def test_realm_authentication_methods_after_downgrade(self) -> None:
+        realm = get_realm("zulip")
+        iago = self.example_user("iago")
+
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_STANDARD, acting_user=iago)
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_STANDARD)
+
+        do_set_realm_authentication_methods(
+            realm, {"Email": True, "AzureAD": True, "SAML": True}, acting_user=None
+        )
+
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=iago)
+        realm.refresh_from_db()
+        self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_LIMITED)
+
+        self.assertEqual(
+            realm.authentication_methods_dict(),
+            {
+                "Email": True,
+                "AzureAD": False,
+                "SAML": False,
+            },
+        )
 
     def test_message_retention_days(self) -> None:
         self.login("iago")
@@ -762,12 +1508,48 @@ class RealmTest(ZulipTestCase):
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
         req = dict(message_retention_days=orjson.dumps(10).decode())
         result = self.client_patch("/json/realm", req)
-        self.assert_json_error(result, "Available on Zulip Standard. Upgrade to access.")
+        self.assert_json_error(result, "Available on Zulip Cloud Standard. Upgrade to access.")
 
         do_change_realm_plan_type(realm, Realm.PLAN_TYPE_STANDARD, acting_user=None)
         req = dict(message_retention_days=orjson.dumps(10).decode())
         result = self.client_patch("/json/realm", req)
         self.assert_json_success(result)
+
+    def test_jitsi_server_url(self) -> None:
+        self.login("iago")
+        realm = get_realm("zulip")
+        self.assertEqual(realm.video_chat_provider, Realm.VIDEO_CHAT_PROVIDERS["jitsi_meet"]["id"])
+
+        req = dict(jitsi_server_url=orjson.dumps("").decode())
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "jitsi_server_url is not an allowed_type")
+
+        req = dict(jitsi_server_url=orjson.dumps("invalidURL").decode())
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "jitsi_server_url is not an allowed_type")
+
+        req = dict(jitsi_server_url=orjson.dumps(12).decode())
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "jitsi_server_url is not a string")
+
+        url_string = "".join(random.choices(string.ascii_lowercase, k=180))
+        long_url = "https://jitsi.example.com/" + url_string
+        req = dict(jitsi_server_url=orjson.dumps(long_url).decode())
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "jitsi_server_url is not an allowed_type")
+
+        valid_url = "https://jitsi.example.com"
+        req = dict(jitsi_server_url=orjson.dumps(valid_url).decode())
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertEqual(realm.jitsi_server_url, valid_url)
+
+        req = dict(jitsi_server_url=orjson.dumps("default").decode())
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertEqual(realm.jitsi_server_url, None)
 
     def test_do_create_realm(self) -> None:
         realm = do_create_realm("realm_string_id", "realm name")
@@ -775,65 +1557,73 @@ class RealmTest(ZulipTestCase):
         self.assertEqual(realm.string_id, "realm_string_id")
         self.assertEqual(realm.name, "realm name")
         self.assertFalse(realm.emails_restricted_to_domains)
-        self.assertEqual(realm.email_address_visibility, Realm.EMAIL_ADDRESS_VISIBILITY_EVERYONE)
         self.assertEqual(realm.description, "")
         self.assertTrue(realm.invite_required)
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_LIMITED)
         self.assertEqual(realm.org_type, Realm.ORG_TYPES["unspecified"]["id"])
-        self.assertEqual(type(realm.date_created), datetime.datetime)
+        self.assertEqual(type(realm.date_created), datetime)
 
         self.assertTrue(
             RealmAuditLog.objects.filter(
-                realm=realm, event_type=RealmAuditLog.REALM_CREATED, event_time=realm.date_created
+                realm=realm,
+                event_type=AuditLogEventType.REALM_CREATED,
+                event_time=realm.date_created,
             ).exists()
         )
 
-        assert realm.notifications_stream is not None
-        self.assertEqual(realm.notifications_stream.name, "general")
-        self.assertEqual(realm.notifications_stream.realm, realm)
+        assert realm.new_stream_announcements_stream is not None
+        self.assertEqual(realm.new_stream_announcements_stream.name, "general")
+        self.assertEqual(realm.new_stream_announcements_stream.realm, realm)
 
-        assert realm.signup_notifications_stream is not None
-        self.assertEqual(realm.signup_notifications_stream.name, "core team")
-        self.assertEqual(realm.signup_notifications_stream.realm, realm)
+        self.assertIsNone(realm.signup_announcements_stream)
 
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_LIMITED)
 
+        for (
+            setting_name,
+            permission_configuration,
+        ) in Realm.REALM_PERMISSION_GROUP_SETTINGS.items():
+            self.assertEqual(
+                getattr(realm, setting_name).named_user_group.name,
+                permission_configuration.default_group_name,
+            )
+
     def test_do_create_realm_with_keyword_arguments(self) -> None:
-        date_created = timezone_now() - datetime.timedelta(days=100)
+        date_created = timezone_now() - timedelta(days=100)
         realm = do_create_realm(
             "realm_string_id",
             "realm name",
             emails_restricted_to_domains=True,
             date_created=date_created,
-            email_address_visibility=Realm.EMAIL_ADDRESS_VISIBILITY_MEMBERS,
             description="realm description",
             invite_required=False,
             plan_type=Realm.PLAN_TYPE_STANDARD_FREE,
             org_type=Realm.ORG_TYPES["community"]["id"],
+            enable_read_receipts=True,
         )
         self.assertEqual(realm.string_id, "realm_string_id")
         self.assertEqual(realm.name, "realm name")
         self.assertTrue(realm.emails_restricted_to_domains)
-        self.assertEqual(realm.email_address_visibility, Realm.EMAIL_ADDRESS_VISIBILITY_MEMBERS)
         self.assertEqual(realm.description, "realm description")
         self.assertFalse(realm.invite_required)
         self.assertEqual(realm.plan_type, Realm.PLAN_TYPE_STANDARD_FREE)
         self.assertEqual(realm.org_type, Realm.ORG_TYPES["community"]["id"])
         self.assertEqual(realm.date_created, date_created)
+        self.assertEqual(realm.enable_read_receipts, True)
 
         self.assertTrue(
             RealmAuditLog.objects.filter(
-                realm=realm, event_type=RealmAuditLog.REALM_CREATED, event_time=realm.date_created
+                realm=realm,
+                event_type=AuditLogEventType.REALM_CREATED,
+                event_time=realm.date_created,
             ).exists()
         )
 
-        assert realm.notifications_stream is not None
-        self.assertEqual(realm.notifications_stream.name, "general")
-        self.assertEqual(realm.notifications_stream.realm, realm)
+        assert realm.new_stream_announcements_stream is not None
+        self.assertEqual(realm.new_stream_announcements_stream.name, "general")
+        self.assertEqual(realm.new_stream_announcements_stream.realm, realm)
 
-        assert realm.signup_notifications_stream is not None
-        self.assertEqual(realm.signup_notifications_stream.name, "core team")
-        self.assertEqual(realm.signup_notifications_stream.realm, realm)
+        self.assertIsNone(realm.signup_announcements_stream)
 
     def test_realm_is_web_public(self) -> None:
         realm = get_realm("zulip")
@@ -884,28 +1674,193 @@ class RealmTest(ZulipTestCase):
             self.assertEqual(realm.web_public_streams_enabled(), False)
             self.assertEqual(realm.has_web_public_streams(), False)
 
+    def test_creating_realm_creates_system_groups(self) -> None:
+        realm = do_create_realm("realm_string_id", "realm name")
+        system_user_groups = NamedUserGroup.objects.filter(realm=realm, is_system_group=True)
+
+        self.assert_length(system_user_groups, 8)
+        user_group_names = [group.name for group in system_user_groups]
+        expected_system_group_names = [
+            SystemGroups.OWNERS,
+            SystemGroups.ADMINISTRATORS,
+            SystemGroups.MODERATORS,
+            SystemGroups.FULL_MEMBERS,
+            SystemGroups.MEMBERS,
+            SystemGroups.EVERYONE,
+            SystemGroups.EVERYONE_ON_INTERNET,
+            SystemGroups.NOBODY,
+        ]
+        self.assertEqual(sorted(user_group_names), sorted(expected_system_group_names))
+
+    @activate_push_notification_service()
+    def test_do_create_realm_notify_bouncer(self) -> None:
+        dummy_send_realms_only_response = {
+            "result": "success",
+            "msg": "",
+            "realms": {},
+        }
+        with mock.patch(
+            "zerver.lib.remote_server.send_to_push_bouncer",
+        ) as m:
+            get_response = {
+                "last_realm_count_id": 0,
+                "last_installation_count_id": 0,
+                "last_realmauditlog_id": 0,
+            }
+
+            def mock_send_to_push_bouncer_response(method: str, *args: Any) -> dict[str, Any]:
+                if method == "GET":
+                    return get_response
+                return dummy_send_realms_only_response
+
+            m.side_effect = mock_send_to_push_bouncer_response
+
+            with self.captureOnCommitCallbacks(execute=True):
+                realm = do_create_realm("realm_string_id", "realm name")
+
+        self.assertEqual(realm.string_id, "realm_string_id")
+        self.assertEqual(m.call_count, 2)
+
+        calls_args_for_assert = m.call_args_list[1][0]
+        self.assertEqual(calls_args_for_assert[0], "POST")
+        self.assertEqual(calls_args_for_assert[1], "server/analytics")
+        self.assertIn(
+            realm.id, [realm["id"] for realm in json.loads(m.call_args_list[1][0][2]["realms"])]
+        )
+
+    def test_changing_waiting_period_updates_system_groups(self) -> None:
+        realm = get_realm("zulip")
+        members_system_group = NamedUserGroup.objects.get(
+            realm=realm, name=SystemGroups.MEMBERS, is_system_group=True
+        )
+        full_members_system_group = NamedUserGroup.objects.get(
+            realm=realm, name=SystemGroups.FULL_MEMBERS, is_system_group=True
+        )
+
+        self.assert_length(UserGroupMembership.objects.filter(user_group=members_system_group), 9)
+        self.assert_length(
+            UserGroupMembership.objects.filter(user_group=full_members_system_group), 9
+        )
+        self.assertEqual(realm.waiting_period_threshold, 0)
+
+        hamlet = self.example_user("hamlet")
+        othello = self.example_user("othello")
+        prospero = self.example_user("prospero")
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=hamlet
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=othello
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=prospero
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=hamlet
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=othello
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=prospero
+            ).exists()
+        )
+
+        hamlet.date_joined = timezone_now() - timedelta(days=50)
+        hamlet.save()
+        othello.date_joined = timezone_now() - timedelta(days=75)
+        othello.save()
+        prospero.date_joined = timezone_now() - timedelta(days=150)
+        prospero.save()
+        do_set_realm_property(realm, "waiting_period_threshold", 100, acting_user=None)
+
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=hamlet
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=othello
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=prospero
+            ).exists()
+        )
+        self.assertFalse(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=hamlet
+            ).exists()
+        )
+        self.assertFalse(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=othello
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=prospero
+            ).exists()
+        )
+
+        do_set_realm_property(realm, "waiting_period_threshold", 70, acting_user=None)
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=hamlet
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=othello
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=members_system_group, user_profile=prospero
+            ).exists()
+        )
+        self.assertFalse(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=hamlet
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=othello
+            ).exists()
+        )
+        self.assertTrue(
+            UserGroupMembership.objects.filter(
+                user_group=full_members_system_group, user_profile=prospero
+            ).exists()
+        )
+
 
 class RealmAPITest(ZulipTestCase):
+    @override
     def setUp(self) -> None:
         super().setUp()
         self.login("desdemona")
 
-    def set_up_db(self, attr: str, value: Any) -> None:
-        realm = get_realm("zulip")
-        setattr(realm, attr, value)
-        realm.save(update_fields=[attr])
-
-    def update_with_api(self, name: str, value: Union[int, str]) -> Realm:
+    def update_with_api(self, name: str, value: int | str) -> Realm:
         if not isinstance(value, str):
             value = orjson.dumps(value).decode()
         result = self.client_patch("/json/realm", {name: value})
         self.assert_json_success(result)
         return get_realm("zulip")  # refresh data
-
-    def update_with_api_multiple_value(self, data_dict: Dict[str, Any]) -> Realm:
-        result = self.client_patch("/json/realm", data_dict)
-        self.assert_json_success(result)
-        return get_realm("zulip")
 
     def do_test_realm_update_api(self, name: str) -> None:
         """Test updating realm properties.
@@ -915,8 +1870,8 @@ class RealmAPITest(ZulipTestCase):
         assertion error.
         """
 
-        bool_tests: List[bool] = [False, True]
-        test_values: Dict[str, Any] = dict(
+        bool_tests: list[bool] = [False, True]
+        test_values: dict[str, Any] = dict(
             default_language=["de", "en"],
             default_code_block_language=["javascript", ""],
             description=["Realm description", "New description"],
@@ -924,31 +1879,20 @@ class RealmAPITest(ZulipTestCase):
             message_retention_days=[10, 20],
             name=["Zulip", "New Name"],
             waiting_period_threshold=[10, 20],
-            create_private_stream_policy=Realm.COMMON_POLICY_TYPES,
-            create_public_stream_policy=Realm.COMMON_POLICY_TYPES,
-            create_web_public_stream_policy=Realm.CREATE_WEB_PUBLIC_STREAM_POLICY_TYPES,
-            user_group_edit_policy=Realm.COMMON_POLICY_TYPES,
-            private_message_policy=Realm.PRIVATE_MESSAGE_POLICY_TYPES,
-            invite_to_stream_policy=Realm.COMMON_POLICY_TYPES,
             wildcard_mention_policy=Realm.WILDCARD_MENTION_POLICY_TYPES,
-            bot_creation_policy=Realm.BOT_CREATION_POLICY_TYPES,
-            email_address_visibility=Realm.EMAIL_ADDRESS_VISIBILITY_TYPES,
             video_chat_provider=[
-                dict(
-                    video_chat_provider=orjson.dumps(
-                        Realm.VIDEO_CHAT_PROVIDERS["jitsi_meet"]["id"]
-                    ).decode(),
-                ),
+                Realm.VIDEO_CHAT_PROVIDERS["jitsi_meet"]["id"],
+                Realm.VIDEO_CHAT_PROVIDERS["disabled"]["id"],
             ],
+            jitsi_server_url=["https://example.jit.si"],
             giphy_rating=[
                 Realm.GIPHY_RATING_OPTIONS["y"]["id"],
                 Realm.GIPHY_RATING_OPTIONS["r"]["id"],
             ],
             message_content_delete_limit_seconds=[1000, 1100, 1200],
-            invite_to_realm_policy=Realm.INVITE_TO_REALM_POLICY_TYPES,
-            move_messages_between_streams_policy=Realm.COMMON_POLICY_TYPES,
-            add_custom_emoji_policy=Realm.COMMON_POLICY_TYPES,
-            delete_own_message_policy=Realm.COMMON_MESSAGE_POLICY_TYPES,
+            message_content_edit_limit_seconds=[1000, 1100, 1200],
+            move_messages_within_stream_limit_seconds=[1000, 1100, 1200],
+            move_messages_between_streams_limit_seconds=[1000, 1100, 1200],
         )
 
         vals = test_values.get(name)
@@ -957,13 +1901,17 @@ class RealmAPITest(ZulipTestCase):
         if vals is None:
             raise AssertionError(f"No test created for {name}")
 
-        if name == "video_chat_provider":
-            self.set_up_db(name, vals[0][name])
-            realm = self.update_with_api_multiple_value(vals[0])
-            self.assertEqual(getattr(realm, name), orjson.loads(vals[0][name]))
+        if name == "jitsi_server_url":
+            realm = get_realm("zulip")
+            self.assertIsNone(realm.jitsi_server_url, None)
+            realm = self.update_with_api(name, orjson.dumps(vals[0]).decode())
+            self.assertEqual(realm.jitsi_server_url, vals[0])
+
+            realm = self.update_with_api(name, orjson.dumps("default").decode())
+            self.assertIsNone(realm.jitsi_server_url, None)
             return
 
-        self.set_up_db(name, vals[0])
+        do_set_realm_property(get_realm("zulip"), name, vals[0], acting_user=None)
 
         for val in vals[1:]:
             realm = self.update_with_api(name, val)
@@ -972,10 +1920,326 @@ class RealmAPITest(ZulipTestCase):
         realm = self.update_with_api(name, vals[0])
         self.assertEqual(getattr(realm, name), vals[0])
 
+    def do_test_realm_permission_group_setting_update_api(self, setting_name: str) -> None:
+        realm = get_realm("zulip")
+
+        all_system_user_groups = NamedUserGroup.objects.filter(
+            realm=realm,
+            is_system_group=True,
+        )
+
+        setting_permission_configuration = Realm.REALM_PERMISSION_GROUP_SETTINGS[setting_name]
+
+        default_group_name = setting_permission_configuration.default_group_name
+        default_group = all_system_user_groups.get(name=default_group_name)
+
+        self.assertEqual(getattr(realm, setting_name), default_group.usergroup_ptr)
+
+        for user_group in all_system_user_groups:
+            value = orjson.dumps(
+                {
+                    "new": user_group.id,
+                }
+            ).decode()
+
+            if (
+                (
+                    user_group.name == SystemGroups.EVERYONE_ON_INTERNET
+                    and not setting_permission_configuration.allow_internet_group
+                )
+                or (
+                    user_group.name == SystemGroups.NOBODY
+                    and not setting_permission_configuration.allow_nobody_group
+                )
+                or (
+                    user_group.name == SystemGroups.EVERYONE
+                    and not setting_permission_configuration.allow_everyone_group
+                )
+                or (
+                    setting_permission_configuration.allowed_system_groups
+                    and user_group.name
+                    not in setting_permission_configuration.allowed_system_groups
+                )
+            ):
+                result = self.client_patch("/json/realm", {setting_name: value})
+                self.assert_json_error(
+                    result, f"'{setting_name}' setting cannot be set to '{user_group.name}' group."
+                )
+                continue
+
+            realm = self.update_with_api(setting_name, value)
+            self.assertEqual(getattr(realm, setting_name), user_group.usergroup_ptr)
+
+        if setting_permission_configuration.require_system_group:
+            leadership_group = NamedUserGroup.objects.get(name="leadership", realm=realm)
+
+            value = orjson.dumps(
+                {
+                    "new": leadership_group.id,
+                }
+            ).decode()
+
+            result = self.client_patch("/json/realm", {setting_name: value})
+            self.assert_json_error(result, f"'{setting_name}' must be a system user group.")
+
+            admins_group = NamedUserGroup.objects.get(name=SystemGroups.ADMINISTRATORS, realm=realm)
+            moderators_group = NamedUserGroup.objects.get(name=SystemGroups.MODERATORS, realm=realm)
+            value = orjson.dumps(
+                {
+                    "new": {
+                        "direct_members": [],
+                        "direct_subgroups": [admins_group.id, leadership_group.id],
+                    }
+                }
+            ).decode()
+            result = self.client_patch("/json/realm", {setting_name: value})
+            self.assert_json_error(result, f"'{setting_name}' must be a system user group.")
+
+            value = orjson.dumps(
+                {
+                    "new": {
+                        "direct_members": [],
+                        "direct_subgroups": [admins_group.id, moderators_group.id],
+                    }
+                }
+            ).decode()
+            result = self.client_patch("/json/realm", {setting_name: value})
+            self.assert_json_error(result, f"'{setting_name}' must be a system user group.")
+
+            group = admins_group
+            if setting_permission_configuration.allowed_system_groups:
+                group = NamedUserGroup.objects.get(
+                    name=setting_permission_configuration.allowed_system_groups[0], realm=realm
+                )
+
+            value = orjson.dumps(
+                {
+                    "new": {
+                        "direct_members": [],
+                        "direct_subgroups": [group.id],
+                    }
+                }
+            ).decode()
+            realm = self.update_with_api(setting_name, value)
+            self.assertEqual(getattr(realm, setting_name), group.usergroup_ptr)
+
+    def do_test_realm_permission_group_setting_update_api_with_anonymous_groups(
+        self, setting_name: str
+    ) -> None:
+        realm = get_realm("zulip")
+        othello = self.example_user("othello")
+        hamlet = self.example_user("hamlet")
+        leadership_group = NamedUserGroup.objects.get(name="leadership", realm=realm)
+
+        moderators_group = NamedUserGroup.objects.get(
+            name=SystemGroups.MODERATORS, realm=realm, is_system_group=True
+        )
+
+        result = self.client_patch(
+            "/json/realm", {setting_name: orjson.dumps({"new": moderators_group.id}).decode()}
+        )
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertEqual(getattr(realm, setting_name), moderators_group.usergroup_ptr)
+
+        # Try passing the old value as well.
+        admins_group = NamedUserGroup.objects.get(
+            name=SystemGroups.ADMINISTRATORS, realm=realm, is_system_group=True
+        )
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {"new": admins_group.id, "old": leadership_group.id}
+                ).decode()
+            },
+        )
+        self.assert_json_error(result, "'old' value does not match the expected value.")
+
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {
+                        "new": admins_group.id,
+                        "old": {
+                            "direct_members": [othello.id],
+                            "direct_subgroups": [moderators_group.id],
+                        },
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_error(result, "'old' value does not match the expected value.")
+
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {"new": admins_group.id, "old": moderators_group.id}
+                ).decode()
+            },
+        )
+        realm = get_realm("zulip")
+        self.assertEqual(getattr(realm, setting_name), admins_group.usergroup_ptr)
+
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {
+                        "new": {
+                            "direct_members": [othello.id],
+                            "direct_subgroups": [leadership_group.id],
+                        }
+                    }
+                ).decode()
+            },
+        )
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertCountEqual(list(getattr(realm, setting_name).direct_members.all()), [othello])
+        self.assertCountEqual(
+            list(getattr(realm, setting_name).direct_subgroups.all()), [leadership_group]
+        )
+
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {
+                        "new": {
+                            "direct_members": [hamlet.id],
+                            "direct_subgroups": [moderators_group.id],
+                        },
+                        "old": moderators_group.id,
+                    }
+                ).decode()
+            },
+        )
+        self.assert_json_error(result, "'old' value does not match the expected value.")
+
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {
+                        "new": {
+                            "direct_members": [hamlet.id],
+                            "direct_subgroups": [moderators_group.id],
+                        },
+                        "old": {
+                            "direct_members": [othello.id],
+                            "direct_subgroups": [moderators_group.id],
+                        },
+                    }
+                ).decode(),
+            },
+        )
+        self.assert_json_error(result, "'old' value does not match the expected value.")
+
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {
+                        "new": {
+                            "direct_members": [hamlet.id],
+                            "direct_subgroups": [moderators_group.id],
+                        },
+                        "old": {
+                            "direct_members": [othello.id],
+                            "direct_subgroups": [leadership_group.id],
+                        },
+                    }
+                ).decode()
+            },
+        )
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertCountEqual(list(getattr(realm, setting_name).direct_members.all()), [hamlet])
+        self.assertCountEqual(
+            list(getattr(realm, setting_name).direct_subgroups.all()), [moderators_group]
+        )
+
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {
+                        "new": leadership_group.id,
+                        "old": {
+                            "direct_members": [hamlet.id],
+                            "direct_subgroups": [moderators_group.id],
+                        },
+                    }
+                ).decode()
+            },
+        )
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertEqual(getattr(realm, setting_name), leadership_group.usergroup_ptr)
+
+        # Test that object with only one direct_subgroup is considered
+        # same as passing the named user group ID directly.
+        result = self.client_patch(
+            "/json/realm",
+            {
+                setting_name: orjson.dumps(
+                    {
+                        "new": {
+                            "direct_members": [],
+                            "direct_subgroups": [admins_group.id],
+                        },
+                        "old": {
+                            "direct_members": [],
+                            "direct_subgroups": [leadership_group.id],
+                        },
+                    }
+                ).decode()
+            },
+        )
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertEqual(getattr(realm, setting_name), admins_group.usergroup_ptr)
+
     def test_update_realm_properties(self) -> None:
         for prop in Realm.property_types:
+            # push_notifications_enabled is maintained by the server, not via the API.
+            if prop != "push_notifications_enabled":
+                with self.subTest(property=prop):
+                    self.do_test_realm_update_api(prop)
+
+        hamlet = self.example_user("hamlet")
+        check_add_user_group(get_realm("zulip"), "leadership", [hamlet], acting_user=hamlet)
+        for prop in Realm.REALM_PERMISSION_GROUP_SETTINGS:
             with self.subTest(property=prop):
-                self.do_test_realm_update_api(prop)
+                self.do_test_realm_permission_group_setting_update_api(prop)
+                if Realm.REALM_PERMISSION_GROUP_SETTINGS[prop].require_system_group:
+                    # Anonymous system groups aren't relevant when
+                    # restricted to system groups.
+                    continue
+                self.do_test_realm_permission_group_setting_update_api_with_anonymous_groups(prop)
+
+    # Not in Realm.property_types because org_type has
+    # a unique RealmAuditLog event_type.
+    def test_update_realm_org_type(self) -> None:
+        vals = [t["id"] for t in Realm.ORG_TYPES.values()]
+
+        do_change_realm_org_type(get_realm("zulip"), vals[0], acting_user=None)
+
+        for val in vals[1:]:
+            realm = self.update_with_api("org_type", val)
+            self.assertEqual(realm.org_type, val)
+
+        realm = self.update_with_api("org_type", vals[0])
+        self.assertEqual(realm.org_type, vals[0])
+
+        # Now we test an invalid org_type id.
+        invalid_org_type = 1
+        assert invalid_org_type not in vals
+        result = self.client_patch("/json/realm", {"org_type": invalid_org_type})
+        self.assert_json_error(result, "Invalid org_type")
 
     def update_with_realm_default_api(self, name: str, val: Any) -> None:
         if not isinstance(val, str):
@@ -984,15 +2248,27 @@ class RealmAPITest(ZulipTestCase):
         self.assert_json_success(result)
 
     def do_test_realm_default_setting_update_api(self, name: str) -> None:
-        bool_tests: List[bool] = [False, True]
-        test_values: Dict[str, Any] = dict(
+        bool_tests: list[bool] = [False, True]
+        test_values: dict[str, Any] = dict(
+            web_font_size_px=[UserProfile.WEB_FONT_SIZE_PX_COMPACT],
+            web_line_height_percent=[UserProfile.WEB_LINE_HEIGHT_PERCENT_COMPACT],
             color_scheme=UserProfile.COLOR_SCHEME_CHOICES,
-            default_view=["recent_topics", "all_messages"],
+            web_home_view=["recent_topics", "inbox", "all_messages"],
             emojiset=[emojiset["key"] for emojiset in RealmUserDefault.emojiset_choices()],
             demote_inactive_streams=UserProfile.DEMOTE_STREAMS_CHOICES,
-            desktop_icon_count_display=[1, 2, 3],
+            web_mark_read_on_scroll_policy=UserProfile.WEB_MARK_READ_ON_SCROLL_POLICY_CHOICES,
+            web_channel_default_view=UserProfile.WEB_CHANNEL_DEFAULT_VIEW_CHOICES,
+            user_list_style=UserProfile.USER_LIST_STYLE_CHOICES,
+            web_animate_image_previews=["always", "on_hover", "never"],
+            web_stream_unreads_count_display_policy=UserProfile.WEB_STREAM_UNREADS_COUNT_DISPLAY_POLICY_CHOICES,
+            desktop_icon_count_display=UserProfile.DESKTOP_ICON_COUNT_DISPLAY_CHOICES,
             notification_sound=["zulip", "ding"],
             email_notifications_batching_period_seconds=[120, 300],
+            email_address_visibility=UserProfile.EMAIL_ADDRESS_VISIBILITY_TYPES,
+            realm_name_in_email_notifications_policy=UserProfile.REALM_NAME_IN_EMAIL_NOTIFICATIONS_POLICY_CHOICES,
+            automatically_follow_topics_policy=UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_CHOICES,
+            automatically_unmute_topics_in_muted_streams_policy=UserProfile.AUTOMATICALLY_CHANGE_VISIBILITY_POLICY_CHOICES,
+            automatically_follow_topics_where_mentioned=[True, False],
         )
 
         vals = test_values.get(name)
@@ -1024,9 +2300,125 @@ class RealmAPITest(ZulipTestCase):
             # duplicate code. default_language is currently present in Realm table also and thus
             # is updated using '/realm' endpoint, but this will be removed in future and the
             # settings in RealmUserDefault table will be used.
-            if prop in ["default_language", "enable_login_emails", "enable_marketing_emails"]:
+            if prop in [
+                "default_language",
+                "enable_login_emails",
+                "enable_marketing_emails",
+                "allow_private_data_export",
+            ]:
+                continue
+            if prop in ["dense_mode"]:
+                # Testing this is complicated, see test_update_default_information_density_settings.
                 continue
             self.do_test_realm_default_setting_update_api(prop)
+
+    def test_update_default_information_density_settings(self) -> None:
+        realm = get_realm("zulip")
+
+        # Start with the legacy settings configuration
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        realm_user_default.dense_mode = True
+        realm_user_default.web_font_size_px = RealmUserDefault.WEB_FONT_SIZE_PX_COMPACT
+        realm_user_default.web_line_height_percent = (
+            RealmUserDefault.WEB_LINE_HEIGHT_PERCENT_COMPACT
+        )
+        realm_user_default.save()
+        self.login("iago")
+
+        data: dict[str, str | int] = {"web_font_size_px": 16}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_error(
+            result,
+            "Incompatible values for 'dense_mode' and 'web_font_size_px'.",
+        )
+
+        data = {"web_font_size_px": 16, "dense_mode": orjson.dumps(False).decode()}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_success(result)
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        self.assertEqual(realm_user_default.web_font_size_px, 16)
+        self.assertEqual(realm_user_default.dense_mode, False)
+
+        data = {"web_font_size_px": 20}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_success(result)
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        self.assertEqual(realm_user_default.web_font_size_px, 20)
+        self.assertEqual(realm_user_default.dense_mode, False)
+
+        # Check dense_mode is still false when both the
+        # settings are set to legacy values.
+        data = {"web_font_size_px": 14}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_success(result)
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        self.assertEqual(realm_user_default.web_font_size_px, 14)
+        self.assertEqual(realm_user_default.web_line_height_percent, 122)
+        self.assertEqual(realm_user_default.dense_mode, False)
+
+        data = {"dense_mode": orjson.dumps(True).decode()}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_success(result)
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        self.assertEqual(realm_user_default.web_font_size_px, 14)
+        self.assertEqual(realm_user_default.dense_mode, True)
+
+        data = {"web_line_height_percent": 140}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_error(
+            result,
+            "Incompatible values for 'dense_mode' and 'web_line_height_percent'.",
+        )
+
+        data = {"web_line_height_percent": 140, "dense_mode": orjson.dumps(False).decode()}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_success(result)
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        self.assertEqual(realm_user_default.web_line_height_percent, 140)
+        self.assertEqual(realm_user_default.dense_mode, False)
+
+        data = {"web_line_height_percent": 130}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_success(result)
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        self.assertEqual(realm_user_default.web_line_height_percent, 130)
+        self.assertEqual(realm_user_default.dense_mode, False)
+
+        # Check dense_mode is still false when both the
+        # settings are set to legacy values.
+        data = {"web_line_height_percent": 122}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_success(result)
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        self.assertEqual(realm_user_default.web_font_size_px, 14)
+        self.assertEqual(realm_user_default.web_line_height_percent, 122)
+        self.assertEqual(realm_user_default.dense_mode, False)
+
+        data = {"dense_mode": orjson.dumps(True).decode(), "web_font_size_px": 16}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_error(
+            result,
+            "Incompatible values for 'dense_mode' and 'web_font_size_px'.",
+        )
+
+        data = {"dense_mode": orjson.dumps(True).decode(), "web_line_height_percent": 140}
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_error(
+            result,
+            "Incompatible values for 'dense_mode' and 'web_line_height_percent'.",
+        )
+
+        data = {
+            "dense_mode": orjson.dumps(True).decode(),
+            "web_font_size_px": 14,
+            "web_line_height_percent": 122,
+        }
+        result = self.client_patch("/json/realm/user_settings_defaults", data)
+        self.assert_json_success(result)
+        realm_user_default = RealmUserDefault.objects.get(realm=realm)
+        self.assertEqual(realm_user_default.web_font_size_px, 14)
+        self.assertEqual(realm_user_default.web_line_height_percent, 122)
+        self.assertEqual(realm_user_default.dense_mode, True)
 
     def test_invalid_default_notification_sound_value(self) -> None:
         result = self.client_patch(
@@ -1055,123 +2447,183 @@ class RealmAPITest(ZulipTestCase):
         )
         self.assert_json_error(result, "Invalid email batching period: 604810 seconds")
 
+    def test_invalid_emojiset_value(self) -> None:
+        result = self.client_patch("/json/realm/user_settings_defaults", {"emojiset": "invalid"})
+        self.assert_json_error(
+            result, "Invalid emojiset: Value error, Not in the list of possible values"
+        )
+
     def test_ignored_parameters_in_realm_default_endpoint(self) -> None:
         params = {"starred_message_counts": orjson.dumps(False).decode(), "emoji_set": "twitter"}
-        json_result = self.client_patch("/json/realm/user_settings_defaults", params)
-        self.assert_json_success(json_result)
+        result = self.client_patch("/json/realm/user_settings_defaults", params)
+        self.assert_json_success(result, ignored_parameters=["emoji_set"])
 
         realm = get_realm("zulip")
         realm_user_default = RealmUserDefault.objects.get(realm=realm)
         self.assertEqual(realm_user_default.starred_message_counts, False)
 
-        result = orjson.loads(json_result.content)
-        self.assertIn("ignored_parameters_unsupported", result)
-        self.assertEqual(result["ignored_parameters_unsupported"], ["emoji_set"])
-
-    def test_update_realm_allow_message_editing(self) -> None:
-        """Tests updating the realm property 'allow_message_editing'."""
-        self.set_up_db("allow_message_editing", False)
-        self.set_up_db("message_content_edit_limit_seconds", 0)
-        self.set_up_db("edit_topic_policy", Realm.POLICY_ADMINS_ONLY)
-        realm = self.update_with_api("allow_message_editing", True)
-        realm = self.update_with_api("message_content_edit_limit_seconds", 100)
-        realm = self.update_with_api("edit_topic_policy", Realm.POLICY_EVERYONE)
-        self.assertEqual(realm.allow_message_editing, True)
-        self.assertEqual(realm.message_content_edit_limit_seconds, 100)
-        self.assertEqual(realm.edit_topic_policy, Realm.POLICY_EVERYONE)
-        realm = self.update_with_api("allow_message_editing", False)
-        self.assertEqual(realm.allow_message_editing, False)
-        self.assertEqual(realm.message_content_edit_limit_seconds, 100)
-        self.assertEqual(realm.edit_topic_policy, Realm.POLICY_EVERYONE)
-        realm = self.update_with_api("message_content_edit_limit_seconds", 200)
-        self.assertEqual(realm.allow_message_editing, False)
-        self.assertEqual(realm.message_content_edit_limit_seconds, 200)
-        self.assertEqual(realm.edit_topic_policy, Realm.POLICY_EVERYONE)
-        realm = self.update_with_api("edit_topic_policy", Realm.POLICY_ADMINS_ONLY)
-        self.assertEqual(realm.allow_message_editing, False)
-        self.assertEqual(realm.message_content_edit_limit_seconds, 200)
-        self.assertEqual(realm.edit_topic_policy, Realm.POLICY_ADMINS_ONLY)
-
-        realm = self.update_with_api("edit_topic_policy", Realm.POLICY_MODERATORS_ONLY)
-        self.assertEqual(realm.allow_message_editing, False)
-        self.assertEqual(realm.message_content_edit_limit_seconds, 200)
-        self.assertEqual(realm.edit_topic_policy, Realm.POLICY_MODERATORS_ONLY)
-
-        realm = self.update_with_api("edit_topic_policy", Realm.POLICY_FULL_MEMBERS_ONLY)
-        self.assertEqual(realm.allow_message_editing, False)
-        self.assertEqual(realm.message_content_edit_limit_seconds, 200)
-        self.assertEqual(realm.edit_topic_policy, Realm.POLICY_FULL_MEMBERS_ONLY)
-
-        realm = self.update_with_api("edit_topic_policy", Realm.POLICY_MEMBERS_ONLY)
-        self.assertEqual(realm.allow_message_editing, False)
-        self.assertEqual(realm.message_content_edit_limit_seconds, 200)
-        self.assertEqual(realm.edit_topic_policy, Realm.POLICY_MEMBERS_ONLY)
-
-        # Test an invalid value for edit_topic_policy
-        invalid_edit_topic_policy_value = 10
-        req = {"edit_topic_policy": orjson.dumps(invalid_edit_topic_policy_value).decode()}
-        result = self.client_patch("/json/realm", req)
-        self.assert_json_error(result, "Invalid edit_topic_policy")
-
-    def test_update_realm_delete_own_message_policy(self) -> None:
-        """Tests updating the realm property 'delete_own_message_policy'."""
-        self.set_up_db("delete_own_message_policy", Realm.POLICY_EVERYONE)
-        realm = self.update_with_api("delete_own_message_policy", Realm.POLICY_ADMINS_ONLY)
-        self.assertEqual(realm.delete_own_message_policy, Realm.POLICY_ADMINS_ONLY)
-        self.assertEqual(realm.message_content_delete_limit_seconds, 600)
-        realm = self.update_with_api("delete_own_message_policy", Realm.POLICY_EVERYONE)
-        realm = self.update_with_api("message_content_delete_limit_seconds", 100)
-        self.assertEqual(realm.delete_own_message_policy, Realm.POLICY_EVERYONE)
-        self.assertEqual(realm.message_content_delete_limit_seconds, 100)
-        realm = self.update_with_api(
-            "message_content_delete_limit_seconds", orjson.dumps("unlimited").decode()
-        )
-        self.assertEqual(realm.message_content_delete_limit_seconds, None)
-        realm = self.update_with_api("message_content_delete_limit_seconds", 600)
-        self.assertEqual(realm.delete_own_message_policy, Realm.POLICY_EVERYONE)
-        self.assertEqual(realm.message_content_delete_limit_seconds, 600)
-        realm = self.update_with_api("delete_own_message_policy", Realm.POLICY_MODERATORS_ONLY)
-        self.assertEqual(realm.delete_own_message_policy, Realm.POLICY_MODERATORS_ONLY)
-        realm = self.update_with_api("delete_own_message_policy", Realm.POLICY_FULL_MEMBERS_ONLY)
-        self.assertEqual(realm.delete_own_message_policy, Realm.POLICY_FULL_MEMBERS_ONLY)
-        realm = self.update_with_api("delete_own_message_policy", Realm.POLICY_MEMBERS_ONLY)
-        self.assertEqual(realm.delete_own_message_policy, Realm.POLICY_MEMBERS_ONLY)
-
-        # Test that 0 is invalid value.
-        req = dict(message_content_delete_limit_seconds=orjson.dumps(0).decode())
-        result = self.client_patch("/json/realm", req)
-        self.assert_json_error(result, "Bad value for 'message_content_delete_limit_seconds': 0")
-
-        # Test that only "unlimited" string is valid and others are invalid.
-        req = dict(message_content_delete_limit_seconds=orjson.dumps("invalid").decode())
-        result = self.client_patch("/json/realm", req)
-        self.assert_json_error(
-            result, "Bad value for 'message_content_delete_limit_seconds': invalid"
-        )
-
-    def test_change_invite_to_realm_policy_by_owners_only(self) -> None:
+    def test_update_realm_move_messages_within_stream_limit_seconds_unlimited_value(self) -> None:
+        realm = get_realm("zulip")
         self.login("iago")
-        req = {"invite_to_realm_policy": Realm.POLICY_ADMINS_ONLY}
-        result = self.client_patch("/json/realm", req)
+        realm = self.update_with_api(
+            "move_messages_within_stream_limit_seconds", orjson.dumps("unlimited").decode()
+        )
+        self.assertEqual(realm.move_messages_within_stream_limit_seconds, None)
+
+    def test_update_realm_move_messages_between_streams_limit_seconds_unlimited_value(self) -> None:
+        realm = get_realm("zulip")
+        self.login("iago")
+        realm = self.update_with_api(
+            "move_messages_between_streams_limit_seconds", orjson.dumps("unlimited").decode()
+        )
+        self.assertEqual(realm.move_messages_between_streams_limit_seconds, None)
+
+    def do_test_changing_settings_by_owners_only(self, setting_name: str) -> None:
+        bool_tests: list[bool] = [False, True]
+        test_values: dict[str, Any] = dict(
+            waiting_period_threshold=[10, 20],
+        )
+
+        vals = test_values.get(setting_name)
+        if Realm.property_types[setting_name] is bool:
+            vals = bool_tests
+        assert vals is not None
+
+        do_set_realm_property(get_realm("zulip"), setting_name, vals[0], acting_user=None)
+        value = vals[1]
+
+        if not isinstance(value, str):
+            value = orjson.dumps(value).decode()
+
+        self.login("iago")
+        result = self.client_patch("/json/realm", {setting_name: value})
         self.assert_json_error(result, "Must be an organization owner")
 
         self.login("desdemona")
-        result = self.client_patch("/json/realm", req)
+        result = self.client_patch("/json/realm", {setting_name: value})
         self.assert_json_success(result)
         realm = get_realm("zulip")
-        self.assertEqual(realm.invite_to_realm_policy, Realm.POLICY_ADMINS_ONLY)
+        self.assertEqual(getattr(realm, setting_name), vals[1])
+
+    def test_changing_user_joining_settings_require_owners(self) -> None:
+        self.do_test_changing_settings_by_owners_only("invite_required")
+        self.do_test_changing_settings_by_owners_only("emails_restricted_to_domains")
+        self.do_test_changing_settings_by_owners_only("disallow_disposable_email_addresses")
+        self.do_test_changing_settings_by_owners_only("waiting_period_threshold")
+
+    def do_test_changing_groups_setting_by_owners_only(self, setting_name: str) -> None:
+        realm = get_realm("zulip")
+        admins_group = NamedUserGroup.objects.get(
+            name=SystemGroups.ADMINISTRATORS, realm=realm, is_system_group=True
+        )
+
+        self.login("iago")
+        result = self.client_patch(
+            "/json/realm", {setting_name: orjson.dumps({"new": admins_group.id}).decode()}
+        )
+        self.assert_json_error(result, "Must be an organization owner")
+
+        self.login("desdemona")
+        result = self.client_patch(
+            "/json/realm", {setting_name: orjson.dumps({"new": admins_group.id}).decode()}
+        )
+        self.assert_json_success(result)
+        realm = get_realm("zulip")
+        self.assertEqual(getattr(realm, setting_name).id, admins_group.id)
+
+    def test_can_create_groups_setting_requires_owner(self) -> None:
+        self.do_test_changing_groups_setting_by_owners_only("can_create_groups")
+
+    def test_can_invite_users_group_setting_requires_owner(self) -> None:
+        self.do_test_changing_groups_setting_by_owners_only("can_invite_users_group")
+
+    def test_can_manage_all_groups_setting_requires_owner(self) -> None:
+        self.do_test_changing_groups_setting_by_owners_only("can_manage_all_groups")
+
+    def test_enable_spectator_access_for_limited_plan_realms(self) -> None:
+        self.login("iago")
+        realm = get_realm("zulip")
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
+        self.assertFalse(realm.enable_spectator_access)
+
+        req = {"enable_spectator_access": orjson.dumps(True).decode()}
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "Available on Zulip Cloud Standard. Upgrade to access.")
+
+    def test_can_create_groups_limited_plan_realms(self) -> None:
+        self.login("iago")
+        realm = get_realm("zulip")
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
+
+        members_group = NamedUserGroup.objects.get(name="role:members", realm=realm)
+        req = {"can_create_groups": orjson.dumps({"new": members_group.id}).decode()}
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "Available on Zulip Cloud Standard. Upgrade to access.")
+
+    def test_changing_can_access_all_users_group_based_on_plan_type(self) -> None:
+        realm = get_realm("zulip")
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_LIMITED, acting_user=None)
+        self.login("iago")
+
+        members_group = NamedUserGroup.objects.get(name="role:members", realm=realm)
+        req = {"can_access_all_users_group": orjson.dumps({"new": members_group.id}).decode()}
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "Available on Zulip Cloud Plus. Upgrade to access.")
+
+        do_change_realm_plan_type(realm, Realm.PLAN_TYPE_STANDARD, acting_user=None)
+        req = {"can_access_all_users_group": orjson.dumps({"new": members_group.id}).decode()}
+        result = self.client_patch("/json/realm", req)
+        self.assert_json_error(result, "Available on Zulip Cloud Plus. Upgrade to access.")
 
 
 class ScrubRealmTest(ZulipTestCase):
+    def test_do_delete_all_realm_attachments(self) -> None:
+        realm = get_realm("zulip")
+        hamlet = self.example_user("hamlet")
+        Attachment.objects.filter(realm=realm).delete()
+        assert settings.LOCAL_UPLOADS_DIR is not None
+        assert settings.LOCAL_FILES_DIR is not None
+
+        path_ids = []
+        for n in range(1, 4):
+            content = f"content{n}".encode()
+            url = upload_message_attachment(f"dummy{n}.txt", "text/plain", content, hamlet)[0]
+            base = "/user_uploads/"
+            self.assertEqual(base, url[: len(base)])
+            path_id = re.sub(r"/user_uploads/", "", url)
+            self.assertTrue(os.path.isfile(os.path.join(settings.LOCAL_FILES_DIR, path_id)))
+            path_ids.append(path_id)
+
+        with mock.patch(
+            "zerver.actions.realm_settings.delete_message_attachments",
+            side_effect=delete_message_attachments,
+        ) as p:
+            do_delete_all_realm_attachments(realm, batch_size=2)
+
+            self.assertEqual(p.call_count, 2)
+            p.assert_has_calls(
+                [
+                    mock.call([path_ids[0], path_ids[1]]),
+                    mock.call([path_ids[2]]),
+                ]
+            )
+        self.assertEqual(Attachment.objects.filter(realm=realm).count(), 0)
+        for file_path in path_ids:
+            self.assertFalse(os.path.isfile(os.path.join(settings.LOCAL_FILES_DIR, path_id)))
+
     def test_scrub_realm(self) -> None:
         zulip = get_realm("zulip")
         lear = get_realm("lear")
+        internal_realm = get_realm(settings.SYSTEM_BOT_REALM)
 
+        hamlet = self.example_user("hamlet")
         iago = self.example_user("iago")
         othello = self.example_user("othello")
 
         cordelia = self.lear_user("cordelia")
         king = self.lear_user("king")
+
+        notification_bot = get_system_bot(settings.NOTIFICATION_BOT, internal_realm.id)
 
         create_stream_if_needed(lear, "Shakespeare")
 
@@ -1187,45 +2639,110 @@ class ScrubRealmTest(ZulipTestCase):
             self.send_stream_message(cordelia, "Shakespeare")
             self.send_stream_message(king, "Shakespeare")
 
-        Attachment.objects.filter(realm=zulip).delete()
-        Attachment.objects.create(realm=zulip, owner=iago, path_id="a/b/temp1.txt", size=512)
-        Attachment.objects.create(realm=zulip, owner=othello, path_id="a/b/temp2.txt", size=512)
+        internal_send_stream_message(
+            notification_bot, get_stream("Scotland", zulip), "test", "test"
+        )
+        internal_send_private_message(notification_bot, othello, "test")
+        internal_send_group_direct_message(
+            zulip, notification_bot, "test", emails=[othello.email, iago.email]
+        )
 
+        internal_send_stream_message(
+            notification_bot, get_stream("Shakespeare", lear), "test", "test"
+        )
+        internal_send_private_message(notification_bot, king, "test")
+        internal_send_group_direct_message(
+            lear, notification_bot, "test", emails=[cordelia.email, king.email]
+        )
+
+        Attachment.objects.filter(realm=zulip).delete()
         Attachment.objects.filter(realm=lear).delete()
-        Attachment.objects.create(realm=lear, owner=cordelia, path_id="c/d/temp1.txt", size=512)
-        Attachment.objects.create(realm=lear, owner=king, path_id="c/d/temp2.txt", size=512)
+        assert settings.LOCAL_UPLOADS_DIR is not None
+        assert settings.LOCAL_FILES_DIR is not None
+        file_paths = []
+        for n, owner in enumerate([iago, othello, hamlet, cordelia, king]):
+            content = f"content{n}".encode()
+            url = upload_message_attachment(f"dummy{n}.txt", "text/plain", content, owner)[0]
+            base = "/user_uploads/"
+            self.assertEqual(base, url[: len(base)])
+            file_path = os.path.join(settings.LOCAL_FILES_DIR, re.sub(r"/user_uploads/", "", url))
+            self.assertTrue(os.path.isfile(file_path))
+            file_paths.append(file_path)
 
         CustomProfileField.objects.create(realm=lear)
 
-        self.assertEqual(Message.objects.filter(sender__in=[iago, othello]).count(), 10)
-        self.assertEqual(Message.objects.filter(sender__in=[cordelia, king]).count(), 10)
-        self.assertEqual(UserMessage.objects.filter(user_profile__in=[iago, othello]).count(), 20)
-        self.assertEqual(UserMessage.objects.filter(user_profile__in=[cordelia, king]).count(), 20)
+        self.assertEqual(
+            Message.objects.filter(
+                realm_id__in=(zulip.id, lear.id), sender__in=[iago, othello]
+            ).count(),
+            10,
+        )
+        self.assertEqual(
+            Message.objects.filter(
+                realm_id__in=(zulip.id, lear.id), sender__in=[cordelia, king]
+            ).count(),
+            10,
+        )
+        self.assertEqual(
+            Message.objects.filter(
+                realm_id__in=(zulip.id, lear.id), sender=notification_bot
+            ).count(),
+            6,
+        )
+        self.assertEqual(UserMessage.objects.filter(user_profile__in=[iago, othello]).count(), 25)
+        self.assertEqual(UserMessage.objects.filter(user_profile__in=[cordelia, king]).count(), 25)
 
         self.assertNotEqual(CustomProfileField.objects.filter(realm=zulip).count(), 0)
 
         with self.assertLogs(level="WARNING"):
             do_scrub_realm(zulip, acting_user=None)
 
-        self.assertEqual(Message.objects.filter(sender__in=[iago, othello]).count(), 0)
-        self.assertEqual(Message.objects.filter(sender__in=[cordelia, king]).count(), 10)
+        self.assertEqual(
+            Message.objects.filter(
+                realm_id__in=(zulip.id, lear.id), sender__in=[iago, othello]
+            ).count(),
+            0,
+        )
+        self.assertEqual(
+            Message.objects.filter(
+                realm_id__in=(zulip.id, lear.id), sender__in=[cordelia, king]
+            ).count(),
+            10,
+        )
+        self.assertEqual(
+            Message.objects.filter(
+                realm_id__in=(zulip.id, lear.id), sender=notification_bot
+            ).count(),
+            3,
+        )
         self.assertEqual(UserMessage.objects.filter(user_profile__in=[iago, othello]).count(), 0)
-        self.assertEqual(UserMessage.objects.filter(user_profile__in=[cordelia, king]).count(), 20)
+        self.assertEqual(UserMessage.objects.filter(user_profile__in=[cordelia, king]).count(), 25)
 
         self.assertEqual(Attachment.objects.filter(realm=zulip).count(), 0)
         self.assertEqual(Attachment.objects.filter(realm=lear).count(), 2)
+
+        # Zulip realm files don't exist on disk, Lear ones do
+        self.assertFalse(os.path.isfile(file_paths[0]))
+        self.assertFalse(os.path.isfile(file_paths[1]))
+        self.assertFalse(os.path.isfile(file_paths[2]))
+        self.assertTrue(os.path.isfile(file_paths[3]))
+        self.assertTrue(os.path.isfile(file_paths[4]))
 
         self.assertEqual(CustomProfileField.objects.filter(realm=zulip).count(), 0)
         self.assertNotEqual(CustomProfileField.objects.filter(realm=lear).count(), 0)
 
         zulip_users = UserProfile.objects.filter(realm=zulip)
         for user in zulip_users:
-            self.assertTrue(re.search("Scrubbed [a-z0-9]{15}", user.full_name))
-            self.assertTrue(re.search("scrubbed-[a-z0-9]{15}@" + zulip.host, user.email))
-            self.assertTrue(re.search("scrubbed-[a-z0-9]{15}@" + zulip.host, user.delivery_email))
+            self.assertRegex(user.full_name, r"^Scrubbed [a-z0-9]{15}$")
+            self.assertRegex(user.email, rf"^scrubbed-[a-z0-9]{{15}}@{re.escape(zulip.host)}$")
+            self.assertRegex(
+                user.delivery_email, rf"^scrubbed-[a-z0-9]{{15}}@{re.escape(zulip.host)}$"
+            )
 
         lear_users = UserProfile.objects.filter(realm=lear)
         for user in lear_users:
-            self.assertIsNone(re.search("Scrubbed [a-z0-9]{15}", user.full_name))
-            self.assertIsNone(re.search("scrubbed-[a-z0-9]{15}@" + zulip.host, user.email))
-            self.assertIsNone(re.search("scrubbed-[a-z0-9]{15}@" + zulip.host, user.delivery_email))
+            self.assertNotRegex(user.full_name, r"^Scrubbed [a-z0-9]{15}$")
+            self.assertNotRegex(user.email, rf"^scrubbed-[a-z0-9]{{15}}@{re.escape(zulip.host)}$")
+            self.assertNotRegex(
+                user.delivery_email, rf"^scrubbed-[a-z0-9]{{15}}@{re.escape(zulip.host)}$"
+            )

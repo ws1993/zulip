@@ -1,10 +1,8 @@
-from typing import Any, List, Mapping
-
 import orjson
 
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.lib.test_helpers import queries_captured
-from zerver.models import Huddle, get_huddle_hash
+from zerver.models import DirectMessageGroup
+from zerver.models.recipients import get_direct_message_group_hash
 
 
 class TypingValidateOperatorTest(ZulipTestCase):
@@ -19,7 +17,7 @@ class TypingValidateOperatorTest(ZulipTestCase):
         result = self.api_post(sender, "/api/v1/typing", params)
         self.assert_json_error(result, "Missing 'op' argument")
 
-    def test_invalid_parameter_pm(self) -> None:
+    def test_invalid_parameter_direct_message(self) -> None:
         """
         Sending typing notification with invalid value for op parameter fails
         """
@@ -53,22 +51,29 @@ class TypingMessagetypeTest(ZulipTestCase):
 
 
 class TypingValidateToArgumentsTest(ZulipTestCase):
-    def test_empty_to_array_pms(self) -> None:
+    def test_invalid_to_for_direct_messages(self) -> None:
         """
-        Sending pms typing notification without recipient fails
+        Sending dms typing notifications without 'to' as a list fails.
+        """
+        sender = self.example_user("hamlet")
+        result = self.api_post(sender, "/api/v1/typing", {"op": "start", "to": "2"})
+        self.assert_json_error(result, "to is not a list")
+
+    def test_invalid_user_id_for_direct_messages(self) -> None:
+        """
+        Sending dms typing notifications with invalid user_id fails.
+        """
+        sender = self.example_user("hamlet")
+        invalid_user_ids = orjson.dumps([2, "a", 4]).decode()
+        result = self.api_post(sender, "/api/v1/typing", {"op": "start", "to": invalid_user_ids})
+        self.assert_json_error(result, "to[1] is not an integer")
+
+    def test_empty_to_array_direct_messages(self) -> None:
+        """
+        Sending dms typing notification without recipient fails
         """
         sender = self.example_user("hamlet")
         result = self.api_post(sender, "/api/v1/typing", {"op": "start", "to": "[]"})
-        self.assert_json_error(result, "Empty 'to' list")
-
-    def test_empty_to_array_stream(self) -> None:
-        """
-        Sending stream typing notification without recipient fails
-        """
-        sender = self.example_user("hamlet")
-        result = self.api_post(
-            sender, "/api/v1/typing", {"type": "stream", "op": "start", "to": "[]"}
-        )
         self.assert_json_error(result, "Empty 'to' list")
 
     def test_missing_recipient(self) -> None:
@@ -79,15 +84,6 @@ class TypingValidateToArgumentsTest(ZulipTestCase):
         result = self.api_post(sender, "/api/v1/typing", {"op": "start"})
         self.assert_json_error(result, "Missing 'to' argument")
 
-    def test_argument_to_is_not_valid_json(self) -> None:
-        """
-        Sending typing notification to invalid recipient fails
-        """
-        sender = self.example_user("hamlet")
-        invalid = "bad email"
-        result = self.api_post(sender, "/api/v1/typing", {"op": "start", "to": invalid})
-        self.assert_json_error(result, 'Argument "to" is not valid JSON.')
-
     def test_bogus_user_id(self) -> None:
         """
         Sending typing notification to invalid recipient fails
@@ -97,13 +93,31 @@ class TypingValidateToArgumentsTest(ZulipTestCase):
         result = self.api_post(sender, "/api/v1/typing", {"op": "start", "to": invalid})
         self.assert_json_error(result, "Invalid user ID 9999999")
 
-    def test_send_multiple_stream_ids(self) -> None:
-        sender = self.example_user("hamlet")
 
+class TypingValidateStreamIdTopicArgumentsTest(ZulipTestCase):
+    def test_missing_stream_id(self) -> None:
+        """
+        Sending stream typing notifications without 'stream_id' fails.
+        """
+        sender = self.example_user("hamlet")
         result = self.api_post(
-            sender, "/api/v1/typing", {"type": "stream", "op": "stop", "to": "[1, 2, 3]"}
+            sender,
+            "/api/v1/typing",
+            {"type": "stream", "op": "start", "topic": "test"},
         )
-        self.assert_json_error(result, "Cannot send to multiple streams")
+        self.assert_json_error(result, "Missing 'stream_id' argument")
+
+    def test_invalid_stream_id(self) -> None:
+        """
+        Sending stream typing notifications without 'stream_id' as an integer fails.
+        """
+        sender = self.example_user("hamlet")
+        result = self.api_post(
+            sender,
+            "/api/v1/typing",
+            {"type": "stream", "op": "start", "stream_id": "invalid", "topic": "test"},
+        )
+        self.assert_json_error(result, "stream_id is not valid JSON")
 
     def test_includes_stream_id_but_not_topic(self) -> None:
         sender = self.example_user("hamlet")
@@ -112,14 +126,14 @@ class TypingValidateToArgumentsTest(ZulipTestCase):
         result = self.api_post(
             sender,
             "/api/v1/typing",
-            {"type": "stream", "op": "start", "to": orjson.dumps([stream_id]).decode()},
+            {"type": "stream", "op": "start", "stream_id": str(stream_id)},
         )
         self.assert_json_error(result, "Missing topic")
 
     def test_stream_doesnt_exist(self) -> None:
         sender = self.example_user("hamlet")
         stream_id = self.INVALID_STREAM_ID
-        topic = "some topic"
+        topic_name = "some topic"
 
         result = self.api_post(
             sender,
@@ -127,14 +141,29 @@ class TypingValidateToArgumentsTest(ZulipTestCase):
             {
                 "type": "stream",
                 "op": "start",
-                "to": orjson.dumps([stream_id]).decode(),
-                "topic": topic,
+                "stream_id": str(stream_id),
+                "topic": topic_name,
             },
         )
-        self.assert_json_error(result, "Invalid stream id")
+        self.assert_json_error(result, "Invalid channel ID")
 
 
-class TypingHappyPathTestPMs(ZulipTestCase):
+class TypingHappyPathTestDirectMessages(ZulipTestCase):
+    def test_valid_type_and_op_parameters(self) -> None:
+        operator_type = ["start", "stop"]
+        sender = self.example_user("hamlet")
+        recipient_user = self.example_user("othello")
+
+        for operator in operator_type:
+            params = dict(
+                to=orjson.dumps([recipient_user.id]).decode(),
+                op=operator,
+                type="direct",
+            )
+
+            result = self.api_post(sender, "/api/v1/typing", params)
+            self.assert_json_success(result)
+
     def test_start_to_single_recipient(self) -> None:
         sender = self.example_user("hamlet")
         recipient_user = self.example_user("othello")
@@ -147,14 +176,14 @@ class TypingHappyPathTestPMs(ZulipTestCase):
             op="start",
         )
 
-        events: List[Mapping[str, Any]] = []
-        with queries_captured() as queries:
-            with self.tornado_redirected_to_list(events, expected_num_events=1):
-                result = self.api_post(sender, "/api/v1/typing", params)
+        with (
+            self.assert_database_query_count(4),
+            self.capture_send_event_calls(expected_num_events=1) as events,
+        ):
+            result = self.api_post(sender, "/api/v1/typing", params)
 
         self.assert_json_success(result)
         self.assert_length(events, 1)
-        self.assert_length(queries, 4)
 
         event = events[0]["event"]
         event_recipient_emails = {user["email"] for user in event["recipients"]}
@@ -175,27 +204,30 @@ class TypingHappyPathTestPMs(ZulipTestCase):
         expected_recipient_emails = {user.email for user in expected_recipients}
         expected_recipient_ids = {user.id for user in expected_recipients}
 
-        huddle_hash = get_huddle_hash(list(expected_recipient_ids))
-        self.assertFalse(Huddle.objects.filter(huddle_hash=huddle_hash).exists())
-
-        events: List[Mapping[str, Any]] = []
+        direct_message_group_hash = get_direct_message_group_hash(list(expected_recipient_ids))
+        self.assertFalse(
+            DirectMessageGroup.objects.filter(huddle_hash=direct_message_group_hash).exists()
+        )
 
         params = dict(
             to=orjson.dumps([user.id for user in recipient_users]).decode(),
             op="start",
         )
 
-        with queries_captured() as queries:
-            with self.tornado_redirected_to_list(events, expected_num_events=1):
-                result = self.api_post(sender, "/api/v1/typing", params)
+        with (
+            self.assert_database_query_count(5),
+            self.capture_send_event_calls(expected_num_events=1) as events,
+        ):
+            result = self.api_post(sender, "/api/v1/typing", params)
         self.assert_json_success(result)
         self.assert_length(events, 1)
-        self.assert_length(queries, 5)
 
-        # We should not be adding new Huddles just because
-        # a user started typing in the compose box.  Let's
-        # wait till they send an actual message.
-        self.assertFalse(Huddle.objects.filter(huddle_hash=huddle_hash).exists())
+        # We should not be adding new Direct Message groups
+        # just because a user started typing in the compose
+        # box.  Let's wait till they send an actual message.
+        self.assertFalse(
+            DirectMessageGroup.objects.filter(huddle_hash=direct_message_group_hash).exists()
+        )
 
         event = events[0]["event"]
         event_recipient_emails = {user["email"] for user in event["recipients"]}
@@ -218,8 +250,7 @@ class TypingHappyPathTestPMs(ZulipTestCase):
         email = user.email
         expected_recipient_emails = {email}
         expected_recipient_ids = {user.id}
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(
                 user,
                 "/api/v1/typing",
@@ -259,8 +290,7 @@ class TypingHappyPathTestPMs(ZulipTestCase):
             op="start",
         )
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(sender, "/api/v1/typing", params)
 
         self.assert_json_success(result)
@@ -288,8 +318,7 @@ class TypingHappyPathTestPMs(ZulipTestCase):
         expected_recipient_emails = {email}
         expected_recipient_ids = {user.id}
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             params = dict(
                 to=orjson.dumps([user.id]).decode(),
                 op="stop",
@@ -322,8 +351,7 @@ class TypingHappyPathTestPMs(ZulipTestCase):
         expected_recipient_emails = {user.email for user in expected_recipients}
         expected_recipient_ids = {user.id for user in expected_recipients}
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             params = dict(
                 to=orjson.dumps([recipient.id]).decode(),
                 op="stop",
@@ -347,31 +375,48 @@ class TypingHappyPathTestPMs(ZulipTestCase):
 
 
 class TypingHappyPathTestStreams(ZulipTestCase):
+    def test_valid_type_and_op_parameters(self) -> None:
+        recipient_type_name = ["channel", "stream"]
+        operator_type = ["start", "stop"]
+        sender = self.example_user("hamlet")
+        stream_name = self.get_streams(sender)[0]
+        stream_id = self.get_stream_id(stream_name)
+        topic_name = "Some topic"
+
+        for recipient_type in recipient_type_name:
+            for operator in operator_type:
+                params = dict(
+                    type=recipient_type,
+                    op=operator,
+                    stream_id=str(stream_id),
+                    topic=topic_name,
+                )
+
+                result = self.api_post(sender, "/api/v1/typing", params)
+                self.assert_json_success(result)
+
     def test_start(self) -> None:
         sender = self.example_user("hamlet")
         stream_name = self.get_streams(sender)[0]
         stream_id = self.get_stream_id(stream_name)
-        topic = "Some topic"
+        topic_name = "Some topic"
 
-        expected_user_ids = {
-            user_profile.id
-            for user_profile in self.users_subscribed_to_stream(stream_name, sender.realm)
-        }
+        expected_user_ids = self.not_long_term_idle_subscriber_ids(stream_name, sender.realm)
 
         params = dict(
             type="stream",
             op="start",
-            to=orjson.dumps([stream_id]).decode(),
-            topic=topic,
+            stream_id=str(stream_id),
+            topic=topic_name,
         )
 
-        events: List[Mapping[str, Any]] = []
-        with queries_captured() as queries:
-            with self.tornado_redirected_to_list(events, expected_num_events=1):
-                result = self.api_post(sender, "/api/v1/typing", params)
+        with (
+            self.assert_database_query_count(6),
+            self.capture_send_event_calls(expected_num_events=1) as events,
+        ):
+            result = self.api_post(sender, "/api/v1/typing", params)
         self.assert_json_success(result)
         self.assert_length(events, 1)
-        self.assert_length(queries, 5)
 
         event = events[0]["event"]
         event_user_ids = set(events[0]["users"])
@@ -379,7 +424,7 @@ class TypingHappyPathTestStreams(ZulipTestCase):
         self.assertEqual(expected_user_ids, event_user_ids)
         self.assertEqual(sender.email, event["sender"]["email"])
         self.assertEqual(stream_id, event["stream_id"])
-        self.assertEqual(topic, event["topic"])
+        self.assertEqual(topic_name, event["topic"])
         self.assertEqual("typing", event["type"])
         self.assertEqual("start", event["op"])
 
@@ -387,27 +432,24 @@ class TypingHappyPathTestStreams(ZulipTestCase):
         sender = self.example_user("hamlet")
         stream_name = self.get_streams(sender)[0]
         stream_id = self.get_stream_id(stream_name)
-        topic = "Some topic"
+        topic_name = "Some topic"
 
-        expected_user_ids = {
-            user_profile.id
-            for user_profile in self.users_subscribed_to_stream(stream_name, sender.realm)
-        }
+        expected_user_ids = self.not_long_term_idle_subscriber_ids(stream_name, sender.realm)
 
         params = dict(
             type="stream",
             op="stop",
-            to=orjson.dumps([stream_id]).decode(),
-            topic=topic,
+            stream_id=str(stream_id),
+            topic=topic_name,
         )
 
-        events: List[Mapping[str, Any]] = []
-        with queries_captured() as queries:
-            with self.tornado_redirected_to_list(events, expected_num_events=1):
-                result = self.api_post(sender, "/api/v1/typing", params)
+        with (
+            self.assert_database_query_count(6),
+            self.capture_send_event_calls(expected_num_events=1) as events,
+        ):
+            result = self.api_post(sender, "/api/v1/typing", params)
         self.assert_json_success(result)
         self.assert_length(events, 1)
-        self.assert_length(queries, 5)
 
         event = events[0]["event"]
         event_user_ids = set(events[0]["users"])
@@ -415,9 +457,80 @@ class TypingHappyPathTestStreams(ZulipTestCase):
         self.assertEqual(expected_user_ids, event_user_ids)
         self.assertEqual(sender.email, event["sender"]["email"])
         self.assertEqual(stream_id, event["stream_id"])
-        self.assertEqual(topic, event["topic"])
+        self.assertEqual(topic_name, event["topic"])
         self.assertEqual("typing", event["type"])
         self.assertEqual("stop", event["op"])
+
+    def test_max_stream_size_for_typing_notifications_setting(self) -> None:
+        sender = self.example_user("hamlet")
+        stream_name = self.get_streams(sender)[0]
+        stream_id = self.get_stream_id(stream_name)
+        topic_name = "Some topic"
+
+        for name in ["aaron", "iago", "cordelia", "prospero", "othello", "polonius"]:
+            user = self.example_user(name)
+            self.subscribe(user, stream_name)
+
+        params = dict(
+            type="stream",
+            op="start",
+            stream_id=str(stream_id),
+            topic=topic_name,
+        )
+        with self.settings(MAX_STREAM_SIZE_FOR_TYPING_NOTIFICATIONS=5):
+            with (
+                self.assert_database_query_count(5),
+                self.capture_send_event_calls(expected_num_events=0) as events,
+            ):
+                result = self.api_post(sender, "/api/v1/typing", params)
+            self.assert_json_success(result)
+            self.assert_length(events, 0)
+
+    def test_notify_not_long_term_idle_subscribers_only(self) -> None:
+        sender = self.example_user("hamlet")
+        stream_name = self.get_streams(sender)[0]
+        stream_id = self.get_stream_id(stream_name)
+        topic_name = "Some topic"
+
+        aaron = self.example_user("aaron")
+        iago = self.example_user("iago")
+        for user in [aaron, iago]:
+            self.subscribe(user, stream_name)
+            self.soft_deactivate_user(user)
+
+        subscriber_ids = {
+            user_profile.id
+            for user_profile in self.users_subscribed_to_stream(stream_name, sender.realm)
+        }
+        not_long_term_idle_subscriber_ids = subscriber_ids - {aaron.id, iago.id}
+
+        params = dict(
+            type="stream",
+            op="start",
+            stream_id=str(stream_id),
+            topic=topic_name,
+        )
+
+        with (
+            self.assert_database_query_count(6),
+            self.capture_send_event_calls(expected_num_events=1) as events,
+        ):
+            result = self.api_post(sender, "/api/v1/typing", params)
+        self.assert_json_success(result)
+        self.assert_length(events, 1)
+
+        event = events[0]["event"]
+        event_user_ids = set(events[0]["users"])
+
+        # Only subscribers who are not long_term_idle are notified for typing notifications.
+        self.assertNotEqual(subscriber_ids, event_user_ids)
+        self.assertEqual(not_long_term_idle_subscriber_ids, event_user_ids)
+
+        self.assertEqual(sender.email, event["sender"]["email"])
+        self.assertEqual(stream_id, event["stream_id"])
+        self.assertEqual(topic_name, event["topic"])
+        self.assertEqual("typing", event["type"])
+        self.assertEqual("start", event["op"])
 
 
 class TestSendTypingNotificationsSettings(ZulipTestCase):
@@ -435,8 +548,7 @@ class TestSendTypingNotificationsSettings(ZulipTestCase):
         # Test typing events sent when `send_private_typing_notifications` set to `True`.
         self.assertTrue(sender.send_private_typing_notifications)
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(sender, "/api/v1/typing", params)
 
         self.assert_json_success(result)
@@ -449,38 +561,31 @@ class TestSendTypingNotificationsSettings(ZulipTestCase):
         sender.save()
 
         # No events should be sent now
-        events = []
-        with self.tornado_redirected_to_list(events, expected_num_events=0):
+        with self.capture_send_event_calls(expected_num_events=0) as events:
             result = self.api_post(sender, "/api/v1/typing", params)
 
-        self.assert_json_error(
-            result, "User has disabled typing notifications for private messages"
-        )
+        self.assert_json_error(result, "User has disabled typing notifications for direct messages")
         self.assertEqual(events, [])
 
     def test_send_stream_typing_notifications_setting(self) -> None:
         sender = self.example_user("hamlet")
         stream_name = self.get_streams(sender)[0]
         stream_id = self.get_stream_id(stream_name)
-        topic = "Some topic"
+        topic_name = "Some topic"
 
-        expected_user_ids = {
-            user_profile.id
-            for user_profile in self.users_subscribed_to_stream(stream_name, sender.realm)
-        }
+        expected_user_ids = self.not_long_term_idle_subscriber_ids(stream_name, sender.realm)
 
         params = dict(
             type="stream",
             op="start",
-            to=orjson.dumps([stream_id]).decode(),
-            topic=topic,
+            stream_id=str(stream_id),
+            topic=topic_name,
         )
 
         # Test typing events sent when `send_stream_typing_notifications` set to `True`.
         self.assertTrue(sender.send_stream_typing_notifications)
 
-        events: List[Mapping[str, Any]] = []
-        with self.tornado_redirected_to_list(events, expected_num_events=1):
+        with self.capture_send_event_calls(expected_num_events=1) as events:
             result = self.api_post(sender, "/api/v1/typing", params)
         self.assert_json_success(result)
         self.assert_length(events, 1)
@@ -492,8 +597,42 @@ class TestSendTypingNotificationsSettings(ZulipTestCase):
         sender.save()
 
         # No events should be sent now
-        events = []
-        with self.tornado_redirected_to_list(events, expected_num_events=0):
+        with self.capture_send_event_calls(expected_num_events=0) as events:
             result = self.api_post(sender, "/api/v1/typing", params)
-        self.assert_json_error(result, "User has disabled typing notifications for stream messages")
+        self.assert_json_error(
+            result, "User has disabled typing notifications for channel messages"
+        )
         self.assertEqual(events, [])
+
+    def test_typing_notifications_disabled(self) -> None:
+        sender = self.example_user("hamlet")
+        stream_name = self.get_streams(sender)[0]
+        stream_id = self.get_stream_id(stream_name)
+        topic_name = "Some topic"
+
+        aaron = self.example_user("aaron")
+        iago = self.example_user("iago")
+        for user in [aaron, iago]:
+            self.subscribe(user, stream_name)
+
+        aaron.receives_typing_notifications = False
+        aaron.save()
+
+        params = dict(
+            type="stream",
+            op="start",
+            stream_id=str(stream_id),
+            topic=topic_name,
+        )
+
+        with self.capture_send_event_calls(expected_num_events=1) as events:
+            result = self.api_post(sender, "/api/v1/typing", params)
+        self.assert_json_success(result)
+        self.assert_length(events, 1)
+
+        event_user_ids = set(events[0]["users"])
+
+        # Only users who have typing notifications enabled would receive
+        # notifications.
+        self.assertNotIn(aaron.id, event_user_ids)
+        self.assertIn(iago.id, event_user_ids)

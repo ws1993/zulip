@@ -1,35 +1,26 @@
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from collections.abc import Callable
+from typing import Any
 
 import django_scim.constants as scim_constants
 import django_scim.exceptions as scim_exceptions
-import orjson
 from django.conf import settings
-from django.contrib.auth.decorators import login_required
 from django.core.exceptions import ValidationError
-from django.db import models, transaction
-from django.http import HttpRequest, HttpResponse
-from django.utils.decorators import method_decorator
-from django.views.decorators.csrf import csrf_exempt
+from django.db import models
+from django.http import HttpRequest
 from django_scim.adapters import SCIMUser
-from django_scim.views import SCIMView, SearchView, UserSearchView, UsersView
-from django_scim.views import logger as scim_views_logger
 from scim2_filter_parser.attr_paths import AttrPath
 
-from zerver.lib.actions import (
-    check_change_full_name,
-    do_change_user_delivery_email,
-    do_create_user,
-    do_deactivate_user,
-    do_reactivate_user,
-)
+from zerver.actions.create_user import do_create_user, do_reactivate_user
+from zerver.actions.user_settings import check_change_full_name, do_change_user_delivery_email
+from zerver.actions.users import do_change_user_role, do_deactivate_user
 from zerver.lib.email_validation import email_allowed_for_realm, validate_email_not_already_in_realm
 from zerver.lib.request import RequestNotes
 from zerver.lib.subdomains import get_subdomain
-from zerver.models import (
+from zerver.models import UserProfile
+from zerver.models.realms import (
     DisposableEmailError,
     DomainNotAllowedForRealmError,
     EmailContainsPlusError,
-    UserProfile,
 )
 
 
@@ -41,7 +32,7 @@ class ZulipSCIMUser(SCIMUser):
 
     id_field = "id"
 
-    def __init__(self, obj: UserProfile, request: Optional[HttpRequest] = None) -> None:
+    def __init__(self, obj: UserProfile, request: HttpRequest | None = None) -> None:
         # We keep the function signature from the superclass, but this actually
         # shouldn't be called with request being None.
         assert request is not None
@@ -58,13 +49,14 @@ class ZulipSCIMUser(SCIMUser):
 
         # These attributes are custom to this class and will be
         # populated with values in handle_replace and similar methods
-        # in response to a request for the the corresponding
+        # in response to a request for the corresponding
         # UserProfile fields to change. The .save() method inspects
         # these fields an executes the requested changes.
-        self._email_new_value: Optional[str] = None
-        self._is_active_new_value: Optional[bool] = None
-        self._full_name_new_value: Optional[str] = None
-        self._password_set_to: Optional[str] = None
+        self._email_new_value: str | None = None
+        self._is_active_new_value: bool | None = None
+        self._full_name_new_value: str | None = None
+        self._role_new_value: int | None = None
+        self._password_set_to: str | None = None
 
     def is_new_user(self) -> bool:
         return not bool(self.obj.id)
@@ -79,7 +71,7 @@ class ZulipSCIMUser(SCIMUser):
         """
         return self.obj.full_name
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """
         Return a ``dict`` conforming to the SCIM User Schema,
         ready for conversion to a JSON object.
@@ -107,26 +99,24 @@ class ZulipSCIMUser(SCIMUser):
                 "givenName": first_name,
                 "familyName": last_name,
             }
-        d = dict(
-            {
-                "schemas": [scim_constants.SchemaURI.USER],
-                "id": self.obj.id,
-                "userName": self.obj.delivery_email,
-                "name": name,
-                "displayName": self.display_name,
-                "active": self.obj.is_active,
-                # meta is a property implemented in the superclass
-                # TODO: The upstream implementation uses `user_profile.date_joined`
-                # as the value of the lastModified meta attribute, which is not
-                # a correct simplification. We should add proper tracking
-                # of this value.
-                "meta": self.meta,
-            }
-        )
 
-        return d
+        return {
+            "schemas": [scim_constants.SchemaURI.USER],
+            "id": self.obj.id,
+            "userName": self.obj.delivery_email,
+            "name": name,
+            "displayName": self.display_name,
+            "active": self.obj.is_active,
+            "role": UserProfile.ROLE_ID_TO_API_NAME[self.obj.role],
+            # meta is a property implemented in the superclass
+            # TODO: The upstream implementation uses `user_profile.date_joined`
+            # as the value of the lastModified meta attribute, which is not
+            # a correct simplification. We should add proper tracking
+            # of this value.
+            "meta": self.meta,
+        }
 
-    def from_dict(self, d: Dict[str, Any]) -> None:
+    def from_dict(self, d: dict[str, Any]) -> None:
         """Consume a dictionary conforming to the SCIM User Schema. The
         dictionary was originally submitted as JSON by the client in
         PUT (update a user) and POST (create a new user) requests.  A
@@ -179,6 +169,11 @@ class ZulipSCIMUser(SCIMUser):
             assert isinstance(active, bool)
             self.change_is_active(active)
 
+        role_name = d.get("role")
+        if role_name:
+            assert isinstance(role_name, str)
+            self.change_role(role_name)
+
     def change_delivery_email(self, new_value: str) -> None:
         # Note that the email_allowed_for_realm check that usually
         # appears adjacent to validate_email is present in save().
@@ -191,13 +186,23 @@ class ZulipSCIMUser(SCIMUser):
             self._full_name_new_value = new_value
 
     def change_is_active(self, new_value: bool) -> None:
-        if new_value is not None and new_value != self.obj.is_active:
+        if new_value != self.obj.is_active:
             self._is_active_new_value = new_value
+
+    def change_role(self, new_role_name: str) -> None:
+        try:
+            role = UserProfile.ROLE_API_NAME_TO_ID[new_role_name]
+        except KeyError:
+            raise scim_exceptions.BadRequestError(
+                f"Invalid role: {new_role_name}. Valid values are: {list(UserProfile.ROLE_API_NAME_TO_ID.keys())}"
+            )
+        if role != self.obj.role:
+            self._role_new_value = role
 
     def handle_replace(
         self,
-        path: Optional[AttrPath],
-        value: Union[str, List[object], Dict[AttrPath, object]],
+        path: AttrPath | None,
+        value: str | list[object] | dict[AttrPath, object],
         operation: Any,
     ) -> None:
         """
@@ -216,18 +221,21 @@ class ZulipSCIMUser(SCIMUser):
             value = {path: value}
 
         assert isinstance(value, dict)
-        for path, val in (value or {}).items():
-            if path.first_path == ("userName", None, None):
+        for attr_path, val in (value or {}).items():
+            if attr_path.first_path == ("userName", None, None):
                 assert isinstance(val, str)
                 self.change_delivery_email(val)
-            elif path.first_path == ("name", "formatted", None):
+            elif attr_path.first_path == ("name", "formatted", None):
                 # TODO: Add support name_formatted_included=False config like we do
                 # for updates via PUT.
                 assert isinstance(val, str)
                 self.change_full_name(val)
-            elif path.first_path == ("active", None, None):
+            elif attr_path.first_path == ("active", None, None):
                 assert isinstance(val, bool)
                 self.change_is_active(val)
+            elif attr_path.first_path == ("role", None, None):
+                assert isinstance(val, str)
+                self.change_role(val)
             else:
                 raise scim_exceptions.NotImplementedError("Not Implemented")
 
@@ -245,6 +253,7 @@ class ZulipSCIMUser(SCIMUser):
         email_new_value = getattr(self, "_email_new_value", None)
         is_active_new_value = getattr(self, "_is_active_new_value", None)
         full_name_new_value = getattr(self, "_full_name_new_value", None)
+        role_new_value = getattr(self, "_role_new_value", None)
         password = getattr(self, "_password_set_to", None)
 
         # Clean up the internal "pending change" state, now that we've
@@ -253,8 +262,9 @@ class ZulipSCIMUser(SCIMUser):
         self._is_active_new_value = None
         self._full_name_new_value = None
         self._password_set_to = None
+        self._role_new_value = None
 
-        if email_new_value:
+        if email_new_value is not None:
             try:
                 # Note that the validate_email check that usually
                 # appears adjacent to email_allowed_for_realm is
@@ -277,27 +287,46 @@ class ZulipSCIMUser(SCIMUser):
                 raise ConflictError("Email address already in use: " + str(e))
 
         if self.is_new_user():
+            assert email_new_value is not None
+            assert full_name_new_value is not None
+            add_initial_stream_subscriptions = True
+            if (
+                self.config.get("create_guests_without_streams", False)
+                and role_new_value == UserProfile.ROLE_GUEST
+            ):
+                add_initial_stream_subscriptions = False
+
             self.obj = do_create_user(
                 email_new_value,
                 password,
                 realm,
                 full_name_new_value,
+                role=role_new_value,
+                tos_version=UserProfile.TOS_VERSION_BEFORE_FIRST_LOGIN,
+                add_initial_stream_subscriptions=add_initial_stream_subscriptions,
                 acting_user=None,
             )
             return
 
-        with transaction.atomic():
-            # We process full_name first here, since it's the only one that can fail.
-            if full_name_new_value:
-                check_change_full_name(self.obj, full_name_new_value, acting_user=None)
+        # TODO: The below operations should ideally be executed in a single
+        # atomic block to avoid failing with partial changes getting saved.
+        # This can be fixed once we figure out how do_deactivate_user can be run
+        # inside an atomic block.
 
-            if email_new_value:
-                do_change_user_delivery_email(self.obj, email_new_value)
+        # We process full_name first here, since it's the only one that can fail.
+        if full_name_new_value:
+            check_change_full_name(self.obj, full_name_new_value, acting_user=None)
 
-            if is_active_new_value is not None and is_active_new_value:
-                do_reactivate_user(self.obj, acting_user=None)
-            elif is_active_new_value is not None and not is_active_new_value:
-                do_deactivate_user(self.obj, acting_user=None)
+        if email_new_value is not None:
+            do_change_user_delivery_email(self.obj, email_new_value, acting_user=None)
+
+        if role_new_value is not None:
+            do_change_user_role(self.obj, role_new_value, acting_user=None)
+
+        if is_active_new_value is not None and is_active_new_value:
+            do_reactivate_user(self.obj, acting_user=None)
+        elif is_active_new_value is not None and not is_active_new_value:
+            do_deactivate_user(self.obj, acting_user=None)
 
     def delete(self) -> None:
         """
@@ -310,8 +339,8 @@ class ZulipSCIMUser(SCIMUser):
 
 
 def get_extra_model_filter_kwargs_getter(
-    model: Type[models.Model],
-) -> Callable[[HttpRequest, Any, Any], Dict[str, object]]:
+    model: type[models.Model],
+) -> Callable[[HttpRequest, Any, Any], dict[str, object]]:
     """Registered as GET_EXTRA_MODEL_FILTER_KWARGS_GETTER in our
     SCIM configuration.
 
@@ -331,7 +360,7 @@ def get_extra_model_filter_kwargs_getter(
 
     def get_extra_filter_kwargs(
         request: HttpRequest, *args: Any, **kwargs: Any
-    ) -> Dict[str, object]:
+    ) -> dict[str, object]:
         realm = RequestNotes.get_notes(request).realm
         assert realm is not None
         return {"realm_id": realm.id, "is_bot": False}
@@ -344,13 +373,13 @@ def base_scim_location_getter(request: HttpRequest, *args: Any, **kwargs: Any) -
 
     Since SCIM synchronization is scoped to an individual realm, we
     need these locations to be namespaced within the realm's domain
-    namespace, which is conveniently accessed via realm.uri.
+    namespace, which is conveniently accessed via realm.url.
     """
 
     realm = RequestNotes.get_notes(request).realm
     assert realm is not None
 
-    return realm.uri
+    return realm.url
 
 
 class ConflictError(scim_exceptions.IntegrityError):
@@ -367,58 +396,3 @@ class ConflictError(scim_exceptions.IntegrityError):
     """
 
     scim_type = "uniqueness"
-
-
-class ZulipSCIMViewMixin(SCIMView):
-    """
-    Default django-scim2 behavior is to convert any exception that occurs while processing
-    the request within the view code to a string and put it
-    in the HttpResponse. We don't want that due to the risk of leaking sensitive information
-    through the error message.
-
-    The way we implement this override is by having this mixin override the main dispatch()
-    method - and then all the specific view classes are re-defined to inherit from this mixin
-    and the original django-scim2 class. This means that we have to also re-register all
-    the URL patterns so that our View classes are used.
-    """
-
-    @method_decorator(csrf_exempt)
-    @method_decorator(login_required)
-    def dispatch(self, request: HttpRequest, *args: Any, **kwargs: Any) -> HttpResponse:
-        """
-        This method through which all SCIM views are processed needs to be forked
-        to change its logic of how exceptions are handled.
-        """
-        if not self.implemented:
-            return self.status_501(request, *args, **kwargs)
-
-        try:
-            return super(SCIMView, self).dispatch(request, *args, **kwargs)
-        except Exception as e:
-            if not isinstance(e, scim_exceptions.SCIMException):
-                # This is where we adjust the exception-handling behavior. Instead of
-                # putting str(e) in the response, we use a generic error that won't leak
-                # information.
-                scim_views_logger.exception("Unable to complete SCIM call.")
-                e = scim_exceptions.SCIMException("Exception while processing SCIM request.")
-
-            content = orjson.dumps(e.to_dict())
-            return HttpResponse(
-                content=content, content_type=scim_constants.SCIM_CONTENT_TYPE, status=e.status
-            )
-
-
-class ZulipSCIMView(ZulipSCIMViewMixin, SCIMView):
-    pass
-
-
-class ZulipSCIMUsersView(ZulipSCIMViewMixin, UsersView):
-    pass
-
-
-class ZulipSCIMSearchView(ZulipSCIMViewMixin, SearchView):
-    pass
-
-
-class ZulipSCIMUserSearchView(ZulipSCIMViewMixin, UserSearchView):
-    pass

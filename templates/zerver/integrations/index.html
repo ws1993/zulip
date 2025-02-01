@@ -15,9 +15,9 @@
 <div class="portico-landing integrations">
     <div class="main">
         <div class="padded-content">
-            <div class="inner-content markdown">
+            <div class="inner-content">
 
-                <div id="integration-main-text">
+                <div class="integration-main-text">
                     <header>
                         <h1 class="portico-page-heading">
                             {% trans %}Over {{integrations_count_display}} native integrations.{% endtrans %}
@@ -37,18 +37,18 @@
                     <div class="searchbar">
                         <div class="searchbar-reset">
                             <i class="fa fa-search" aria-hidden="true"></i>
-                            <input type="text" placeholder="{{ _('Search integrations') }}"/>
+                            <input type="text" class="search_input" placeholder="{{ _('Search integrations') }}"/>
                         </div>
                     </div>
                 </div>
 
                 <div class="integration-categories-dropdown">
-                    <div class="dropdown-toggle">
+                    <div class="integration-toggle-categories-dropdown">
                         <h3 class="dropdown-category-label">{% trans %}Filter by category{% endtrans %}</h3>
                         <i class="fa fa-angle-down" aria-hidden="true"></i>
                     </div>
                     <div class="dropdown-list">
-                        <a href="/integrations">
+                        <a href="/integrations/">
                             <h4 class="integration-category selected" data-category="all">All</h4>
                         </a>
                         {% for category in categories_dict.keys() %}
@@ -74,7 +74,7 @@
                 <div class="catalog">
                     <div class="integration-categories-sidebar">
                         <h3>{% trans %}Categories{% endtrans %}</h3>
-                        <a href="/integrations">
+                        <a href="/integrations/">
                             <h4 data-category="all" class="integration-category selected">{% trans %}All{% endtrans %}</h4>
                         </a>
                         {% for category in categories_dict.keys() %}
@@ -107,7 +107,7 @@
                                   class="integration-lozenge integration-{{ integration.name }} legacy"{% else %}
                                   class="integration-lozenge integration-{{ integration.name }}"
                                   {% endif %}
-                                  data-categories="{{ integration.categories }}"
+                                  data-categories='{{ integration.get_translated_categories()|tojson }}'
                                   data-name="{{ integration.name }}">
                                     <img class="integration-logo" src="{{ integration.logo_url }}"
                                       alt="{{ integration.display_name }} logo"/>
@@ -143,14 +143,14 @@
                 <div id="integration-instructions-group">
                     <div id="integration-instruction-block" class="integration-instruction-block">
                         <div class="categories"></div>
-                        <a href="/integrations" id="integration-list-link" class="no-underline"><i class="fa fa-arrow-circle-left" aria-hidden="true"></i><span>Back to list</span></a>
+                        <a href="/integrations/" id="integration-list-link" class="no-underline"><i class="fa fa-arrow-circle-left" aria-hidden="true"></i><span class="integrations-back-to-list-label">Back to list</span></a>
                     </div>
 
                     {% for integration in integrations_dict.values() %}
                         {% if integration.is_enabled() %}
-                        <div id="{{ integration.name }}" class="integration-instructions">
+                        <div id="{{ integration.name }}" class="integration-instructions markdown">
                             <div class="help-content"></div>
-                            <p style="font-size:11px; font-style:italic;">
+                            <p class="logos_disclaimer">
                                 Logos are trademarks of their respective owners.
                                 None of the integrations on this page are created by,
                                 affiliated with, or supported by the companies

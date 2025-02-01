@@ -1,20 +1,22 @@
 from unittest.mock import MagicMock, patch
 
 import orjson
+from django.core.exceptions import ValidationError
 
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.models import Message, Stream, get_realm, get_user
+from zerver.models import Message, Stream
+from zerver.models.realms import get_realm
+from zerver.models.users import get_user
 
 
 class TestIntegrationsDevPanel(ZulipTestCase):
-
     zulip_realm = get_realm("zulip")
 
     def test_check_send_webhook_fixture_message_for_error(self) -> None:
         bot = get_user("webhook-bot@zulip.com", self.zulip_realm)
         url = f"/api/v1/external/airbrake?api_key={bot.api_key}"
         target_url = "/devtools/integrations/check_send_webhook_fixture_message"
-        body = "{}"  # This empty body should generate a KeyError on the webhook code side.
+        body = "{}"  # This empty body should generate a ValidationError on the webhook code side.
 
         data = {
             "url": url,
@@ -22,20 +24,30 @@ class TestIntegrationsDevPanel(ZulipTestCase):
             "custom_headers": "{}",
             "is_json": "true",
         }
-        with self.assertLogs(level="ERROR") as logs:
-            response = self.client_post(target_url, data)
+        with (
+            self.assertLogs(level="ERROR") as logs,
+            self.settings(TEST_SUITE=False),
+            self.assertRaises(ValidationError),
+        ):
+            self.client_post(target_url, data)
 
-            self.assertEqual(response.status_code, 500)  # Since the response would be forwarded.
-            expected_response = {"result": "error", "msg": "Internal server error"}
-            self.assertEqual(orjson.loads(response.content), expected_response)
-
-        # Intention of this test looks like to trigger keyError
-        # so just testing KeyError is printed along with Traceback in logs
-        self.assertTrue("KeyError" in logs.output[0])
-        self.assertTrue("Traceback (most recent call last)" in logs.output[0])
-        self.assertEqual(
-            logs.output[1], "ERROR:django.request:Internal Server Error: /api/v1/external/airbrake"
+        # Intention of this test looks like to trigger ValidationError
+        # so just testing ValidationError is printed along with Traceback in logs
+        self.assert_length(logs.output, 2)
+        self.assertTrue(
+            logs.output[0].startswith(
+                "ERROR:django.request:Internal Server Error: /api/v1/external/airbrake\n"
+                "Traceback (most recent call last):\n"
+            )
         )
+        self.assertTrue("ValidationError" in logs.output[0])
+        self.assertTrue(
+            logs.output[1].startswith(
+                "ERROR:django.request:Internal Server Error: /devtools/integrations/check_send_webhook_fixture_message\n"
+                "Traceback (most recent call last):\n"
+            )
+        )
+        self.assertTrue("ValidationError" in logs.output[1])
 
     def test_check_send_webhook_fixture_message_for_success_without_headers(self) -> None:
         bot = get_user("webhook-bot@zulip.com", self.zulip_realm)
@@ -80,7 +92,7 @@ class TestIntegrationsDevPanel(ZulipTestCase):
         data = {
             "url": url,
             "body": body,
-            "custom_headers": orjson.dumps({"X_GITHUB_EVENT": "ping"}).decode(),
+            "custom_headers": orjson.dumps({"X-GitHub-Event": "ping"}).decode(),
             "is_json": "true",
         }
 
@@ -120,12 +132,12 @@ class TestIntegrationsDevPanel(ZulipTestCase):
         self.assertEqual(Stream.objects.get(id=latest_msg.recipient.type_id).name, "Denmark")
         self.assertEqual(latest_msg.topic_name(), "WordPress notifications")
 
-    def test_get_fixtures_for_nonexistant_integration(self) -> None:
-        target_url = "/devtools/integrations/somerandomnonexistantintegration/fixtures"
+    def test_get_fixtures_for_nonexistent_integration(self) -> None:
+        target_url = "/devtools/integrations/somerandomnonexistentintegration/fixtures"
         response = self.client_get(target_url)
         expected_response = {
             "code": "BAD_REQUEST",
-            "msg": '"somerandomnonexistantintegration" is not a valid webhook integration.',
+            "msg": '"somerandomnonexistentintegration" is not a valid webhook integration.',
             "result": "error",
         }
         self.assertEqual(response.status_code, 404)

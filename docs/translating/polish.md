@@ -2,22 +2,22 @@
 
 Use semi-formal Polish for translation, some specifics:
 
-- Informal "you" (_ty_) instead of more formal approaches (e.g. plural
+- Informal "you" (_ty_) instead of more formal approaches (e.g., plural
   "you" (_wy_), using any formal titles like _Państwo_, _Pan/Pani_).
 
-- Gender-neutral forms of verbs, e.g. _unsubscribed_ - _odsubskrybowano_,
+- Gender-neutral forms of verbs, e.g., _unsubscribed_ - _odsubskrybowano_,
   not \*odsubskrybowałeś".
 
-- Imperative, active and continuous verbs, e.g. _manage streams_ -
+- Imperative, active and continuous verbs, e.g., _manage streams_ -
   _zarządzaj kanałami_, not _zarządź kanałami_.
 
-- Not using reflexive _się_, e.g. _log out_ would be simply _wyloguj_,
+- Not using reflexive _się_, e.g., _log out_ would be simply _wyloguj_,
   not _wyloguj się_.
 
 - Warm and friendly phrasing whenever appropriate.
 
 - No slang or regional phrases that could be unclear or too informal,
-  e.g. _zajawka_.
+  e.g., _zajawka_.
 
 - Consistent usage of Zulip-specific terms and common verbs for
   actions, even if it means repeating - this is one of the key aspects
@@ -30,7 +30,7 @@ Use semi-formal Polish for translation, some specifics:
 
 - Balance common verbs and nouns with specific IT-related translations
   of English terms - this can be tricky, try to check how other
-  resources were translated (e.g. Gmail, Microsoft websites, Facebook)
+  resources were translated (e.g., Gmail, Microsoft websites, Facebook)
   to decide what wouldn't sound awkward in Polish.
 
 Some terms are very tricky to translate, so be sure to communicate
@@ -48,11 +48,11 @@ You can set your own alert words for Zulip messages.
 
 > Możesz ustawić powiadomienia dla wybranych fraz w Zulipie.
 
-**All messages**: wszystkie wiadomości
+**Combined feed**: wszystkie wiadomości
 
 example:
 
-You can see all messages in unmuted streams and topics with "All messages".
+You can see all messages in unmuted streams and topics with "Combined feed".
 
 > Możesz zobaczyć pełną listę wiadomości poprzez widok "Wszystkie wiadomości".
 
@@ -69,7 +69,7 @@ and _dostosowanie do potrzeb klienta_ is too long
 
 example:
 
-You can personalize Zulip in many ways, e.g. by pinning certain streams.
+You can personalize Zulip in many ways, e.g., by pinning certain streams.
 
 > Możesz spersonalizować Zulipa na wiele sposobów, np. przypinając niektóre kanały.
 
@@ -89,12 +89,12 @@ You can filter the messages by searching for relevant terms.
 
 > Możesz przefiltrować wiadomości poprzez wyszukiwanie.
 
-**group PM**: czat grupowy, different from _wiadomość_ since the usage
+**group DM**: czat grupowy, different from _wiadomość_ since the usage
 of _czat grupowy_ seems more common
 
 example:
 
-You can start a group PM with users in your organization.
+You can start a group DM with users in your organization.
 
 > Możesz rozpocząć czat grupowy z użytkownikami w Twojej organizacji.
 
@@ -190,21 +190,21 @@ You can pin streams in the left-side panel.
 
 > Możesz przypiąć wybrane kanały w menu kontekstowym po lewej.
 
-**private message**: prywatna wiadomość
+**direct message**: Wiadomość bezpośrednia
 
 example:
 
-You can send a private message to other users in your organization.
+You can send a direct message to other users in your organization.
 
-> Możesz wysłać prywatną wiadomość do innych użytkowników w Twojej organizacji.
+> Możesz wysłać bezpośrednią wiadomość do innych użytkowników w Twojej organizacji.
 
-**PM**: PM, translation could be confusing
+**DM**: DM, translation could be confusing
 
 example:
 
-Private messages are often abbreviated to PM.
+Direct messages are often abbreviated to DM.
 
-> Prywatne wiadomości są też nazywane PMami, od angielskiego "private message".
+> Wiadomości bezpośrednie są też nazywane DMami, od angielskiego "direct message".
 
 **private stream**: prywatny kanał
 **public stream**: publiczny kanał

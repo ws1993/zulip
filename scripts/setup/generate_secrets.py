@@ -2,7 +2,7 @@
 # This tools generates /etc/zulip/zulip-secrets.conf
 import os
 import sys
-from typing import Dict, List
+from contextlib import suppress
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(BASE_DIR)
@@ -11,6 +11,7 @@ from scripts.lib.zulip_tools import get_config, get_config_file
 
 setup_path()
 
+os.environ["DISABLE_MANDATORY_SECRET_CHECK"] = "True"
 os.environ["DJANGO_SETTINGS_MODULE"] = "zproject.settings"
 
 import argparse
@@ -60,7 +61,7 @@ def generate_django_secretkey() -> str:
     return get_random_string(50, chars)
 
 
-def get_old_conf(output_filename: str) -> Dict[str, str]:
+def get_old_conf(output_filename: str) -> dict[str, str]:
     if not os.path.exists(output_filename) or os.path.getsize(output_filename) == 0:
         return {}
 
@@ -77,7 +78,7 @@ def generate_secrets(development: bool = False) -> None:
         OUTPUT_SETTINGS_FILENAME = "/etc/zulip/zulip-secrets.conf"
     current_conf = get_old_conf(OUTPUT_SETTINGS_FILENAME)
 
-    lines: List[str] = []
+    lines: list[str] = []
     if len(current_conf) == 0:
         lines = ["[secrets]\n"]
 
@@ -165,10 +166,8 @@ def generate_secrets(development: bool = False) -> None:
                             )
                         break
 
-                try:
+                with suppress(redis.exceptions.ConnectionError):
                     get_redis_client().config_set("requirepass", redis_password)
-                except redis.exceptions.ConnectionError:
-                    pass
 
                 add_secret("redis_password", redis_password)
 
@@ -194,7 +193,6 @@ def generate_secrets(development: bool = False) -> None:
 
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser()
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(

@@ -3,7 +3,6 @@ import argparse
 import os
 import subprocess
 import sys
-from typing import Set
 
 ZULIP_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ZULIP_PATH)
@@ -11,7 +10,7 @@ from scripts.lib import clean_unused_caches
 from scripts.lib.zulip_tools import (
     DEPLOYMENTS_DIR,
     get_recent_deployments,
-    may_be_perform_purging,
+    maybe_perform_purging,
     su_to_zulip,
 )
 
@@ -47,8 +46,7 @@ def parse_args() -> argparse.Namespace:
         "--no-print-headings",
         dest="no_headings",
         action="store_true",
-        help="If specified then script will not print headings for "
-        "what will be deleted/kept back.",
+        help="If specified then script will not print headings for what will be deleted/kept back.",
     )
 
     args = parser.parse_args()
@@ -56,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def get_deployments_to_be_purged(recent_deployments: Set[str]) -> Set[str]:
+def get_deployments_to_be_purged(recent_deployments: set[str]) -> set[str]:
     all_deployments = {
         os.path.join(DEPLOYMENTS_DIR, deployment) for deployment in os.listdir(DEPLOYMENTS_DIR)
     }
@@ -80,7 +78,7 @@ def main() -> None:
     deployments_to_keep = get_recent_deployments(args.threshold_days)
     deployments_to_purge = get_deployments_to_be_purged(deployments_to_keep)
 
-    may_be_perform_purging(
+    maybe_perform_purging(
         deployments_to_purge, deployments_to_keep, "deployment", args.dry_run, args.verbose, True
     )
 

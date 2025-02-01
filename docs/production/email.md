@@ -12,7 +12,9 @@ email addresses and send notifications.
 1. Fill out the section of `/etc/zulip/settings.py` headed "Outgoing
    email (SMTP) settings". This includes the hostname and typically
    the port to reach your SMTP provider, and the username to log in to
-   it. You'll also want to fill out the noreply email section.
+   it. If your SMTP server does not require authentication, leave
+   `EMAIL_HOST_USER` empty. You'll also want to fill out the noreply
+   email section.
 
 1. Put the password for the SMTP user account in
    `/etc/zulip/zulip-secrets.conf` by setting `email_password`. For
@@ -70,10 +72,15 @@ follows:
   providers
 - The password like `email_password = abcd1234` in `/etc/zulip/zulip-secrets.conf`.
 
+If your SMTP provider uses implicit SSL/TLS on port 465 (and not `STARTTLS` on
+port 587), you need to set `EMAIL_PORT = 465`, as well as replacing
+[`EMAIL_USE_TLS = True`](https://docs.djangoproject.com/en/5.0/ref/settings/#std-setting-EMAIL_USE_TLS)
+with [`EMAIL_USE_SSL = True`](https://docs.djangoproject.com/en/5.0/ref/settings/#std-setting-EMAIL_USE_SSL).
+
 ### Using system email
 
 If you'd like to send outgoing email using the local operating
-system's email delivery configuration (e.g. you have `postfix`
+system's email delivery configuration (e.g., you have `postfix`
 configuration on the system that forwards email sent locally into your
 corporate email system), you will likely need to use something like
 these setting values:
@@ -111,7 +118,7 @@ how to make it work:
   ["less secure"](https://support.google.com/accounts/answer/6010255);
   Gmail doesn't allow servers to send outgoing email by default.
 - Note also that the rate limits for Gmail are also quite low
-  (e.g. 100 / day), so it's easy to get rate-limited if your server
+  (e.g., 100 / day), so it's easy to get rate-limited if your server
   has significant traffic. For more active servers, we recommend
   moving to a free account on a transactional email service.
 
@@ -191,21 +198,16 @@ aren't receiving emails from Zulip:
   you can inspect the emails that reached the service, whether an
   email was flagged as spam, etc.
 
-- Starting with Zulip 1.7, Zulip logs an entry in
-  `/var/log/zulip/send_email.log` whenever it attempts to send an
-  email. The log entry includes whether the request succeeded or failed.
+- Zulip logs an entry in `/var/log/zulip/send_email.log` whenever it
+  attempts to send an email. The log entry includes whether the
+  request succeeded or failed.
 
 - If attempting to send an email throws an exception, a traceback
   should be in `/var/log/zulip/errors.log`, along with any other
   exceptions Zulip encounters.
 
-- If your SMTP provider uses SSL on port 465 (and not TLS on port
-  587), you need to set `EMAIL_PORT = 465` as well as replacing
-  `EMAIL_USE_TLS = True` with `EMAIL_USE_SSL = True`; otherwise, Zulip
-  will try to use the TLS protocol on port 465, which won't work.
-
 - Zulip's email sending configuration is based on the standard Django
-  [SMTP backend](https://docs.djangoproject.com/en/3.2/topics/email/#smtp-backend)
+  [SMTP backend](https://docs.djangoproject.com/en/5.0/topics/email/#smtp-backend)
   configuration. So if you're having trouble getting your email
   provider working, you may want to search for documentation related
   to using your email provider with Django.

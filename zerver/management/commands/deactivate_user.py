@@ -2,15 +2,18 @@ from argparse import ArgumentParser
 from typing import Any
 
 from django.core.management.base import CommandError
+from typing_extensions import override
 
-from zerver.lib.actions import do_deactivate_user, get_active_bots_owned_by_user
+from zerver.actions.users import do_deactivate_user
 from zerver.lib.management import ZulipBaseCommand
 from zerver.lib.sessions import user_sessions
+from zerver.lib.users import get_active_bots_owned_by_user
 
 
 class Command(ZulipBaseCommand):
     help = "Deactivate a user, including forcibly logging them out."
 
+    @override
     def add_arguments(self, parser: ArgumentParser) -> None:
         parser.add_argument(
             "-f",
@@ -21,6 +24,7 @@ class Command(ZulipBaseCommand):
         parser.add_argument("email", metavar="<email>", help="email of user to deactivate")
         self.add_realm_args(parser)
 
+    @override
     def handle(self, *args: Any, **options: Any) -> None:
         realm = self.get_realm(options)
         user_profile = self.get_user(options["email"], realm)
@@ -31,12 +35,9 @@ class Command(ZulipBaseCommand):
         print(f"{user_profile.delivery_email} has the following active sessions:")
         for session in user_sessions(user_profile):
             print(session.expire_date, session.get_decoded())
-        print("")
+        print()
         print(
-            "{} has {} active bots that will also be deactivated.".format(
-                user_profile.delivery_email,
-                get_active_bots_owned_by_user(user_profile).count(),
-            )
+            f"{user_profile.delivery_email} has {get_active_bots_owned_by_user(user_profile).count()} active bots that will also be deactivated."
         )
 
         if not options["for_real"]:

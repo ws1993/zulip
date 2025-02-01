@@ -1,4 +1,5 @@
-from typing import TYPE_CHECKING, Optional
+import os
+from typing import TYPE_CHECKING, Any, Optional
 
 import sentry_sdk
 from django.utils.translation import override as override_language
@@ -9,6 +10,7 @@ from sentry_sdk.integrations.sqlalchemy import SqlalchemyIntegration
 from sentry_sdk.utils import capture_internal_exceptions
 
 from version import ZULIP_VERSION
+from zproject.config import DEPLOY_ROOT
 
 if TYPE_CHECKING:
     from sentry_sdk._types import Event, Hint
@@ -22,8 +24,7 @@ def add_context(event: "Event", hint: "Hint") -> Optional["Event"]:
             return None
     from django.conf import settings
 
-    from zerver.lib.request import RequestNotes, get_current_request
-    from zerver.models import get_user_profile_by_id
+    from zerver.models.users import get_user_profile_by_id
 
     with capture_internal_exceptions():
         # event.user is the user context, from Sentry, which is
@@ -31,8 +32,9 @@ def add_context(event: "Event", hint: "Hint") -> Optional["Event"]:
         # https://docs.sentry.io/platforms/python/guides/django/enriching-error-data/additional-data/identify-user/
         event.setdefault("tags", {})
         user_info = event.get("user", {})
-        if user_info.get("id"):
-            user_profile = get_user_profile_by_id(user_info["id"])
+        user_id = user_info.get("id")
+        if isinstance(user_id, str):
+            user_profile = get_user_profile_by_id(int(user_id))
             event["tags"]["realm"] = user_info["realm"] = user_profile.realm.string_id or "root"
             with override_language(settings.LANGUAGE_CODE):
                 # str() to force the lazy-translation to apply now,
@@ -45,23 +47,36 @@ def add_context(event: "Event", hint: "Hint") -> Optional["Event"]:
         if "email" in user_info:
             del user_info["email"]
 
-        request = get_current_request()
-        if request:
-            request_notes = RequestNotes.get_notes(request)
-            if request_notes.client is not None:
-                event["tags"]["client"] = request_notes.client.name
-            if request_notes.realm is not None:
-                event["tags"].setdefault("realm", request_notes.realm.string_id)
     return event
 
 
-def setup_sentry(dsn: Optional[str], environment: str) -> None:
+def traces_sampler(sampling_context: dict[str, Any]) -> float | bool:
+    from django.conf import settings
+
+    queue = sampling_context.get("queue")
+    if queue is not None and isinstance(queue, str):
+        if isinstance(settings.SENTRY_TRACE_WORKER_RATE, dict):
+            return settings.SENTRY_TRACE_WORKER_RATE.get(queue, 0.0)
+        else:
+            return settings.SENTRY_TRACE_WORKER_RATE
+    else:
+        return settings.SENTRY_TRACE_RATE
+
+
+def setup_sentry(dsn: str | None, environment: str) -> None:
+    from django.conf import settings
+
     if not dsn:
         return
+
+    sentry_release = ZULIP_VERSION
+    if os.path.exists(os.path.join(DEPLOY_ROOT, "sentry-release")):
+        with open(os.path.join(DEPLOY_ROOT, "sentry-release")) as sentry_release_file:
+            sentry_release = sentry_release_file.readline().strip()
     sentry_sdk.init(
         dsn=dsn,
         environment=environment,
-        release=ZULIP_VERSION,
+        release=sentry_release,
         integrations=[
             DjangoIntegration(),
             RedisIntegration(),
@@ -80,10 +95,12 @@ def setup_sentry(dsn: Optional[str], environment: str) -> None:
         # PII while having the identifiers needed to determine that an
         # exception only affects a small subset of users or realms.
         send_default_pii=True,
+        traces_sampler=traces_sampler,
+        profiles_sample_rate=settings.SENTRY_PROFILE_RATE,
     )
 
     # Ignore all of the loggers from django.security that are for user
-    # errors; see https://docs.djangoproject.com/en/3.2/ref/exceptions/#suspiciousoperation
+    # errors; see https://docs.djangoproject.com/en/5.0/ref/exceptions/#suspiciousoperation
     ignore_logger("django.security.SuspiciousOperation")
     ignore_logger("django.security.DisallowedHost")
     ignore_logger("django.security.DisallowedModelAdminLookup")

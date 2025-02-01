@@ -1,5 +1,10 @@
 {% extends "zerver/portico.html" %}
 {% set entrypoint = "signup" %}
+
+{% block title %}
+<title>{{ _("Log in") }} | Zulip</title>
+{% endblock %}
+
 {# Login page. #}
 
 {% block portico_content %}
@@ -20,7 +25,7 @@ page can be easily identified in it's respective JavaScript file. -->
                     <img class="avatar" src="{{ realm_icon }}" alt="" />
                     <div class="info-box">
                         <div class="organization-name">{{ realm_name }}</div>
-                        <div class="organization-path">{{ realm_uri }}</div>
+                        <div class="organization-path">{{ realm_url }}</div>
                     </div>
                 </div>
                 <div class="description">
@@ -34,10 +39,9 @@ page can be easily identified in it's respective JavaScript file. -->
                     <div class="login-social">
                         <form class="anonymous_access_form form-inline" action="/" method="post">
                             {{ csrf_input }}
-                            <input type="hidden" name="prefers_web_public_view" value="true" />
                             <input type="hidden" name="next" value="{{ next }}" />
                             <button class="full-width">
-                                {{ _('Access without an account') }}
+                                {{ _('View without an account') }}
                             </button>
                         </form>
                     </div>
@@ -59,6 +63,19 @@ page can be easily identified in it's respective JavaScript file. -->
                         </p>
                     </div>
                 {% else %}
+
+                    {% if already_registered %}
+                    <div class="alert">
+                        {{ _("You've already registered with this email address. Please log in below.") }}
+                    </div>
+                    {% endif %}
+
+                    {% if deactivated_account_error %}
+                    <div class="alert">
+                        {{ deactivated_account_error }}
+                    </div>
+                    {% endif %}
+
                     {% if password_auth_enabled %}
                         <form name="login_form" id="login_form" method="post" class="login-form"
                           action="{{ url('login') }}">
@@ -69,9 +86,8 @@ page can be easily identified in it's respective JavaScript file. -->
                             {% endif %}
                             {{ csrf_input }}
 
-                            <!-- .no-validation is for removing the red star in CSS -->
                             {% if not two_factor_authentication_enabled or wizard.steps.current == 'auth' %}
-                            <div class="input-box no-validation">
+                            <div class="input-box">
                                 <input id="id_username" type="{% if not require_email_format_usernames %}text{% else %}email{% endif %}"
                                   name="username" class="{% if require_email_format_usernames %}email {% endif %}required"
                                   {% if email %} value="{{ email }}" {% else %} value="" autofocus {% endif %}
@@ -87,12 +103,12 @@ page can be easily identified in it's respective JavaScript file. -->
                                 </label>
                             </div>
 
-                            <div class="input-box no-validation password-div">
+                            <div class="input-box password-div">
                                 <input id="id_password" name="password" class="required" type="password" autocomplete="off"
                                   {% if email %} autofocus {% endif %}
                                   required />
-                                <label for="id_password" class="control-label">{{ _('Password') }}</label>
-                                <i class="fa fa-eye-slash password_visibility_toggle" role="button"></i>
+                                <label for="id_password">{{ _('Password') }}</label>
+                                <i class="fa fa-eye-slash password_visibility_toggle" role="button" tabindex="0"></i>
                             </div>
                             {% else %}
                             {% include "two_factor/_wizard_forms.html" %}
@@ -106,35 +122,23 @@ page can be easily identified in it's respective JavaScript file. -->
                             </div>
                             {% endif %}
 
-                            {% if already_registered %}
-                            <div class="alert">
-                                {{ _("You've already registered with this email address. Please log in below.") }}
-                            </div>
-                            {% endif %}
-
-                            {% if deactivated_account_error %}
-                            <div class="alert">
-                                {{ deactivated_account_error }}
-                            </div>
-                            {% endif %}
-
                             <button type="submit" name="button" class="full-width">
-                                <img class="loader" src="/static/images/loader-white.svg" alt="" />
+                                <img class="loader" src="{{ static('images/loading/loader-white.svg') }}" alt="" />
                                 <span class="text">{{ _("Log in") }}</span>
                             </button>
                         </form>
 
-                        {% if page_params.external_authentication_methods|length > 0 %}
+                        {% if external_authentication_methods|length > 0 %}
                         <div class="or"><span>{{ _('OR') }}</span></div>
                         {% endif %}
 
                     {% endif %} <!-- if password_auth_enabled -->
 
-                    {% for backend in page_params.external_authentication_methods %}
+                    {% for backend in external_authentication_methods %}
                     <div class="login-social">
                         <form class="social_login_form form-inline" action="{{ backend.login_url }}" method="get">
                             <input type="hidden" name="next" value="{{ next }}" />
-                            <button id="login_{{ backend.button_id_suffix }}" class="login-social-button"
+                            <button id="login_auth_button_{{ backend.name }}" class="login-social-button"
                               {% if backend.display_icon %} style="background-image:url({{ backend.display_icon }})"  {% endif %}> {{ _('Log in with %(identity_provider)s', identity_provider=backend.display_name) }}
                             </button>
                         </form>

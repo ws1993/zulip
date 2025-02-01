@@ -27,17 +27,16 @@ the validation Zulip has today.
 Our API documentation is defined by a few sets of files:
 
 - The primary source of our API documentation is the Zulip server's
-  [OpenAPI description](../documentation/openapi.md) at
+  [OpenAPI description](openapi.md) at
   `zerver/openapi/zulip.yaml`.
 - The documentation is written the same Markdown framework that powers
-  our [user docs](../documentation/user.md), with some special
+  our [help center docs](helpcenter.md), with some special
   extensions for rendering nice code blocks and example
   responses. Most API endpoints share a common template,
-  `templates/zerver/api/api-doc-template.md`, which renders the
+  `api_docs/api-doc-template.md`, which renders the
   OpenAPI description of the API endpoint. A handful of endpoints that
   require special content, as well as pages that document general API
-  details rather than specific endpoints, live at
-  `templates/zerver/api/*.md`.
+  details rather than specific endpoints, live at `api_docs/*.md`.
 - We have an extensive set of tests designed to validate that the data
   in the OpenAPI file matching the implementation. Specifically,
   `zerver/tests/test_openapi.py` compares every endpoint's accepted
@@ -57,8 +56,8 @@ Our API documentation is defined by a few sets of files:
 - The cURL examples are generated and tested using
   `zerver/openapi/curl_param_value_generators.py`.
 - The REST API index
-  (`templates/zerver/help/include/rest-endpoints.md`) in the broader
-  /api left sidebar (`templates/zerver/api/sidebar_index.md`).
+  (`api_docs/include/rest-endpoints.md`) in the broader
+  /api left sidebar (`api_docs/sidebar_index.md`).
 
 This first section is focused on explaining how the API documentation
 system is put together; when actually documenting an endpoint, you'll
@@ -66,73 +65,94 @@ want to also read the [Step by step guide](#step-by-step-guide).
 
 ## How it works
 
-To understand how this documentation system works, start by reading an
-existing doc file (`templates/zerver/api/render-message.md` is a good
-example; accessible live
-[here](https://zulip.com/api/render-message) or in the development
-environment at `http://localhost:9991/api/render-message`).
+Let's use the existing documentation for one of our REST API endpoints
+to show how the documentation system works:
+[POST /messages/render](https://zulip.com/api/render-message).
+We highly recommend looking at these resources while reading the above
+documentation page:
 
-We highly recommend looking at those resources while reading this page.
+- `api_docs/api-doc-template.md`
+- `zerver/openapi/zulip.yaml`, specifically the section with
+  `operationId: render-message`
+- `zerver/openapi/python_examples.py`
 
 If you look at the documentation for existing endpoints, you'll notice
 that a typical endpoint's documentation is divided into four sections:
 
-- The top-level **Title and description**
+- **Title and description**
 - **Usage examples**
-- **Arguments**
-- **Responses**
+- **Parameters**
+- **Response with examples**
 
 The rest of this guide describes how each of these sections works.
 
 ### Title and description
 
-Displayed at the top of any REST endpoint documentation page, the
-title comes from the `summary` parameter in OpenAPI data. The
-description should explain what the endpoint does in clear
-English. Include details on how to use it correctly or what it's good
-or bad for, with links to any alternative endpoints the user might
-want to consider.
+The first line of `api-doc-template.md` generates a lot of key
+information for our API endpoint documentation:
 
-These sections should often contain a link to the documentation of the
-relevant feature in `/help/`.
+```
+{generate_api_header(API_ENDPOINT_NAME)}
+```
+
+At the top of the endpoint documentation page is the title, and it
+comes from the `summary` parameter in the OpenAPI data,
+`zerver/openapi/zulip.yaml`.
+
+The endpoint `description` in the OpenAPI data explains what the
+endpoint does in clear English. It should include details on how to
+use the endpoint correctly or what it's good or bad for, with links
+to any alternative endpoints the user might want to consider.
+
+The description should often contain a link to the documentation of
+the relevant feature in the [help center](helpcenter.md), and should
+include **Changes** notes for all feature level updates documented
+in the [API changelog](https://zulip.com/api/changelog), see
+`api_docs/changelog.md`, that reference the endpoint.
+
+Endpoints that only administrators can use should be tagged with the
+custom `x-requires-administrator` field in the OpenAPI definition.
+
+All of this information is rendered via a Markdown preprocessor,
+specifically the `APIHeaderPreprocessor` class defined in
+`zerver/openapi/markdown_extension.py`.
 
 ### Usage examples
 
 We display usage examples in three languages: Python, JavaScript and
-`curl`; we may add more in the future. Every endpoint should have
-Python and `curl` documentation; `JavaScript` is optional as we don't
-consider that API library to be fully supported. The examples are
-defined using a special Markdown extension
-(`zerver/openapi/markdown_extension.py`). To use this extension, one
-writes a Markdown file block that looks something like this:
+curl; we may add more in the future. Every endpoint should have
+Python and curl documentation; JavaScript is optional as we don't
+consider that API library to be fully supported.
+
+The examples are defined using a special Markdown extension, see
+`zerver/openapi/markdown_extension.py`. Here's the Markdown file
+block that uses this in `api-doc-template.md`:
 
 ```md
 {start_tabs}
-{tab|python}
 
-{generate_code_example(python)|/messages/render:post|example}
+{generate_code_example(python)|API_ENDPOINT_NAME|example}
 
-{tab|js}
-...
+{generate_code_example(javascript)|API_ENDPOINT_NAME|example}
 
 {tab|curl}
 
-{generate_code_example(curl)|/messages/render:post|example}
+{generate_code_example(curl)|API_ENDPOINT_NAME|example}
 
 {end_tabs}
 ```
 
 In some cases, one wants to configure specific parameters to be
-included or excluded from the example `curl` requests for readability
+included or excluded from the example curl requests for readability
 reasons. One can do that using the `x-curl-examples-parameters`
-parameter.
+parameter in the OpenAPI data.
 
 #### Writing Python examples
 
 For the Python examples, you'll write the example in
 `zerver/openapi/python_examples.py`, and it'll be run and verified
-automatically in Zulip's automated test suite. The code there will
-look something like this:
+automatically in Zulip's automated test suite. The code for our
+example API endpoint looks like this:
 
 ```python
 @openapi_test_function('/messages/render:post')
@@ -165,47 +185,53 @@ API client by copy-pasting from the website; it's easy to make typos
 and other mistakes where variables are defined outside the tested
 block, and the tests are not foolproof.
 
-The code that renders `/api` pages will extract the block between the
-`# {code_example|start}` and `# {code_example|end}` comments, and
-substitute it in place of
-`{generate_code_example(python)|/messages/render:post|example}`
-wherever that string appears in the API documentation.
+The code that renders API documentation pages will extract the block
+between the `# {code_example|start}` and `# {code_example|end}` comments,
+and substitute it in place of
+`{generate_code_example(python)|/messages/render:post|example}`. Note
+that here the `API_ENDPOINT_NAME` has been filled in with our example
+endpoint's information.
 
-- Additional Python imports can be added using the custom
-  `x-python-examples-extra-imports` field in the OpenAPI definition.
-- Endpoints that only administrators can use should be tagged with the
-  custom `x-requires-administrator` field in the OpenAPI definition.
+Additional Python imports can be added using the custom
+`x-python-examples-extra-imports` field in the OpenAPI definition.
 
 ### Parameters
 
 We have a separate Markdown extension to document the parameters that
-an API endpoint supports. You'll see this in files like
-`templates/zerver/api/render-message.md` via the following Markdown
-directive (implemented in
-`zerver/lib/markdown/api_arguments_table_generator.py`):
+an API endpoint supports. Implemented in
+`zerver/lib/markdown/api_arguments_table_generator.py`, you can see
+this in `api-doc-template.md` after the **Parameters** header:
 
-```md
-{generate_api_arguments_table|zulip.yaml|/messages/render:post}
+```
+{generate_api_arguments_table|zulip.yaml|API_ENDPOINT_NAME}
 ```
 
-Just as in the usage examples, the `/messages/render` key must match a
-URL definition in `zerver/openapi/zulip.yaml`, and that URL definition
-must have a `post` HTTP method defined.
+This generates the information from the endpoint's parameter
+definition in the OpenAPI data.
 
 Additional content that you'd like to appear in the parameter
 description area can be declared using the custom
 `x-parameter-description` field in the OpenAPI definition.
 
-### Displaying example payloads/responses
+### Response with examples
 
-If you've already followed the steps in the [Usage examples](#usage-examples)
-section, this part should be fairly trivial.
+Similar to the parameters section above, there is a separate Markdown
+extension to document the endpoint's return values and generate the
+example response(s) from the OpenAPI data. Implemented in
+`zerver/lib/markdown/api_return_values_table_generator.py`, you can
+see this in after the **Response** header in `api-doc-template.md`:
 
-You can use the following Markdown directive to render all the fixtures
-defined in the OpenAPI `zulip.yaml` for a given endpoint
+```
+{generate_return_values_table|zulip.yaml|API_ENDPOINT_NAME}
+```
 
-```md
-{generate_code_example|/messages/render:post|fixture}
+To generate the example responses from the OpenAPI data, we again
+use the special Markdown extension from the **Usage examples**
+discussed above, except with the `fixture` argument instead of the
+`example` argument:
+
+```
+{generate_code_example|API_ENDPOINT_NAME|fixture}
 ```
 
 Additional content that you'd like to appear in the responses part of
@@ -218,7 +244,7 @@ This section offers a step-by-step process for adding documentation
 for a new API endpoint. It assumes you've read and understood the
 above.
 
-1. Start by adding [OpenAPI format](../documentation/openapi.md)
+1. Start by adding [OpenAPI format](openapi.md)
    data to `zerver/openapi/zulip.yaml` for the endpoint. If you
    copy-paste (which is helpful to get the indentation structure
    right), be sure to update all the content that you copied to
@@ -228,13 +254,13 @@ above.
    question works by reading the code! To understand how arguments
    are specified in Zulip backend endpoints, read our [REST API
    tutorial][rest-api-tutorial], paying special attention to the
-   details of `REQ` and `has_request_variables`.
+   details of `typed_endpoint`.
 
    Once you understand that, the best way to determine the supported
    arguments for an API endpoint is to find the corresponding URL
    pattern in `zprojects/urls.py`, look up the backend function for
-   that endpoint in `zerver/views/`, and inspect its arguments
-   declared using `REQ`.
+   that endpoint in `zerver/views/`, and inspect its keyword-only
+   arguments.
 
    You can check your formatting using these helpful tools.
 
@@ -247,7 +273,7 @@ above.
      defined OpenAPI schema. Use `test-backend --rerun` for a fast
      edit/refresh cycle when debugging.
 
-   [rest-api-tutorial]: ../tutorials/writing-views.html#writing-api-rest-endpoints
+   [rest-api-tutorial]: ../tutorials/writing-views.md#writing-api-rest-endpoints
 
 1. Add a function for the endpoint you'd like to document to
    `zerver/openapi/python_examples.py`, decorated with
@@ -290,30 +316,28 @@ above.
 
 1. Finally, if the API docs page of the endpoint doesn't follow the
    common API docs template in
-   `templates/zerver/api/api-docs-template.md`, then add its custom
-   Markdown file under `templates/zerver/api/`. However, it is a goal
+   `api_docs/api-docs-template.md`, then add its custom
+   Markdown file under `api_docs/`. However, it is a goal
    to minimize the number of files that diverse from the common
    template, so only do this if there's a good reason.
 
 1. Add the endpoint to the index in
-   `templates/zerver/help/include/rest-endpoints.md`. The URL should
+   `api_docs/include/rest-endpoints.md`. The URL should
    match the `operationId` for the endpoint, and the link text should
    match the title of the endpoint from the OpenAPI `summary` field.
 
 1. Test your endpoint, pretending to be a new user in a hurry, by
-   visiting it via the links on `http://localhost:9991/api` (the API
+   visiting it via the links on `http://localhost:9991/api/` (the API
    docs are rendered from the Markdown source files on page load, so
    just reload to see an updated version as you edit). You should
    make sure that copy-pasting the code in your examples works, and
    post an example of the output in the pull request.
 
-1. Document the new API in `templates/zerver/api/changelog.md` and
+1. Document the new API in `api_docs/changelog.md` and
    bump the `API_FEATURE_LEVEL` in `version.py`. Also, make sure to
    add a `**Changes**` entry in the description of the new API/event
    in `zerver/openapi/zulip.yaml`, which mentions the API feature level
    at which they were added.
-
-[javascript-examples]: https://github.com/zulip/zulip-js/tree/main/examples
 
 ## Why a custom system?
 
@@ -330,8 +354,190 @@ it? There's several major benefits to this system:
   pre-substituted for the user.
 - We're able to share implementation language and visual styling with
   our Help Center, which is especially useful for the extensive
-  non-REST API documentation pages (e.g. our bot framework).
+  non-REST API documentation pages (e.g., our bot framework).
 
 Using the standard OpenAPI format gives us flexibility, though; if we
 later choose to migrate to third-party tools, we don't need to redo
 the actual documentation work in order to migrate tools.
+
+## Debugging schema validation errors
+
+A common function used to validate and test Zulip's REST API is
+`validate_against_openapi_schema`. It is used to verify that every
+successful API response returned in the backend and documentation test
+suites are a documented possibility in the API documentation.
+
+Therefore, when you add a new feature or setting to Zulip, you will most
+likely need to update the API documentation (`zerver/openapi/zulip.yaml`)
+in order to pass existing tests that use this function. Additionally, if
+you're writing documentation for a new or undocumented REST API endpoint,
+you'll want to use this function to validate and test your changes in
+`zerver/openapi/python_examples.py`.
+
+Below are some examples to help you when debugging the schema validation
+errors produced by `validate_against_openapi_schema`. Before reading
+through the examples, we recommend reviewing the
+[OpenAPI configuration](openapi.md) documentation if you're unfamiliar
+with the format.
+
+If you use Visual Studio Code, an OpenAPI extension can be very helpful in
+navigating Zulip's large and detailed OpenAPI file; see
+`.vscode/extensions.json`.
+
+### Deconstructing the error output
+
+To start with a clear example, let's imagine that we are writing the
+documentation for the REST API endpoint for uploading a file,
+[POST /api/v1/user_uploads](https://zulip.com/api/upload-file).
+
+There are no parameters for this endpoint, and only one return value
+specific to this endpoint, `uri`, which is the URL of the uploaded file.
+If we comment out that return value and example from the existing API
+documentation in `zerver/openapi/zulip.yaml`, for example:
+
+```yaml
+  /user_uploads:
+    post:
+      operationId: upload-file
+...
+      responses:
+        "200":
+          description: Success.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/JsonSuccessBase"
+                  - additionalProperties: false
+                    properties:
+                      result: {}
+                      msg: {}
+                      # uri:
+                      #   type: string
+                      #   description: |
+                      #     The URI of the uploaded file.
+                    example:
+                      {
+                        "msg": "",
+                        "result": "success",
+                        # "uri": "/user_uploads/1/4e/m2A3MSqFnWRLUf9SaPzQ0Up_/zulip.txt",
+                      }
+```
+
+We will now get an error when we run the API documentation test suite
+in the development environment (`tools/test-api`):
+
+```console
+Running API tests...
+2022-12-19 15:05:42.347 WARN [django.server] "POST /api/v1/users HTTP/1.1" 400 88
+Waiting for children to stop...
+Traceback (most recent call last):
+  File "tools/test-api", line 93, in <module>
+    test_the_api(client, nonadmin_client, owner_client)
+  File "/srv/zulip/zerver/openapi/python_examples.py", line 1636, in test_the_api
+    test_users(client, owner_client)
+  File "/srv/zulip/zerver/openapi/python_examples.py", line 1555, in test_users
+    upload_file(client)
+  File "/srv/zulip/zerver/openapi/python_examples.py", line 52, in _record_calls_wrapper
+    return test_func(*args, **kwargs)
+  File "/srv/zulip/zerver/openapi/python_examples.py", line 1284, in upload_file
+    validate_against_openapi_schema(result, "/user_uploads", "post", "200")
+  File "/srv/zulip/zerver/openapi/openapi.py", line 489, in validate_against_openapi_schema
+    raise SchemaError(message) from None
+zerver.openapi.openapi.SchemaError: 1 response validation error(s) at post /api/v1/user_uploads (200):
+
+ValidationError: Additional properties are not allowed ('uri' was unexpected)
+
+Failed validating 'additionalProperties' in schema['allOf'][2]:
+    {'additionalProperties': False,
+     'example': {'msg': '',
+                 'result': 'success',
+     'properties': {'msg': {}, 'result': {}}}
+
+On instance:
+    {'msg': '',
+     'result': 'success',
+     'uri': '/user_uploads/2/85/XoqF0K7XEOLVGylgdpof80RB/img.jpg'}
+
+```
+
+We can see in the traceback that a `SchemaError` was raised in
+`validate_against_openapi_schema`:
+
+```console
+  File "/srv/zulip/zerver/openapi/openapi.py", line 478, in validate_against_openapi_schema
+    raise SchemaError(message) from None
+```
+
+The next line in the output, lets us know how many errors were found
+and for what endpoint.
+
+```console
+zerver.openapi.openapi.SchemaError: 1 response validation error(s) at post /api/v1/user_uploads (200):
+```
+
+As expected from commenting out the code above, there was one validation
+error for the `POST /api/v1/user_uploads` endpoint. The next line gives
+more information about that error.
+
+```console
+ValidationError: Additional properties are not allowed ('uri' was unexpected)
+```
+
+We see that there was a `uri` value returned by the endpoint that hasn't
+been documented. The next few lines of output, show us what return values
+are documented (again due to our changes) for this endpoint.
+
+```console
+Failed validating 'additionalProperties' in schema['allOf'][2]:
+    {'additionalProperties': False,
+     'example': {'msg': '',
+                 'result': 'success',
+     'properties': {'msg': {}, 'result': {}}}
+```
+
+And finally, we see the test instance that did not match our current
+documentation, which includes the `uri` return value.
+
+```console
+On instance:
+    {'msg': '',
+     'result': 'success',
+     'uri': '/user_uploads/2/85/XoqF0K7XEOLVGylgdpof80RB/img.jpg'}
+```
+
+This is a useful example because the endpoint's documentation is short
+and straightforward, helping to easily identify the parts of the
+error output that are useful in debugging these errors when testing the
+API documentation.
+
+### Adding a realm setting
+
+Building on [the new feature tutorial](../tutorials/new-feature-tutorial.md)
+example, if the realm setting for `mandatory_topics` was not documented
+in the `POST /api/v1/register` endpoint, running `tools/test-api` in the
+development environment would result in this error:
+
+```console
+...
+zerver.openapi.openapi.SchemaError: 1 response validation error(s) at post /api/v1/register (200):
+
+ValidationError: Additional properties are not allowed ('realm_mandatory_topics' was unexpected)
+
+Failed validating 'additionalProperties' in schema['allOf'][2]:
+    'OpenAPI schema omitted due to length of output.'
+
+On instance:
+    'Error instance omitted due to length of output.'
+```
+
+Because this endpoint is very long and descriptive, we do not print the
+entire documentation schema (or test instance, in this case) to the
+console. Doing so would print thousands of lines of output that are not
+useful for debugging what is missing from the API documentation.
+
+The key information for debugging this endpoint is in the line beginning
+with `ValidationError`. There we can see that the documentation does not
+include the new `realm_mandatory_topics` boolean that we added in the
+example feature tutorial, and we can look at other similar realm settings
+to add the documentation for that new feature.

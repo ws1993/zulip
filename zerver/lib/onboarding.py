@@ -1,20 +1,20 @@
-from typing import Dict, List
-
 from django.conf import settings
 from django.db import transaction
 from django.db.models import Count
 from django.utils.translation import gettext as _
+from django.utils.translation import override as override_language
 
-from zerver.lib.actions import (
-    create_users,
-    do_add_reaction,
+from zerver.actions.create_realm import setup_realm_internal_bots
+from zerver.actions.message_send import (
     do_send_messages,
     internal_prep_stream_message_by_name,
     internal_send_private_message,
 )
-from zerver.lib.emoji import emoji_name_to_emoji_code
-from zerver.lib.message import SendMessageRequest
-from zerver.models import Message, Realm, UserProfile, get_system_bot
+from zerver.actions.reactions import do_add_reaction
+from zerver.lib.emoji import get_emoji_data
+from zerver.lib.message import SendMessageRequest, remove_single_newlines
+from zerver.models import Message, OnboardingUserMessage, Realm, UserProfile
+from zerver.models.users import get_system_bot
 
 
 def missing_any_realm_internal_bots() -> bool:
@@ -22,32 +22,10 @@ def missing_any_realm_internal_bots() -> bool:
         bot["email_template"] % (settings.INTERNAL_BOT_DOMAIN,)
         for bot in settings.REALM_INTERNAL_BOTS
     ]
-    bot_counts = dict(
-        UserProfile.objects.filter(email__in=bot_emails).values_list("email").annotate(Count("id"))
-    )
     realm_count = Realm.objects.count()
-    return any(bot_counts.get(email, 0) < realm_count for email in bot_emails)
-
-
-def setup_realm_internal_bots(realm: Realm) -> None:
-    """Create this realm's internal bots.
-
-    This function is idempotent; it does nothing for a bot that
-    already exists.
-    """
-    internal_bots = [
-        (bot["name"], bot["email_template"] % (settings.INTERNAL_BOT_DOMAIN,))
-        for bot in settings.REALM_INTERNAL_BOTS
-    ]
-    create_users(realm, internal_bots, bot_type=UserProfile.DEFAULT_BOT)
-    bots = UserProfile.objects.filter(
-        realm=realm,
-        email__in=[bot_info[1] for bot_info in internal_bots],
-        bot_owner__isnull=True,
-    )
-    for bot in bots:
-        bot.bot_owner = bot
-        bot.save()
+    return UserProfile.objects.filter(email__in=bot_emails).values("email").alias(
+        count=Count("id")
+    ).filter(count=realm_count).count() != len(bot_emails)
 
 
 def create_if_missing_realm_internal_bots() -> None:
@@ -60,53 +38,77 @@ def create_if_missing_realm_internal_bots() -> None:
             setup_realm_internal_bots(realm)
 
 
-def send_initial_pms(user: UserProfile) -> None:
-    organization_setup_text = ""
-    if user.is_realm_admin:
-        help_url = user.realm.uri + "/help/getting-your-organization-started-with-zulip"
-        organization_setup_text = (
-            " " + _("We also have a guide for [Setting up your organization]({help_url}).")
-        ).format(help_url=help_url)
+def send_initial_direct_message(user: UserProfile) -> int:
+    # We adjust the initial Welcome Bot direct message for education organizations.
+    education_organization = user.realm.org_type in (
+        Realm.ORG_TYPES["education_nonprofit"]["id"],
+        Realm.ORG_TYPES["education"]["id"],
+    )
 
-    welcome_msg = _("Hello, and welcome to Zulip!") + "👋"
-    demo_org_warning = ""
-    if user.realm.demo_organization_scheduled_deletion_date is not None:
-        demo_org_warning = (
-            _(
-                "Note that this is a [demo organization]({demo_org_help_url}) and will be "
-                "**automatically deleted** in 30 days."
-            )
-            + "\n\n"
+    # We need to override the language in this code path, because it's
+    # called from account registration, which is a pre-account API
+    # request and thus may not have the user's language context yet.
+    with override_language(user.default_language):
+        if education_organization:
+            getting_started_string = _("""
+To learn more, check out our [using Zulip for a class guide]({getting_started_url})!
+""").format(getting_started_url="/help/using-zulip-for-a-class")
+        else:
+            getting_started_string = _("""
+To learn more, check out our [getting started guide]({getting_started_url})!
+""").format(getting_started_url="/help/getting-started-with-zulip")
+
+        organization_setup_string = ""
+        # Add extra content on setting up a new organization for administrators.
+        if user.is_realm_admin:
+            if education_organization:
+                organization_setup_string = _("""
+We also have a guide for [setting up Zulip for a class]({organization_setup_url}).
+""").format(organization_setup_url="/help/setting-up-zulip-for-a-class")
+            else:
+                organization_setup_string = _("""
+We also have a guide for [moving your organization to Zulip]({organization_setup_url}).
+""").format(organization_setup_url="/help/moving-to-zulip")
+
+        demo_organization_warning_string = ""
+        # Add extra content about automatic deletion for demo organization owners.
+        if user.is_realm_owner and user.realm.demo_organization_scheduled_deletion_date is not None:
+            demo_organization_warning_string = _("""
+Note that this is a [demo organization]({demo_organization_help_url}) and
+will be **automatically deleted** in 30 days.
+""").format(demo_organization_help_url="/help/demo-organizations")
+
+        inform_about_tracked_onboarding_messages_text = ""
+        if OnboardingUserMessage.objects.filter(realm_id=user.realm_id).exists():
+            inform_about_tracked_onboarding_messages_text = _("""
+I've kicked off some conversations to help you get started. You can find
+them in your [Inbox](/#inbox).
+""")
+
+        content = _("""
+Hello, and welcome to Zulip!👋 {inform_about_tracked_onboarding_messages_text}
+
+{getting_started_text} {organization_setup_text}
+
+{demo_organization_text}
+
+""").format(
+            inform_about_tracked_onboarding_messages_text=inform_about_tracked_onboarding_messages_text,
+            getting_started_text=getting_started_string,
+            organization_setup_text=organization_setup_string,
+            demo_organization_text=demo_organization_warning_string,
         )
 
-    content = "".join(
-        [
-            welcome_msg + " ",
-            _("This is a private message from me, Welcome Bot.") + "\n\n",
-            _(
-                "If you are new to Zulip, check out our [Getting started guide]({getting_started_url})!"
-            ),
-            "{organization_setup_text}" + "\n\n",
-            "{demo_org_warning}",
-            _(
-                "I can also help you get set up! Just click anywhere on this message or press `r` to reply."
-            )
-            + "\n\n",
-            _("Here are a few messages I understand:") + " ",
-            bot_commands(),
-        ]
+    message_id = internal_send_private_message(
+        get_system_bot(settings.WELCOME_BOT, user.realm_id),
+        user,
+        remove_single_newlines(content),
+        # Note: Welcome bot doesn't trigger email/push notifications,
+        # as this is intended to be seen contextually in the application.
+        disable_external_notifications=True,
     )
-
-    content = content.format(
-        organization_setup_text=organization_setup_text,
-        demo_org_warning=demo_org_warning,
-        demo_org_help_url="/help/demo-organizations",
-        getting_started_url="/help/getting-started-with-zulip",
-    )
-
-    internal_send_private_message(
-        get_system_bot(settings.WELCOME_BOT, user.realm_id), user, content
-    )
+    assert message_id is not None
+    return message_id
 
 
 def bot_commands(no_help_command: bool = False) -> str:
@@ -114,214 +116,337 @@ def bot_commands(no_help_command: bool = False) -> str:
         "apps",
         "profile",
         "theme",
-        "streams",
+        "channels",
         "topics",
         "message formatting",
         "keyboard shortcuts",
     ]
     if not no_help_command:
         commands.append("help")
-    return ", ".join(["`" + command + "`" for command in commands]) + "."
+    return ", ".join("`" + command + "`" for command in commands) + "."
 
 
 def select_welcome_bot_response(human_response_lower: str) -> str:
     # Given the raw (pre-markdown-rendering) content for a private
     # message from the user to Welcome Bot, select the appropriate reply.
     if human_response_lower in ["app", "apps"]:
-        return _(
-            "You can [download](/apps) the [mobile and desktop apps](/apps). "
-            "Zulip also works great in a browser."
-        )
+        return _("""
+You can [download](/apps/) the [mobile and desktop apps](/apps/).
+Zulip also works great in a browser.
+""")
     elif human_response_lower == "profile":
-        return _(
-            "Go to [Profile settings](#settings/profile) "
-            "to add a [profile picture](/help/change-your-profile-picture) "
-            "and edit your [profile information](/help/edit-your-profile)."
-        )
+        return _("""
+Go to [Profile settings](#settings/profile) to add a [profile picture](/help/change-your-profile-picture)
+and edit your [profile information](/help/edit-your-profile).
+""")
     elif human_response_lower == "theme":
-        return _(
-            "Go to [Display settings](#settings/display-settings) "
-            "to [switch between the light and dark themes](/help/dark-theme), "
-            "[pick your favorite emoji theme](/help/emoji-and-emoticons#change-your-emoji-set), "
-            "[change your language](/help/change-your-language), "
-            "and make other tweaks to your Zulip experience."
-        )
+        return _("""
+You can switch between [light and dark theme](/help/dark-theme), [pick your
+favorite emoji set](/help/emoji-and-emoticons#change-your-emoji-set), [change
+your language](/help/change-your-language), and otherwise customize your Zulip
+experience in your [Preferences](#settings/preferences).
+""")
     elif human_response_lower in ["stream", "streams", "channel", "channels"]:
-        return "".join(
-            [
-                _(
-                    "In Zulip, streams [determine who gets a message](/help/streams-and-topics). "
-                    "They are similar to channels in other chat apps."
-                )
-                + "\n\n",
-                _("[Browse and subscribe to streams](#streams/all)."),
-            ]
-        )
+        return _("""
+Channels organize conversations based on who needs to see them. For example,
+it's common to have a channel for each team in an organization.
+
+[Browse and subscribe to channels]({settings_link}).
+""").format(help_link="/help/introduction-to-channels", settings_link="#channels/all")
     elif human_response_lower in ["topic", "topics"]:
-        return "".join(
-            [
-                _(
-                    "In Zulip, topics [tell you what a message is about](/help/streams-and-topics). "
-                    "They are light-weight subjects, very similar to the subject line of an email."
-                )
-                + "\n\n",
-                _(
-                    "Check out [Recent topics](#recent_topics) to see what's happening! "
-                    'You can return to this conversation by clicking "Private messages" in the upper left.'
-                ),
-            ]
-        )
+        return _("""
+[Topics](/help/introduction-to-topics) summarize what each conversation in Zulip
+is about. You can read Zulip one topic at a time, seeing each message in
+context, no matter how many other conversations are going on.
+
+When you start a conversation, label it with a new topic. For a good topic name,
+think about finishing the sentence: “Hey, can we chat about…?”
+
+Check out [Recent conversations](#recent) for a list of topics that are being
+discussed.
+""")
     elif human_response_lower in ["keyboard", "shortcuts", "keyboard shortcuts"]:
-        return "".join(
-            [
-                _(
-                    "Zulip's [keyboard shortcuts](#keyboard-shortcuts) "
-                    "let you navigate the app quickly and efficiently."
-                )
-                + "\n\n",
-                _("Press `?` any time to see a [cheat sheet](#keyboard-shortcuts)."),
-            ]
-        )
+        return _("""
+Zulip's [keyboard shortcuts](#keyboard-shortcuts) let you navigate the app
+quickly and efficiently.
+
+Press `?` any time to see a [cheat sheet](#keyboard-shortcuts).
+""")
     elif human_response_lower in ["formatting", "message formatting"]:
-        return "".join(
-            [
-                _(
-                    "Zulip uses [Markdown](/help/format-your-message-using-markdown), "
-                    "an intuitive format for **bold**, *italics*, bulleted lists, and more. "
-                    "Click [here](#message-formatting) for a cheat sheet."
-                )
-                + "\n\n",
-                _(
-                    "Check out our [messaging tips](/help/messaging-tips) "
-                    "to learn about emoji reactions, code blocks and much more!"
-                ),
-            ]
-        )
+        return _("""
+You can **format** *your* `message` using the handy formatting buttons, or by
+typing your formatting with Markdown.
+
+Check out the [cheat sheet](#message-formatting) to learn about spoilers, global
+times, and more.
+""")
     elif human_response_lower in ["help", "?"]:
-        return "".join(
-            [
-                _("Here are a few messages I understand:") + " ",
-                bot_commands(no_help_command=True) + "\n\n",
-                _(
-                    "Check out our [Getting started guide](/help/getting-started-with-zulip), "
-                    "or browse the [Help center](/help/) to learn more!"
-                ),
-            ]
-        )
+        return _("""
+Here are a few messages I understand: {bot_commands}
+
+Check out our [Getting started guide](/help/getting-started-with-zulip),
+or browse the [Help center](/help/) to learn more!
+""").format(bot_commands=bot_commands(no_help_command=True))
     else:
-        return "".join(
-            [
-                _(
-                    "I’m sorry, I did not understand your message. Please try one of the following commands:"
-                )
-                + " ",
-                bot_commands(),
-            ]
-        )
+        return _("""
+You can chat with me as much as you like! To
+get help, try one of the following messages: {bot_commands}
+""").format(bot_commands=bot_commands())
 
 
 def send_welcome_bot_response(send_request: SendMessageRequest) -> None:
-    """Given the send_request object for a private message from the user
+    """Given the send_request object for a direct message from the user
     to welcome-bot, trigger the welcome-bot reply."""
-    welcome_bot = get_system_bot(settings.WELCOME_BOT, send_request.message.sender.realm_id)
+    welcome_bot = get_system_bot(settings.WELCOME_BOT, send_request.realm.id)
     human_response_lower = send_request.message.content.lower()
+    human_user_recipient_id = send_request.message.sender.recipient_id
+    assert human_user_recipient_id is not None
     content = select_welcome_bot_response(human_response_lower)
-    internal_send_private_message(welcome_bot, send_request.message.sender, content)
+    realm_id = send_request.realm.id
+    commands = bot_commands()
+    if (
+        commands in content
+        and Message.objects.filter(
+            realm_id=realm_id,
+            sender_id=welcome_bot.id,
+            recipient_id=human_user_recipient_id,
+            content__icontains=commands,
+        ).exists()
+        # Uses index 'zerver_message_realm_sender_recipient'
+    ):
+        # If the bot has already sent bot commands to this user and
+        # if the bot does not understand the current message sent by this user then
+        # do not send any message
+        return
+
+    internal_send_private_message(
+        welcome_bot,
+        send_request.message.sender,
+        remove_single_newlines(content),
+        # Note: Welcome bot doesn't trigger email/push notifications,
+        # as this is intended to be seen contextually in the application.
+        disable_external_notifications=True,
+    )
 
 
-@transaction.atomic
+@transaction.atomic(savepoint=False)
 def send_initial_realm_messages(realm: Realm) -> None:
+    # Sends the initial messages for a new organization.
+    #
+    # Technical note: Each stream created in the realm creation
+    # process should have at least one message declared in this
+    # function, to enforce the pseudo-invariant that every stream has
+    # at least one message.
     welcome_bot = get_system_bot(settings.WELCOME_BOT, realm.id)
-    # Make sure each stream created in the realm creation process has at least one message below
-    # Order corresponds to the ordering of the streams on the left sidebar, to make the initial Home
-    # view slightly less overwhelming
-    content_of_private_streams_topic = (
-        _("This is a private stream, as indicated by the lock icon next to the stream name.")
-        + " "
-        + _("Private streams are only visible to stream members.")
-        + "\n"
-        "\n"
-        + _(
-            "To manage this stream, go to [Stream settings]({stream_settings_url}) "
-            "and click on `{initial_private_stream_name}`."
-        )
+
+    # Content is declared here to apply translation properly.
+    #
+    # remove_single_newlines needs to be called on any multiline
+    # strings for them to render properly.
+    content1_of_moving_messages_topic_name = (
+        _("""
+If anything is out of place, it’s easy to [move messages]({move_content_another_topic_help_url}),
+[rename]({rename_topic_help_url}) and [split]({move_content_another_topic_help_url}) topics,
+or even move a topic [to a different channel]({move_content_another_channel_help_url}).
+""")
     ).format(
-        stream_settings_url="#streams/subscribed",
-        initial_private_stream_name=Realm.INITIAL_PRIVATE_STREAM_NAME,
+        move_content_another_topic_help_url="/help/move-content-to-another-topic",
+        rename_topic_help_url="/help/rename-a-topic",
+        move_content_another_channel_help_url="/help/move-content-to-another-channel",
     )
 
-    content1_of_topic_demonstration_topic = (
-        _(
-            "This is a message on stream #**{default_notification_stream_name}** with the "
-            "topic `topic demonstration`."
-        )
-    ).format(default_notification_stream_name=Realm.DEFAULT_NOTIFICATION_STREAM_NAME)
+    content2_of_moving_messages_topic_name = _("""
+:point_right: Try moving this message to another topic and back.
+""")
 
-    content2_of_topic_demonstration_topic = (
-        _("Topics are a lightweight tool to keep conversations organized.")
-        + " "
-        + _("You can learn more about topics at [Streams and topics]({about_topics_help_url}).")
-    ).format(about_topics_help_url="/help/streams-and-topics")
+    content1_of_welcome_to_zulip_topic_name = _("""
+Zulip is organized to help you communicate more efficiently. Conversations are
+labeled with topics, which summarize what the conversation is about.
 
-    content_of_swimming_turtles_topic = (
-        _(
-            "This is a message on stream #**{default_notification_stream_name}** with the "
-            "topic `swimming turtles`."
-        )
-        + "\n"
-        "\n"
-        "[](/static/images/cute/turtle.png)"
-        "\n"
-        "\n"
-        + _(
-            "[Start a new topic]({start_topic_help_url}) any time you're not replying to a \
-        previous message."
-        )
-    ).format(
-        default_notification_stream_name=Realm.DEFAULT_NOTIFICATION_STREAM_NAME,
-        start_topic_help_url="/help/start-a-new-topic",
+For example, this message is in the “{topic_name}” topic in the
+#**{zulip_discussion_channel_name}** channel, as you can see in the left sidebar
+and above.
+""").format(
+        zulip_discussion_channel_name=str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME),
+        topic_name=_("welcome to Zulip!"),
     )
 
-    welcome_messages: List[Dict[str, str]] = [
+    content2_of_welcome_to_zulip_topic_name = _("""
+You can read Zulip one conversation at a time, seeing each message in context,
+no matter how many other conversations are going on.
+""")
+
+    content3_of_welcome_to_zulip_topic_name = _("""
+:point_right: When you're ready, check out your [Inbox](/#inbox) for other
+conversations with unread messages.
+""")
+
+    content1_of_start_conversation_topic_name = _("""
+To kick off a new conversation, click **Start new conversation** below.
+The new conversation thread will be labeled with its own topic.
+""")
+
+    content2_of_start_conversation_topic_name = _("""
+For a good topic name, think about finishing the sentence: “Hey, can we chat about…?”
+""")
+
+    content3_of_start_conversation_topic_name = _("""
+:point_right: Try starting a new conversation in this channel.
+""")
+
+    content1_of_experiments_topic_name = (
+        _("""
+:point_right:  Use this topic to try out [Zulip's messaging features]({format_message_help_url}).
+""")
+    ).format(format_message_help_url="/help/format-your-message-using-markdown")
+
+    content2_of_experiments_topic_name = (
+        _("""
+```spoiler Want to see some examples?
+
+````python
+
+print("code blocks")
+
+````
+
+- bulleted
+- lists
+
+Link to a conversation: #**{zulip_discussion_channel_name}>{topic_name}**
+
+```
+""")
+    ).format(
+        zulip_discussion_channel_name=str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME),
+        topic_name=_("welcome to Zulip!"),
+    )
+
+    content1_of_greetings_topic_name = _("""
+This **greetings** topic is a great place to say “hi” :wave: to your teammates.
+""")
+
+    content2_of_greetings_topic_name = _("""
+:point_right: Click on this message to start a new message in the same conversation.
+""")
+
+    welcome_messages: list[dict[str, str]] = []
+
+    # Messages added to the "welcome messages" list last will be most
+    # visible to users, since welcome messages will likely be browsed
+    # via the right sidebar or recent conversations view, both of
+    # which are sorted newest-first.
+    #
+    # Initial messages are configured below.
+
+    # Advertising moving messages.
+    welcome_messages += [
         {
-            "stream": Realm.INITIAL_PRIVATE_STREAM_NAME,
-            "topic": "private streams",
-            "content": content_of_private_streams_topic,
-        },
-        {
-            "stream": Realm.DEFAULT_NOTIFICATION_STREAM_NAME,
-            "topic": "topic demonstration",
-            "content": content1_of_topic_demonstration_topic,
-        },
-        {
-            "stream": Realm.DEFAULT_NOTIFICATION_STREAM_NAME,
-            "topic": "topic demonstration",
-            "content": content2_of_topic_demonstration_topic,
-        },
-        {
-            "stream": realm.DEFAULT_NOTIFICATION_STREAM_NAME,
-            "topic": "swimming turtles",
-            "content": content_of_swimming_turtles_topic,
-        },
+            "channel_name": str(Realm.ZULIP_DISCUSSION_CHANNEL_NAME),
+            "topic_name": _("moving messages"),
+            "content": content,
+        }
+        for content in [
+            content1_of_moving_messages_topic_name,
+            content2_of_moving_messages_topic_name,
+        ]
     ]
+
+    # Suggestion to test messaging features.
+    # Dependency on knowing how to send messages.
+    welcome_messages += [
+        {
+            "channel_name": str(realm.ZULIP_SANDBOX_CHANNEL_NAME),
+            "topic_name": _("experiments"),
+            "content": content,
+        }
+        for content in [content1_of_experiments_topic_name, content2_of_experiments_topic_name]
+    ]
+
+    # Suggestion to start your first new conversation.
+    welcome_messages += [
+        {
+            "channel_name": str(realm.ZULIP_SANDBOX_CHANNEL_NAME),
+            "topic_name": _("start a conversation"),
+            "content": content,
+        }
+        for content in [
+            content1_of_start_conversation_topic_name,
+            content2_of_start_conversation_topic_name,
+            content3_of_start_conversation_topic_name,
+        ]
+    ]
+
+    # Suggestion to send first message as a hi to your team.
+    welcome_messages += [
+        {
+            "channel_name": str(Realm.DEFAULT_NOTIFICATION_STREAM_NAME),
+            "topic_name": _("greetings"),
+            "content": content,
+        }
+        for content in [content1_of_greetings_topic_name, content2_of_greetings_topic_name]
+    ]
+
+    # Main welcome message, this should be last.
+    welcome_messages += [
+        {
+            "channel_name": str(realm.ZULIP_DISCUSSION_CHANNEL_NAME),
+            "topic_name": _("welcome to Zulip!"),
+            "content": content,
+        }
+        for content in [
+            content1_of_welcome_to_zulip_topic_name,
+            content2_of_welcome_to_zulip_topic_name,
+            content3_of_welcome_to_zulip_topic_name,
+        ]
+    ]
+
+    # End of message declarations; now we actually send them.
 
     messages = [
         internal_prep_stream_message_by_name(
             realm,
             welcome_bot,
-            message["stream"],
-            message["topic"],
-            message["content"],
+            message["channel_name"],
+            message["topic_name"],
+            remove_single_newlines(message["content"]),
         )
         for message in welcome_messages
     ]
-    message_ids = do_send_messages(messages)
+    message_ids = [
+        sent_message_result.message_id for sent_message_result in do_send_messages(messages)
+    ]
 
-    # We find the one of our just-sent messages with turtle.png in it,
-    # and react to it.  This is a bit hacky, but works and is kinda a
-    # 1-off thing.
-    turtle_message = Message.objects.select_for_update().get(
-        id__in=message_ids, content__icontains="cute/turtle.png"
+    seen_topics = set()
+    onboarding_topics_first_message_ids = set()
+    for index, message in enumerate(welcome_messages):
+        topic_name = message["topic_name"]
+        if topic_name not in seen_topics:
+            onboarding_topics_first_message_ids.add(message_ids[index])
+            seen_topics.add(topic_name)
+
+    onboarding_user_messages = []
+    for message_id in message_ids:
+        flags = OnboardingUserMessage.flags.historical
+        if message_id in onboarding_topics_first_message_ids:
+            flags |= OnboardingUserMessage.flags.starred
+        onboarding_user_messages.append(
+            OnboardingUserMessage(realm=realm, message_id=message_id, flags=flags)
+        )
+
+    OnboardingUserMessage.objects.bulk_create(onboarding_user_messages)
+
+    # We find the one of our just-sent greetings messages, and react to it.
+    # This is a bit hacky, but works and is kinda a 1-off thing.
+    greetings_message = (
+        Message.objects.select_for_update()
+        .filter(
+            id__in=message_ids, content=remove_single_newlines(content1_of_greetings_topic_name)
+        )
+        .first()
     )
-    (emoji_code, reaction_type) = emoji_name_to_emoji_code(realm, "turtle")
-    do_add_reaction(welcome_bot, turtle_message, "turtle", emoji_code, reaction_type)
+    assert greetings_message is not None
+    emoji_data = get_emoji_data(realm.id, "wave")
+    do_add_reaction(
+        welcome_bot, greetings_message, "wave", emoji_data.emoji_code, emoji_data.reaction_type
+    )

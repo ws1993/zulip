@@ -2,7 +2,6 @@ import logging
 import os
 import shutil
 import subprocess
-from typing import List, Optional, Set, Tuple
 
 from scripts.lib.hash_reqs import expand_reqs, python_version
 from scripts.lib.zulip_tools import ENDC, WARNING, os_families, run, run_as_root
@@ -13,9 +12,6 @@ VENV_CACHE_PATH = "/srv/zulip-venv-cache"
 VENV_DEPENDENCIES = [
     "build-essential",
     "libffi-dev",
-    "libfreetype6-dev",  # Needed for image types with Pillow
-    "zlib1g-dev",  # Needed to handle compressed PNGs with Pillow
-    "libjpeg-dev",  # Needed to handle JPEGs with Pillow
     "libldap2-dev",
     "python3-dev",  # Needed to install typed-ast dependency of mypy
     "python3-pip",
@@ -29,19 +25,14 @@ VENV_DEPENDENCIES = [
     # Needed by python-xmlsec:
     "libxmlsec1-dev",
     "pkg-config",
-    # This is technically a node dependency, but we add it here
-    # because we don't have another place that we install apt packages
-    # on upgrade of a production server, and it's not worth adding
-    # another call to `apt install` for.
-    "jq",  # Used by scripts/lib/install-yarn to check yarn version
+    "jq",  # No longer used in production (clean me up later)
     "libsasl2-dev",  # For building python-ldap from source
+    "libvips",  # For thumbnailing
+    "libvips-tools",
 ]
 
 COMMON_YUM_VENV_DEPENDENCIES = [
     "libffi-devel",
-    "freetype-devel",
-    "zlib-devel",
-    "libjpeg-turbo-devel",
     "openldap-devel",
     "libyaml-devel",
     # Needed by python-xmlsec:
@@ -55,6 +46,8 @@ COMMON_YUM_VENV_DEPENDENCIES = [
     "postgresql-libs",  # libpq-dev on apt
     "openssl-devel",
     "jq",
+    "vips",  # For thumbnailing
+    "vips-tools",
 ]
 
 REDHAT_VENV_DEPENDENCIES = [
@@ -70,7 +63,7 @@ FEDORA_VENV_DEPENDENCIES = [
 ]
 
 
-def get_venv_dependencies(vendor: str, os_version: str) -> List[str]:
+def get_venv_dependencies(vendor: str, os_version: str) -> list[str]:
     if "debian" in os_families():
         return VENV_DEPENDENCIES
     elif "rhel" in os_families():
@@ -101,7 +94,7 @@ def get_index_filename(venv_path: str) -> str:
     return os.path.join(venv_path, "package_index")
 
 
-def get_package_names(requirements_file: str) -> List[str]:
+def get_package_names(requirements_file: str) -> list[str]:
     packages = expand_reqs(requirements_file)
     cleaned = []
     operators = ["~=", "==", "!=", "<", ">"]
@@ -140,7 +133,7 @@ def create_requirements_index_file(venv_path: str, requirements_file: str) -> st
     return index_filename
 
 
-def get_venv_packages(venv_path: str) -> Set[str]:
+def get_venv_packages(venv_path: str) -> set[str]:
     """
     Returns the packages installed in the virtual environment using the
     package index file.
@@ -149,7 +142,7 @@ def get_venv_packages(venv_path: str) -> Set[str]:
         return {p.strip() for p in reader.read().split("\n") if p.strip()}
 
 
-def try_to_copy_venv(venv_path: str, new_packages: Set[str]) -> bool:
+def try_to_copy_venv(venv_path: str, new_packages: set[str]) -> bool:
     """
     Tries to copy packages from an old virtual environment in the cache
     to the new virtual environment. The algorithm works as follows:
@@ -167,8 +160,8 @@ def try_to_copy_venv(venv_path: str, new_packages: Set[str]) -> bool:
     desired_python_version = python_version()
     venv_name = os.path.basename(venv_path)
 
-    overlaps = []  # type: List[Tuple[int, str, Set[str]]]
-    old_packages = set()  # type: Set[str]
+    overlaps: list[tuple[int, str, set[str]]] = []
+    old_packages: set[str] = set()
     for sha1sum in os.listdir(VENV_CACHE_PATH):
         curr_venv_path = os.path.join(VENV_CACHE_PATH, sha1sum, venv_name)
         if curr_venv_path == venv_path or not os.path.exists(get_index_filename(curr_venv_path)):
@@ -178,14 +171,12 @@ def try_to_copy_venv(venv_path: str, new_packages: Set[str]) -> bool:
         venv_python3 = os.path.join(curr_venv_path, "bin", "python3")
         if not os.path.exists(venv_python3):
             continue
-        venv_python_version = subprocess.check_output(
-            [venv_python3, "-VV"], universal_newlines=True
-        )
+        venv_python_version = subprocess.check_output([venv_python3, "-VV"], text=True)
         if desired_python_version != venv_python_version:
             continue
 
         old_packages = get_venv_packages(curr_venv_path)
-        # We only consider using using old virtualenvs that only
+        # We only consider using old virtualenvs that only
         # contain packages that we want in our new virtualenv.
         if not (old_packages - new_packages):
             overlap = new_packages & old_packages
@@ -240,10 +231,9 @@ def get_logfile_name(venv_path: str) -> str:
 def create_log_entry(
     target_log: str,
     parent: str,
-    copied_packages: Set[str],
-    new_packages: Set[str],
+    copied_packages: set[str],
+    new_packages: set[str],
 ) -> None:
-
     venv_path = os.path.dirname(target_log)
     with open(target_log, "a") as writer:
         writer.write(f"{venv_path}\n")
@@ -282,16 +272,15 @@ def do_patch_activate_script(venv_path: str) -> None:
 
 def generate_hash(requirements_file: str) -> str:
     path = os.path.join(ZULIP_PATH, "scripts", "lib", "hash_reqs.py")
-    output = subprocess.check_output([path, requirements_file], universal_newlines=True)
+    output = subprocess.check_output([path, requirements_file], text=True)
     return output.split()[0]
 
 
 def setup_virtualenv(
-    target_venv_path: Optional[str],
+    target_venv_path: str | None,
     requirements_file: str,
     patch_activate_script: bool = False,
 ) -> str:
-
     sha1sum = generate_hash(requirements_file)
     # Check if a cached version already exists
     if target_venv_path is None:
@@ -322,8 +311,7 @@ def add_cert_to_pipconf() -> None:
 
 
 def do_setup_virtualenv(venv_path: str, requirements_file: str) -> None:
-
-    # Setup Python virtualenv
+    # Set up Python virtualenv
     new_packages = set(get_package_names(requirements_file))
 
     run_as_root(["rm", "-rf", venv_path])

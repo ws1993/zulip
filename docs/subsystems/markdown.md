@@ -5,7 +5,7 @@ formatting. Our Markdown flavor is unique primarily to add important
 extensions, such as quote blocks and math blocks, and also to do
 previews and correct issues specific to the chat context. Beyond
 that, it has a number of minor historical variations resulting from
-its history predacting CommonMark (and thus Zulip choosing different
+its history predating CommonMark (and thus Zulip choosing different
 solutions to some problems) and based in part on Python-Markdown,
 which is proudly a classic Markdown implementation. We reduce these
 variations with every major Zulip release.
@@ -17,7 +17,7 @@ authoritatively render messages to HTML (and implements
 slow/expensive/complex features like querying the Twitter API to
 render tweets nicely). The frontend implementation is in JavaScript,
 based on [marked.js](https://github.com/chjj/marked)
-(`static/js/echo.js`), and is used to preview and locally echo
+(`web/src/echo.ts`), and is used to preview and locally echo
 messages the moment the sender hits Enter, without waiting for round
 trip from the server. Those frontend renderings are only shown to the
 sender of a message, and they are (ideally) identical to the backend
@@ -41,7 +41,7 @@ message is sent). As a result, we try to make sure that
 The Python-Markdown implementation is tested by
 `zerver/tests/test_markdown.py`, and the marked.js implementation and
 `markdown.contains_backend_only_syntax` are tested by
-`frontend_tests/node_tests/markdown.js`.
+`web/tests/markdown.test.cjs`.
 
 A shared set of fixed test data ("test fixtures") is present in
 `zerver/tests/fixtures/markdown_test_cases.json`, and is automatically used
@@ -64,7 +64,7 @@ this file:
   rendered content, since the APNS and GCM push notification systems
   don't support richer markup. Mostly, this involves stripping HTML,
   but there's some syntax we take special care with. Tests for what
-  this plain-text version of content should be are stored in the
+  this plain-text version of content should be stored in the
   `text_content` field.
 
 If you're going to manually test some changes in the frontend Markdown
@@ -101,12 +101,12 @@ When changing Zulip's Markdown syntax, you need to update several
 places:
 
 - The backend Markdown processor (`zerver/lib/markdown/__init__.py`).
-- The frontend Markdown processor (`static/js/markdown.js` and sometimes
-  `static/third/marked/lib/marked.js`), or `markdown.contains_backend_only_syntax` if
+- The frontend Markdown processor (`web/src/markdown.ts` and sometimes
+  `web/third/marked/lib/marked.cjs`), or `markdown.contains_backend_only_syntax` if
   your changes won't be supported in the frontend processor.
-- If desired, the typeahead logic in `static/js/composebox_typeahead.js`.
+- If desired, the typeahead logic in `web/src/composebox_typeahead.ts`.
 - The test suite, probably via adding entries to `zerver/tests/fixtures/markdown_test_cases.json`.
-- The in-app Markdown documentation (`markdown_help_rows` in `static/js/info_overlay.js`).
+- The in-app Markdown documentation (`markdown_help_rows` in `web/src/info_overlay.ts`).
 - The list of changes to Markdown at the end of this document.
 
 Important considerations for any changes are:
@@ -138,20 +138,20 @@ Zulip's Markdown processor's rendering supports a number of features
 that depend on realm-specific or user-specific data. For example, the
 realm could have
 [linkifiers](https://zulip.com/help/add-a-custom-linkifier)
-or [custom emoji](https://zulip.com/help/add-custom-emoji)
-configured, and Zulip supports mentions for streams, users, and user
+or [custom emoji](https://zulip.com/help/custom-emoji)
+configured, and Zulip supports mentions for channels, users, and user
 groups (which depend on data like users' names, IDs, etc.).
 
 At a backend code level, these are controlled by the `message_realm`
 object and other arguments passed into `do_convert` (`sent_by_bot`,
 `translate_emoticons`, `mention_data`, etc.). Because
 Python-Markdown doesn't support directly passing arguments into the
-Markdown processor, our logic attaches these data to the Markdown
-processor object via e.g. `_md_engine.zulip_db_data`, and then
-individual Markdown rules can access the data from there.
+Markdown processor, our logic attaches the data to the Markdown
+processor object via, for example, `_md_engine.zulip_db_data`, and
+then individual Markdown rules can access the data from there.
 
-For non-message contexts (e.g. an organization's profile (aka the
-thing on the right-hand side of the login page), stream descriptions,
+For non-message contexts (e.g., an organization's profile (aka the
+thing on the right-hand side of the login page), channel descriptions,
 or rendering custom profile fields), one needs to just pass in a
 `message_realm` (see, for example, `zulip_default_context` for the
 organization profile code for this). But for messages, we need to
@@ -166,7 +166,7 @@ Markdown, not newer Markdown variants like CommonMark.
 Markdown is great for group chat for the same reason it's been
 successful in products ranging from blogs to wikis to bug trackers:
 it's close enough to how people try to express themselves when writing
-plain text (e.g. emails) that it helps more than getting in the way.
+plain text (e.g., emails) that it helps more than getting in the way.
 
 The main issue for using Markdown in instant messaging is that the
 Markdown standard syntax used in a lot of wikis/blogs has nontrivial
@@ -212,7 +212,7 @@ accurate.
 
 - Allow only `*` syntax for italics, not `_`. This resolves an issue where
   people were using `_` and hitting it by mistake too often. Asterisks
-  surrounded by spaces won't trigger italics, either (e.g. with stock Markdown
+  surrounded by spaces won't trigger italics, either (e.g., with stock Markdown
   `You should use char * instead of void * there` would produce undesired
   results).
 
@@ -253,7 +253,7 @@ accurate.
 - Disable link-by-reference syntax,
   `[foo][bar]` ... `[bar]: https://google.com`.
 
-- Enable linking to other streams using `#**streamName**`.
+- Enable linking to other channels using `#**channelName**`.
 
 ### Code
 

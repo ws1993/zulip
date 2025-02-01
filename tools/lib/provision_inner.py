@@ -1,33 +1,45 @@
 #!/usr/bin/env python3
+
+############################## NOTE ################################
+# This script is used to provision a development environment ONLY.
+# For production, extend update-prod-static to generate new static
+# assets, and puppet to install other software.
+####################################################################
+
 import argparse
 import glob
 import os
+import pwd
 import shutil
+import subprocess
 import sys
-from typing import List
 
 ZULIP_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 sys.path.append(ZULIP_PATH)
 import pygments
-from pytz import VERSION as timezones_version
 
 from scripts.lib import clean_unused_caches
 from scripts.lib.zulip_tools import (
     ENDC,
     OKBLUE,
     get_dev_uuid_var_path,
+    get_tzdata_zi,
     is_digest_obsolete,
     run,
+    run_as_root,
     write_new_digest,
 )
 from tools.setup.generate_zulip_bots_static_files import generate_zulip_bots_static_files
 from version import PROVISION_VERSION
 
-pygments_version = pygments.__version__  # type: ignore[attr-defined] # private member missing from stubs
-
 VENV_PATH = "/srv/zulip-py3-venv"
 UUID_VAR_PATH = get_dev_uuid_var_path()
+
+with get_tzdata_zi() as f:
+    line = f.readline()
+    assert line.startswith("# version ")
+    timezones_version = line.removeprefix("# version ")
 
 
 def create_var_directories() -> None:
@@ -46,7 +58,7 @@ def create_var_directories() -> None:
         os.makedirs(path, exist_ok=True)
 
 
-def build_pygments_data_paths() -> List[str]:
+def build_pygments_data_paths() -> list[str]:
     paths = [
         "tools/setup/build_pygments_data",
         "tools/setup/lang.json",
@@ -54,34 +66,53 @@ def build_pygments_data_paths() -> List[str]:
     return paths
 
 
-def build_timezones_data_paths() -> List[str]:
+def build_timezones_data_paths() -> list[str]:
     paths = [
         "tools/setup/build_timezone_values",
     ]
     return paths
 
 
-def compilemessages_paths() -> List[str]:
+def build_landing_page_images_paths() -> list[str]:
+    paths = ["tools/setup/generate_landing_page_images.py"]
+    paths += glob.glob("static/images/landing-page/hello/original/*")
+    return paths
+
+
+def compilemessages_paths() -> list[str]:
     paths = ["zerver/management/commands/compilemessages.py"]
     paths += glob.glob("locale/*/LC_MESSAGES/*.po")
     paths += glob.glob("locale/*/translations.json")
     return paths
 
 
-def inline_email_css_paths() -> List[str]:
-    paths = [
-        "scripts/setup/inline_email_css.py",
-        "templates/zerver/emails/email.css",
-    ]
-    paths += glob.glob("templates/zerver/emails/*.source.html")
-    return paths
-
-
-def configure_rabbitmq_paths() -> List[str]:
+def configure_rabbitmq_paths() -> list[str]:
     paths = [
         "scripts/setup/configure-rabbitmq",
     ]
     return paths
+
+
+def is_wsl_instance() -> bool:
+    if "WSL_DISTRO_NAME" in os.environ:
+        return True
+
+    with open("/proc/version") as file:
+        content = file.read().lower()
+        if "microsoft" in content:
+            return True
+
+    result = subprocess.run(["uname", "-r"], capture_output=True, text=True, check=True)
+    if "microsoft" in result.stdout.lower():
+        return True
+
+    return False
+
+
+def is_vagrant_or_digitalocean_instance() -> bool:
+    user_id = os.getuid()
+    user_name = pwd.getpwuid(user_id).pw_name
+    return user_name in ["vagrant", "zulipdev"]
 
 
 def setup_shell_profile(shell_profile: str) -> None:
@@ -90,7 +121,7 @@ def setup_shell_profile(shell_profile: str) -> None:
     def write_command(command: str) -> None:
         if os.path.exists(shell_profile_path):
             with open(shell_profile_path) as shell_profile_file:
-                lines = [line.strip() for line in shell_profile_file.readlines()]
+                lines = [line.strip() for line in shell_profile_file]
             if command not in lines:
                 with open(shell_profile_path, "a+") as shell_profile_file:
                     shell_profile_file.writelines(command + "\n")
@@ -99,7 +130,9 @@ def setup_shell_profile(shell_profile: str) -> None:
                 shell_profile_file.writelines(command + "\n")
 
     source_activate_command = "source " + os.path.join(VENV_PATH, "bin", "activate")
-    write_command(source_activate_command)
+    # We want to activate the virtual environment for login shells only on virtualized systems.
+    if is_vagrant_or_digitalocean_instance() or is_wsl_instance():
+        write_command(source_activate_command)
     if os.path.exists("/srv/zulip"):
         write_command("cd /srv/zulip")
 
@@ -143,18 +176,18 @@ def setup_bash_profile() -> None:
 
 
 def need_to_run_build_pygments_data() -> bool:
-    if not os.path.exists("static/generated/pygments_data.json"):
+    if not os.path.exists("web/generated/pygments_data.json"):
         return True
 
     return is_digest_obsolete(
         "build_pygments_data_hash",
         build_pygments_data_paths(),
-        [pygments_version],
+        [pygments.__version__],
     )
 
 
 def need_to_run_build_timezone_data() -> bool:
-    if not os.path.exists("static/generated/timezones.json"):
+    if not os.path.exists("web/generated/timezones.json"):
         return True
 
     return is_digest_obsolete(
@@ -164,9 +197,19 @@ def need_to_run_build_timezone_data() -> bool:
     )
 
 
+def need_to_regenerate_landing_page_images() -> bool:
+    if not os.path.exists("static/images/landing-page/hello/generated"):
+        return True
+
+    return is_digest_obsolete(
+        "landing_page_images_hash",
+        build_landing_page_images_paths(),
+    )
+
+
 def need_to_run_compilemessages() -> bool:
     if not os.path.exists("locale/language_name_map.json"):
-        # User may have cleaned their git checkout.
+        # User may have cleaned their Git checkout.
         print("Need to run compilemessages due to missing language_name_map.json")
         return True
 
@@ -176,17 +219,7 @@ def need_to_run_compilemessages() -> bool:
     )
 
 
-def need_to_run_inline_email_css() -> bool:
-    if not os.path.exists("templates/zerver/emails/compiled/"):
-        return True
-
-    return is_digest_obsolete(
-        "last_email_source_files_hash",
-        inline_email_css_paths(),
-    )
-
-
-def need_to_run_configure_rabbitmq(settings_list: List[str]) -> bool:
+def need_to_run_configure_rabbitmq(settings_list: list[str]) -> bool:
     obsolete = is_digest_obsolete(
         "last_configure_rabbitmq_hash",
         configure_rabbitmq_paths(),
@@ -227,7 +260,7 @@ def main(options: argparse.Namespace) -> int:
         write_new_digest(
             "build_pygments_data_hash",
             build_pygments_data_paths(),
-            [pygments_version],
+            [pygments.__version__],
         )
     else:
         print("No need to run `tools/setup/build_pygments_data`.")
@@ -242,14 +275,12 @@ def main(options: argparse.Namespace) -> int:
     else:
         print("No need to run `tools/setup/build_timezone_values`.")
 
-    if options.is_force or need_to_run_inline_email_css():
-        run(["scripts/setup/inline_email_css.py"])
+    if options.is_force or need_to_regenerate_landing_page_images():
+        run(["tools/setup/generate_landing_page_images.py"])
         write_new_digest(
-            "last_email_source_files_hash",
-            inline_email_css_paths(),
+            "landing_page_images_hash",
+            build_landing_page_images_paths(),
         )
-    else:
-        print("No need to run `scripts/setup/inline_email_css.py`.")
 
     if not options.is_build_release_tarball_only:
         # The following block is skipped when we just need the development
@@ -269,8 +300,9 @@ def main(options: argparse.Namespace) -> int:
             destroy_leaked_test_databases,
         )
 
+        assert settings.RABBITMQ_PASSWORD is not None
         if options.is_force or need_to_run_configure_rabbitmq([settings.RABBITMQ_PASSWORD]):
-            run(["scripts/setup/configure-rabbitmq"])
+            run_as_root(["scripts/setup/configure-rabbitmq"])
             write_new_digest(
                 "last_configure_rabbitmq_hash",
                 configure_rabbitmq_paths(),
@@ -309,7 +341,7 @@ def main(options: argparse.Namespace) -> int:
             print("No need to regenerate the test DB.")
 
         if options.is_force or need_to_run_compilemessages():
-            run(["./manage.py", "compilemessages"])
+            run(["./manage.py", "compilemessages", "--ignore=*"])
             write_new_digest(
                 "last_compilemessages_hash",
                 compilemessages_paths(),
@@ -357,7 +389,7 @@ def main(options: argparse.Namespace) -> int:
     version_file = os.path.join(UUID_VAR_PATH, "provision_version")
     print(f"writing to {version_file}\n")
     with open(version_file, "w") as f:
-        f.write(PROVISION_VERSION + "\n")
+        f.write(".".join(map(str, PROVISION_VERSION)) + "\n")
 
     print()
     print(OKBLUE + "Zulip development environment setup succeeded!" + ENDC)

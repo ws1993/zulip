@@ -3,7 +3,7 @@
 This section attempts to document the Zulip security model. It likely
 does not cover every issue; if there are details you're curious about,
 please feel free to ask questions in [#production
-help](https://chat.zulip.org/#narrow/stream/31-production-help) on the
+help](https://chat.zulip.org/#narrow/channel/31-production-help) on the
 [Zulip community server](https://zulip.com/development-community/) (or if you
 think you've found a security bug, please report it to
 security@zulip.com so we can do a responsible security
@@ -35,11 +35,11 @@ announcement).
 - Zulip requires CSRF tokens in all interactions with the web API to
   prevent CSRF attacks.
 
-- The preferred way to log in to Zulip is using an SSO solution like
-  Google auth, LDAP, or similar, but Zulip also supports password
-  authentication. See
-  [the authentication methods documentation](../production/authentication-methods.md)
-  for details on Zulip's available authentication methods.
+- The preferred way to log in to Zulip is using a single sign-on (SSO)
+  solution like Google authentication, LDAP, or similar, but Zulip
+  also supports password authentication. See [the authentication
+  methods documentation](authentication-methods.md) for
+  details on Zulip's available authentication methods.
 
 ### Passwords
 
@@ -67,7 +67,7 @@ strength allowed is controlled by two settings in
   By default, `PASSWORD_MIN_GUESSES` is 10000. This provides
   significant protection against online attacks, while limiting the
   burden imposed on users choosing a password. See
-  [password strength](../production/password-strength.md) for an extended
+  [password strength](password-strength.md) for an extended
   discussion on how we chose this value.
 
   Estimating the guessability of a password is a complex problem and
@@ -99,41 +99,43 @@ strength allowed is controlled by two settings in
   parser which escapes content to protect against cross-site scripting
   attacks.
 
-- Zulip supports both public streams and private streams.
+- Zulip supports both public channels and private channels.
 
-  - Any non-guest user can join any public stream in the organization,
-    and can view the complete message history of any public stream
-    without joining the stream. Guests can only access streams that
+  - Any non-guest user can join any public channel in the organization,
+    and can view the complete message history of any public channel
+    without joining the channel. Guests can only access channels that
     another user adds them to.
 
   - Organization owners and administrators can see and modify most
-    aspects of a private stream, including the membership and
+    aspects of a private channel, including the membership and
     estimated traffic. Owners and administrators generally cannot see
-    messages sent to private streams or do things that would
+    messages sent to private channels or do things that would
     indirectly give them access to those messages, like adding members
-    or changing the stream privacy settings.
+    or changing the channel privacy settings.
 
-  - Non-admins cannot easily see which private streams exist, or interact
-    with them in any way until they are added. Given a stream name, they can
-    figure out whether a stream with that name exists, but cannot see any
-    other details about the stream.
+  - Non-admins cannot easily see which private channels exist, or interact
+    with them in any way until they are added. Given a channel name, they can
+    figure out whether a channel with that name exists, but cannot see any
+    other details about the channel.
 
-  - See [Stream permissions](https://zulip.com/help/stream-permissions) for more details.
+  - See [channel types and permissions](https://zulip.com/help/channel-permissions)
+    for more details.
 
 - Zulip supports editing the content and topics of messages that have
   already been sent. As a general philosophy, our policies provide
   hard limits on the ways in which message content can be changed or
   undone. In contrast, our policies around message topics favor
-  usefulness (e.g. for conversational organization) over faithfulness
+  usefulness (e.g., for conversational organization) over faithfulness
   to the original. In all configurations:
 
   - Message content can only ever be modified by the original author.
 
-  - Any message visible to an organization owner or administrator can
-    be deleted at any time by that administrator.
+  - Organization administrators can configure who has permission to
+    delete their own message, and who can delete other users'
+    messages that they can see.
 
   - See
-    [Configuring message editing and deletion](https://zulip.com/help/configure-message-editing-and-deletion)
+    [Restrict message editing and deletion](https://zulip.com/help/restrict-message-editing-and-deletion)
     for more details.
 
 ## Users and bots
@@ -143,22 +145,22 @@ strength allowed is controlled by two settings in
   and bots.
 
 - Owners and administrators have the ability to deactivate and
-  reactivate other human and bot users, archive streams, add/remove
+  reactivate other human and bot users, archive channels, add/remove
   administrator privileges, as well as change configuration for the
   organization.
 
   Being an organization administrator does not generally provide the ability
-  to read other users' private messages or messages sent to private
-  streams to which the administrator is not subscribed. There are two
+  to read other users' direct messages or messages sent to private
+  channels to which the administrator is not subscribed. There are two
   exceptions:
 
-  - Organization owners may get access to private messages via some types of
+  - Organization owners may get access to direct messages via some types of
     [data export](https://zulip.com/help/export-your-organization).
 
   - Administrators can change the ownership of a bot. If a bot is subscribed
-    to a private stream, then an administrator can indirectly get access to
-    stream messages by taking control of the bot, though the access will be
-    limited to what the bot can do. (E.g. incoming webhook bots cannot read
+    to a private channel, then an administrator can indirectly get access to
+    channel messages by taking control of the bot, though the access will be
+    limited to what the bot can do. (e.g., incoming webhook bots cannot read
     messages.)
 
 - Every Zulip user has an API key, available on the settings page.
@@ -168,11 +170,11 @@ strength allowed is controlled by two settings in
 
 - To properly remove a user's access to a Zulip team, it does not
   suffice to change their password or deactivate their account in a
-  SSO system, since neither of those prevents authenticating with the
-  user's API key or those of bots the user has created. Instead, you
-  should
-  [deactivate the user's account](https://zulip.com/help/deactivate-or-reactivate-a-user)
-  via Zulip's "Organization settings" interface.
+  single sign-on (SSO) system, since neither of those prevents
+  authenticating with the user's API key or those of bots the user has
+  created. Instead, you should [deactivate the user's
+  account](https://zulip.com/help/deactivate-or-reactivate-a-user) via
+  Zulip's "Organization settings" interface.
 
 - The Zulip mobile apps authenticate to the server by sending the
   user's password and retrieving the user's API key; the apps then use
@@ -181,18 +183,18 @@ strength allowed is controlled by two settings in
   you should rotate the user's Zulip API key.
 
 - Guest users are like Members, but they do not have automatic access
-  to public streams.
+  to public channels.
 
 - Zulip supports several kinds of bots with different capabilities.
 
   - Incoming webhook bots can only send messages into Zulip.
   - Outgoing webhook bots and Generic bots can essentially do anything a
-    non-administrator user can, with a few exceptions (e.g. a bot cannot
+    non-administrator user can, with a few exceptions (e.g., a bot cannot
     log in to the web application, register for mobile push
     notifications, or create other bots).
   - Bots with the `can_forge_sender` permission can send messages that appear to have been sent by
     another user. They also have the ability to see the names of all
-    streams, including private streams. This is important for implementing
+    channels, including private channels. This is important for implementing
     integrations like the Jabber, IRC, and Zephyr mirrors.
 
     These bots cannot be created by Zulip users, including
@@ -203,7 +205,7 @@ strength allowed is controlled by two settings in
 
 - Zulip supports user-uploaded files. Ideally they should be hosted
   from a separate domain from the main Zulip server to protect against
-  various same-domain attacks (e.g. zulip-user-content.example.com).
+  various same-domain attacks (e.g., zulip-user-content.example.com).
 
   We support two ways of hosting them: the basic `LOCAL_UPLOADS_DIR`
   file storage backend, where they are stored in a directory on the
@@ -219,25 +221,12 @@ strength allowed is controlled by two settings in
   file to be accessed by the unauthorized user. Of course, any
   such authorized user could have just downloaded and sent the file
   instead of the URL, so this is arguably pretty good protection.)
-  However, to help protect against accidental
-  sharing of URLs to restricted files (e.g. by forwarding a
-  missed-message email or leaks involving the Referer header), we
-  provide additional layers of protection in both backends as well.
 
-  In the Zulip S3 backend, the random URLs to access files that are
-  presented to users don't actually host the content. Instead, the S3
-  backend verifies that the user has a valid Zulip session in the
-  relevant organization (and that has access to a Zulip message linking to
-  the file), and if so, then redirects the browser to a temporary S3
-  URL for the file that expires a short time later. In this way,
-  possessing a URL to a secret file in Zulip does not provide
-  unauthorized users with access to that file.
-
-  We have a similar protection for the `LOCAL_UPLOADS_DIR` backend.
-  Every access
-  to an uploaded file has access control verified (confirming that the
-  browser is logged into a Zulip account that has received the
-  uploaded file in question).
+  However, to help protect against accidental sharing of URLs to
+  restricted files (e.g., by forwarding a missed-message email or leaks
+  involving the Referer header), every access to an uploaded file has
+  access control verified (confirming that the browser is logged into
+  a Zulip account that has received the uploaded file in question).
 
 - Zulip supports using the [go-camo][go-camo] image proxy to proxy content like
   inline image previews, that can be inserted into the Zulip message feed by
@@ -260,15 +249,65 @@ strength allowed is controlled by two settings in
 
 - Notably, these first 3 features give end users (limited) control to cause
   the Zulip server to make HTTP requests on their behalf. Because of this,
-  Zulip routes all outgoing outgoing HTTP requests [through
+  Zulip routes all outgoing HTTP requests [through
   Smokescreen][smokescreen-setup] to ensure that Zulip cannot be
   used to execute [SSRF attacks][ssrf] against other systems on an
   internal corporate network. The default Smokescreen configuration
   denies access to all non-public IP addresses, including 127.0.0.1.
 
+  The Camo image server does not, by default, route its traffic
+  through Smokescreen, since Camo includes logic to deny access to
+  private subnets; this can be [overridden][proxy.enable_for_camo].
+
 [go-camo]: https://github.com/cactus/go-camo
 [ssrf]: https://owasp.org/www-community/attacks/Server_Side_Request_Forgery
-[smokescreen-setup]: ../production/deployment.html#customizing-the-outgoing-http-proxy
+[smokescreen-setup]: deployment.md#customizing-the-outgoing-http-proxy
+[proxy.enable_for_camo]: system-configuration.md#enable_for_camo
+
+## Rate limiting
+
+Zulip has built-in rate limiting of login attempts, all access to the
+API, as well as certain other types of actions that may be involved in
+abuse. For example, the email confirmation flow, by its nature, needs
+to allow sending an email to an email address that isn't associated
+with an existing Zulip account. Limiting the ability of users to
+trigger such emails helps prevent bad actors from damaging the spam
+reputation of a Zulip server by sending confirmation emails to random
+email addresses.
+
+The default rate limiting rules for a Zulip server will change as we improve
+the product. A server administrator can browse the current rules using
+`/home/zulip/deployments/current/scripts/get-django-setting
+RATE_LIMITING_RULES`; or with comments by reading
+`DEFAULT_RATE_LIMITING_RULES` in `zproject/default_settings.py`.
+
+Server administrators can tweak rate limiting in the following ways in
+`/etc/zulip/settings.py`:
+
+- The `RATE_LIMITING` setting can be set to `False` to completely
+  disable all rate-limiting.
+- The `RATE_LIMITING_RULES` setting can be used to override specific
+  rules. See the comment in the file for more specific details on how
+  to do it. After changing the setting, we recommend using
+  `/home/zulip/deployments/current/scripts/get-django-setting
+RATE_LIMITING_RULES` to verify your changes. You can then restart
+  the Zulip server with `scripts/restart-server` to have the new
+  configuration take effect.
+- The `RATE_LIMIT_TOR_TOGETHER` setting can be set to `True` to group all
+  known exit nodes of [TOR](https://www.torproject.org/) together for purposes
+  of IP address limiting. Since traffic from a client using TOR is distributed
+  across its exit nodes, without enabling this setting, TOR can otherwise be
+  used to avoid IP-based rate limiting. The updated list of TOR exit nodes
+  is refetched once an hour.
+- If a user runs into the rate limit for login attempts, a server
+  administrator can clear this state using the
+  `manage.py reset_authentication_attempt_count`
+  [management command][management-commands].
+
+See also our [API documentation on rate limiting][rate-limit-api].
+
+[management-commands]: ../production/management-commands.md
+[rate-limit-api]: https://zulip.com/api/rest-error-handling#rate-limit-exceeded
 
 ## Final notes and security response
 

@@ -1,6 +1,7 @@
-from zerver.lib.actions import do_add_realm_playground
+from zerver.actions.realm_playgrounds import check_add_realm_playground
 from zerver.lib.test_classes import ZulipTestCase
-from zerver.models import RealmPlayground, get_realm
+from zerver.models import RealmPlayground
+from zerver.models.realms import get_realm
 
 
 class RealmPlaygroundTests(ZulipTestCase):
@@ -10,10 +11,10 @@ class RealmPlaygroundTests(ZulipTestCase):
         payload = {
             "name": "Python playground",
             "pygments_language": "Python",
-            "url_prefix": "https://python.example.com",
+            "url_template": "https://python.example.com{code}",
         }
         # Now send a POST request to the API endpoint.
-        resp = self.api_post(iago, "/json/realm/playgrounds", payload)
+        resp = self.api_post(iago, "/api/v1/realm/playgrounds", payload)
         self.assert_json_success(resp)
 
         # Check if the actual object exists
@@ -29,16 +30,16 @@ class RealmPlaygroundTests(ZulipTestCase):
             {
                 "name": "Python playground 1",
                 "pygments_language": "Python",
-                "url_prefix": "https://python.example.com",
+                "url_template": "https://python.example.com{code}",
             },
             {
                 "name": "Python playground 2",
                 "pygments_language": "Python",
-                "url_prefix": "https://python2.example.com",
+                "url_template": "https://python2.example.com{code}",
             },
         ]
         for payload in data:
-            resp = self.api_post(iago, "/json/realm/playgrounds", payload)
+            resp = self.api_post(iago, "/api/v1/realm/playgrounds", payload)
             self.assert_json_success(resp)
 
         realm = get_realm("zulip")
@@ -53,17 +54,38 @@ class RealmPlaygroundTests(ZulipTestCase):
         iago = self.example_user("iago")
 
         payload = {
-            "name": "Invalid URL",
-            "pygments_language": "Python",
-            "url_prefix": "https://invalid-url",
+            "name": "Invalid characters in pygments language",
+            "pygments_language": "a$b$c",
+            "url_template": "https://template.com{code}",
         }
-        resp = self.api_post(iago, "/json/realm/playgrounds", payload)
-        self.assert_json_error(resp, "url_prefix is not a URL")
-
-        payload["url_prefix"] = "https://python.example.com"
-        payload["pygments_language"] = "a$b$c"
-        resp = self.api_post(iago, "/json/realm/playgrounds", payload)
+        resp = self.api_post(iago, "/api/v1/realm/playgrounds", payload)
         self.assert_json_error(resp, "Invalid characters in pygments language")
+
+        payload = {
+            "name": "Template with an unexpected variable",
+            "pygments_language": "Python",
+            "url_template": "https://template.com{?test,code}",
+        }
+        resp = self.api_post(iago, "/api/v1/realm/playgrounds", payload)
+        self.assert_json_error(
+            resp, '"code" should be the only variable present in the URL template'
+        )
+
+        payload = {
+            "name": "Invalid URL template",
+            "pygments_language": "Python",
+            "url_template": "https://template.com?test={test",
+        }
+        resp = self.api_post(iago, "/api/v1/realm/playgrounds", payload)
+        self.assert_json_error(resp, "Invalid URL template.")
+
+        payload = {
+            "name": "Template without the required variable",
+            "pygments_language": "Python",
+            "url_template": "https://template.com{?test}",
+        }
+        resp = self.api_post(iago, "/api/v1/realm/playgrounds", payload)
+        self.assert_json_error(resp, 'Missing the required variable "code" in the URL template')
 
     def test_create_already_existing_playground(self) -> None:
         iago = self.example_user("iago")
@@ -71,12 +93,12 @@ class RealmPlaygroundTests(ZulipTestCase):
         payload = {
             "name": "Python playground",
             "pygments_language": "Python",
-            "url_prefix": "https://python.example.com",
+            "url_template": "https://python.example.com{code}",
         }
-        resp = self.api_post(iago, "/json/realm/playgrounds", payload)
+        resp = self.api_post(iago, "/api/v1/realm/playgrounds", payload)
         self.assert_json_success(resp)
 
-        resp = self.api_post(iago, "/json/realm/playgrounds", payload)
+        resp = self.api_post(iago, "/api/v1/realm/playgrounds", payload)
         self.assert_json_error(
             resp, "Realm playground with this Realm, Pygments language and Name already exists."
         )
@@ -84,27 +106,28 @@ class RealmPlaygroundTests(ZulipTestCase):
     def test_not_realm_admin(self) -> None:
         hamlet = self.example_user("hamlet")
 
-        resp = self.api_post(hamlet, "/json/realm/playgrounds")
+        resp = self.api_post(hamlet, "/api/v1/realm/playgrounds")
         self.assert_json_error(resp, "Must be an organization administrator")
 
-        resp = self.api_delete(hamlet, "/json/realm/playgrounds/1")
+        resp = self.api_delete(hamlet, "/api/v1/realm/playgrounds/1")
         self.assert_json_error(resp, "Must be an organization administrator")
 
     def test_delete_realm_playground(self) -> None:
         iago = self.example_user("iago")
         realm = get_realm("zulip")
 
-        playground_info = dict(
+        playground_id = check_add_realm_playground(
+            realm,
+            acting_user=iago,
             name="Python playground",
             pygments_language="Python",
-            url_prefix="https://python.example.com",
+            url_template="https://python.example.com{code}",
         )
-        playground_id = do_add_realm_playground(realm, **playground_info)
         self.assertTrue(RealmPlayground.objects.filter(name="Python playground").exists())
 
-        result = self.api_delete(iago, f"/json/realm/playgrounds/{playground_id + 1}")
+        result = self.api_delete(iago, f"/api/v1/realm/playgrounds/{playground_id + 1}")
         self.assert_json_error(result, "Invalid playground")
 
-        result = self.api_delete(iago, f"/json/realm/playgrounds/{playground_id}")
+        result = self.api_delete(iago, f"/api/v1/realm/playgrounds/{playground_id}")
         self.assert_json_success(result)
         self.assertFalse(RealmPlayground.objects.filter(name="Python").exists())

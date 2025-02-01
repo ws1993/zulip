@@ -1,10 +1,10 @@
-```{eval-rst}
-:orphan:
-```
+---
+orphan: true
+---
 
-# Production installation on existing server
+# Production installation on an existing server
 
-Here are some tips for installing the latest release Zulip on a
+Here are some tips for installing the latest release of Zulip on a
 production server running Debian or Ubuntu. The Zulip installation
 scripts assume that it has carte blanche to overwrite your
 configuration files in /etc, so we recommend against installing it on
@@ -21,7 +21,7 @@ Linux sysadmin, you will have a much better experience if you get a
 dedicated VM to install Zulip on instead (or [use
 zulip.com](https://zulip.com)).
 
-### Nginx
+### nginx
 
 Copy your existing nginx configuration to a backup and then merge the
 one created by Zulip into it:
@@ -75,7 +75,7 @@ $ sudo service puppet stop
 
 ### PostgreSQL
 
-Zulip expects to install PostgreSQL 12, and find that listening on
+Zulip expects to install PostgreSQL 16, and find that listening on
 port 5432; any other version of PostgreSQL that is detected at install
 time will cause the install to abort. If you already have PostgreSQL
 installed, you can pass `--postgresql-version=` to the installer to

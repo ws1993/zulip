@@ -1,19 +1,12 @@
 import json
 import logging
 
-import stripe
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.http import HttpRequest, HttpResponse
 from django.views.decorators.csrf import csrf_exempt
 
-from corporate.lib.stripe import STRIPE_API_VERSION
-from corporate.lib.stripe_event_handler import (
-    handle_checkout_session_completed_event,
-    handle_payment_intent_payment_failed_event,
-    handle_payment_intent_succeeded_event,
-)
-from corporate.models import Event, PaymentIntent, Session
+from corporate.models import Event, Invoice, Session
 from zproject.config import get_secret
 
 billing_logger = logging.getLogger("corporate.stripe")
@@ -21,6 +14,14 @@ billing_logger = logging.getLogger("corporate.stripe")
 
 @csrf_exempt
 def stripe_webhook(request: HttpRequest) -> HttpResponse:
+    import stripe
+
+    from corporate.lib.stripe import STRIPE_API_VERSION
+    from corporate.lib.stripe_event_handler import (
+        handle_checkout_session_completed_event,
+        handle_invoice_paid_event,
+    )
+
     stripe_webhook_endpoint_secret = get_secret("stripe_webhook_endpoint_secret", "")
     if (
         stripe_webhook_endpoint_secret and not settings.TEST_SUITE
@@ -29,12 +30,12 @@ def stripe_webhook(request: HttpRequest) -> HttpResponse:
         try:
             stripe_event = stripe.Webhook.construct_event(
                 request.body,
-                request.META.get("HTTP_STRIPE_SIGNATURE"),
+                request.headers["Stripe-Signature"],
                 stripe_webhook_endpoint_secret,
             )
         except ValueError:
             return HttpResponse(status=400)
-        except stripe.error.SignatureVerificationError:
+        except stripe.SignatureVerificationError:
             return HttpResponse(status=400)
     else:
         assert not settings.PRODUCTION
@@ -50,8 +51,7 @@ def stripe_webhook(request: HttpRequest) -> HttpResponse:
 
     if stripe_event.type not in [
         "checkout.session.completed",
-        "payment_intent.succeeded",
-        "payment_intent.payment_failed",
+        "invoice.paid",
     ]:
         return HttpResponse(status=200)
 
@@ -71,34 +71,18 @@ def stripe_webhook(request: HttpRequest) -> HttpResponse:
         event.object_id = session.id
         event.save()
         handle_checkout_session_completed_event(stripe_session, event)
-    elif stripe_event.type == "payment_intent.succeeded":
-        stripe_payment_intent = stripe_event.data.object
-        assert isinstance(stripe_payment_intent, stripe.PaymentIntent)
+    elif stripe_event.type == "invoice.paid":
+        stripe_invoice = stripe_event.data.object
+        assert isinstance(stripe_invoice, stripe.Invoice)
         try:
-            payment_intent = PaymentIntent.objects.get(
-                stripe_payment_intent_id=stripe_payment_intent.id
-            )
-        except PaymentIntent.DoesNotExist:
-            # PaymentIntent that was not manually created from the billing system.
-            # Could be an Invoice getting paid which is is not an event we are interested in.
+            invoice = Invoice.objects.get(stripe_invoice_id=stripe_invoice.id)
+        except Invoice.DoesNotExist:
             return HttpResponse(status=200)
-        event.content_type = ContentType.objects.get_for_model(PaymentIntent)
-        event.object_id = payment_intent.id
+        event.content_type = ContentType.objects.get_for_model(Invoice)
+        event.object_id = invoice.id
         event.save()
-        handle_payment_intent_succeeded_event(stripe_payment_intent, event)
-    elif stripe_event.type == "payment_intent.payment_failed":
-        stripe_payment_intent = stripe_event.data.object
-        try:
-            assert isinstance(stripe_payment_intent, stripe.PaymentIntent)
-            payment_intent = PaymentIntent.objects.get(
-                stripe_payment_intent_id=stripe_payment_intent.id
-            )
-        except PaymentIntent.DoesNotExist:
-            # PaymentIntent that was not manually created from the billing system.
-            # Could be an Invoice getting paid which is is not an event we are interested in.
-            return HttpResponse(status=200)
-        event.content_type = ContentType.objects.get_for_model(PaymentIntent)
-        event.object_id = payment_intent.id
-        event.save()
-        handle_payment_intent_payment_failed_event(stripe_payment_intent, event)
+        handle_invoice_paid_event(stripe_invoice, event)
+    # We don't need to process failed payments via webhooks since we directly charge users
+    # when they click on "Purchase" button and immediately provide feedback for failed payments.
+    # If the feedback is not immediate, our event_status handler checks for payment status and informs the user.
     return HttpResponse(status=200)

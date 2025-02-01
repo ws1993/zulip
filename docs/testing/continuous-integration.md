@@ -60,11 +60,12 @@ checks are run to confirm the installation worked.
 `zulip-ci.yml` is designed to run our main test suites on all of our
 supported platforms. Out of them, only one of them runs the frontend
 tests, since `puppeteer` is slow and unlikely to catch issues that
-depend on the version of the base OS and/or Python.
+depend on the version of the base OS and/or Python. Similarly, only a
+(different) one runs the documentation tests.
 
 Our code for running the tests in CI lives under `tools/ci`; but that
 logic is mostly thin wrappers around [Zulip's test
-suites](../testing/testing.md) or production installer.
+suites](testing.md) or production installer.
 
 The `Legacy OS` tests are designed to ensure we give good error
 messages when trying to upgrade Zulip servers running on very old base
@@ -81,11 +82,13 @@ the job. Once GitHub Actions fetches the image from Docker Hub, it will spin
 up a docker container. See [images](#images) section to know more about
 the images we use in GitHub Actions for testing.
 
+[docker-hub]: https://hub.docker.com/r/zulip/ci
+
 After booting the container from the configured image, GitHub Actions will
 create the directory mentioned in `working_directory` and all the
-steps are be run from here.
+steps will be run from here.
 
-The `steps` section describes describes everything: fetching the Zulip
+The `steps` section describes everything: fetching the Zulip
 code, provisioning, fetching caught data, running tests and uploading
 coverage reports. The steps with prefix `*` reference aliases, which
 are defined in the `aliases` section at the top of the file.

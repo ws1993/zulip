@@ -18,19 +18,19 @@ Zulip 的文风比较口语化，考虑到大多数中国用户的习惯，翻�
 
 "Message" can be literally translated as "消息" and "信息", both
 OK. Here "消息" is chosen for translation. For example, "Stream
-Message" is translated as "频道消息", while "Private Message" is
-translated as "私信". The domestic WeiBo, WeChat also keep in line
+Message" is translated as "频道消息", while "Direct Message" is
+translated as "直信". The domestic WeiBo, WeChat also keep in line
 with the habit. "Starred Message" is similar to "Star Mail (星标邮件)"
 feature in QQ Mail, so it is translated into "星标消息".
 
 Message 可直译为“消息”、“信息”等，两者皆可，这里统一选用“消息”。例如，
-“Stream Message”译作“频道消息”；但“Private Message”又译为“私信"，与国
+“Stream Message”译作“频道消息”；但“Direct Message”又译为“直信"，与国
 内微博、微信的使用习惯保持一致。“Starred Message”类似于 QQ 邮箱中的“星标
 邮件”功能，这里也借鉴翻译为“星标消息”。
 
 - Stream - **频道**
 
-There were several other optional translations, e.g. "群组(Group)", "
+There were several other optional translations, e.g., "群组(Group)", "
 主题(Subject)", and "栏目(Column)". The "频道(Channel)" is in use now,
 which is inspired by the chat "Channel" in the game Ingress. Since
 "Stream" can be "Created/Deleted" or "Subscribed/Unsubscribed",
@@ -96,7 +96,7 @@ The perfect tense subscribed/unsubscribed is translated as "已订阅/已
    scope of ...". The two words share the common meanings.
 
 2. "筛选" is a common computer phrase and has been well
-   accepted by public, e.g. the "Filter(筛选)" feature in Microsoft
+   accepted by public, e.g., the "Filter(筛选)" feature in Microsoft
    Excel.
 
 In addition, in the searching context "Narrow to ..." is not

@@ -1,6 +1,5 @@
-from typing import Dict, List, Optional
-
 from django.http import HttpRequest, HttpResponse
+from pydantic import Json
 
 from zerver.lib.bot_storage import (
     StateError,
@@ -10,30 +9,31 @@ from zerver.lib.bot_storage import (
     set_bot_storage,
 )
 from zerver.lib.exceptions import JsonableError
-from zerver.lib.request import REQ, has_request_variables
 from zerver.lib.response import json_success
-from zerver.lib.validator import check_dict, check_list, check_string
+from zerver.lib.typed_endpoint import typed_endpoint
 from zerver.models import UserProfile
 
 
-@has_request_variables
+@typed_endpoint
 def update_storage(
     request: HttpRequest,
     user_profile: UserProfile,
-    storage: Dict[str, str] = REQ(json_validator=check_dict([], value_validator=check_string)),
+    *,
+    storage: Json[dict[str, str]],
 ) -> HttpResponse:
     try:
         set_bot_storage(user_profile, list(storage.items()))
     except StateError as e:  # nocoverage
         raise JsonableError(str(e))
-    return json_success()
+    return json_success(request)
 
 
-@has_request_variables
+@typed_endpoint
 def get_storage(
     request: HttpRequest,
     user_profile: UserProfile,
-    keys: Optional[List[str]] = REQ(json_validator=check_list(check_string), default=None),
+    *,
+    keys: Json[list[str] | None] = None,
 ) -> HttpResponse:
     if keys is None:
         keys = get_keys_in_bot_storage(user_profile)
@@ -41,14 +41,15 @@ def get_storage(
         storage = {key: get_bot_storage(user_profile, key) for key in keys}
     except StateError as e:
         raise JsonableError(str(e))
-    return json_success({"storage": storage})
+    return json_success(request, data={"storage": storage})
 
 
-@has_request_variables
+@typed_endpoint
 def remove_storage(
     request: HttpRequest,
     user_profile: UserProfile,
-    keys: Optional[List[str]] = REQ(json_validator=check_list(check_string), default=None),
+    *,
+    keys: Json[list[str] | None] = None,
 ) -> HttpResponse:
     if keys is None:
         keys = get_keys_in_bot_storage(user_profile)
@@ -56,4 +57,4 @@ def remove_storage(
         remove_bot_storage(user_profile, keys)
     except StateError as e:
         raise JsonableError(str(e))
-    return json_success()
+    return json_success(request)

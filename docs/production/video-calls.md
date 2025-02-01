@@ -1,9 +1,34 @@
 # Video call providers
 
-This page documents the server-level configuration required to support
-non-default [video call integration
-options](https://zulip.com/help/start-a-call) on a self-hosted Zulip
-server.
+Zulip makes it convenient to [start a
+call](https://zulip.com/help/start-a-call) with the click of a button, using the
+call provider of your choice. The call providers
+supported by Zulip are:
+
+- [Jitsi Meet](https://zulip.com/integrations/doc/jitsi), a fully-encrypted,
+  100% open source video conferencing solution.
+- [Zoom](https://zulip.com/integrations/doc/zoom)
+- [BigBlueButton](https://zulip.com/integrations/doc/big-blue-button)
+
+By default, Zulip uses the [cloud version of Jitsi Meet](https://meet.jit.si/)
+as its call provider. This page documents the configurations required to support
+other [video call integration options](https://zulip.com/help/start-a-call) on a
+self-hosted Zulip server.
+
+:::{note}
+It is possible to disable the video and voice call buttons for your
+organization by [setting the call
+provider](https://zulip.com/help/start-a-call#change-your-organizations-call-provider)
+to "None".
+:::
+
+## Jitsi
+
+You can configure Zulip to use a self-hosted
+instance of Jitsi Meet by providing the URL of your self-hosted Jitsi Meet
+server [in organization
+settings](https://zulip.com/help/start-a-call#use-a-self-hosted-instance-of-jitsi-meet).
+No server configuration changes are required.
 
 ## Zoom
 
@@ -20,7 +45,7 @@ installation, you'll need to register a custom Zoom app as follows:
    - Disable the option to publish the app on the Marketplace.
    - Click **Create**.
 
-1. Inside of the Zoom app management page:
+1. Inside the Zoom app management page:
 
    - On the **App Credentials** tab, set both the **Redirect URL for
      OAuth** and the **Whitelist URL** to
@@ -40,16 +65,16 @@ follows:
 1. Restart the Zulip server with
    `/home/zulip/deployments/current/scripts/restart-server`.
 
-This enables Zoom support in your Zulip server. Finally, [configure
-Zoom as the video call
-provider](https://zulip.com/help/start-a-call) in the Zulip
-organization(s) where you want to use it.
+This enables Zoom support in your Zulip server. Finally, [configure Zoom as the
+video call
+provider](https://zulip.com/help/start-a-call#change-your-organizations-call-provider)
+in the Zulip organizations where you want to use it.
 
 ## BigBlueButton
 
 To use the [BigBlueButton](https://bigbluebutton.org/) video call
 integration on a self-hosted Zulip installation, you'll need to have a
-BigBlueButton server and configure it:
+BigBlueButton server (version 2.4+) and configure it:
 
 1. Get the Shared Secret using the `bbb-conf --secret` command on your
    BigBlueButton Server. See also [the BigBlueButton
@@ -73,5 +98,5 @@ Server as follows:
 
 This enables BigBlueButton support in your Zulip server. Finally, [configure
 BigBlueButton as the video call
-provider](https://zulip.com/help/start-a-call) in the Zulip
-organization(s) where you want to use it.
+provider](https://zulip.com/help/start-a-call#change-your-organizations-call-provider)
+in the Zulip organizations where you want to use it.

@@ -3,7 +3,7 @@
 This is a design document aiming to provide context for developers
 working on Zulip's email notifications and mobile push notifications
 code paths. We recommend first becoming familiar with [sending
-messages](../subsystems/sending-messages.md); this document expands on
+messages](sending-messages.md); this document expands on
 the details of the email/mobile push notifications code path.
 
 ## Important corner cases
@@ -27,11 +27,11 @@ As a reminder, the relevant part of the flow for sending messages is
 as follows:
 
 - `do_send_messages` is the synchronous message-sending code path,
-  and passing the following data in its `send_event` call:
-  - Data about the message's content (E.g. mentions, wildcard
+  and passing the following data in its `send_event_on_commit` call:
+  - Data about the message's content (e.g., mentions, wildcard
     mentions, and alert words) and encodes it into the `UserMessage`
     table's `flags` structure, which is in turn passed into
-    `send_event` for each user receiving the message.
+    `send_event_on_commit` for each user receiving the message.
   - Data about user configuration relevant to the message, such as
     `online_push_user_ids` and `stream_notify_user_ids`, are included
     in the main event dictionary.
@@ -42,8 +42,8 @@ as follows:
     `enable_online_push_notifications` flag is enabled). This data
     structure ignores users for whom the message is not notifiable,
     which is important to avoid this being thousands of `user_ids` for
-    messages to large streams with few currently active users.
-- The Tornado [event queue system](../subsystems/events-system.md)
+    messages to large channels with few currently active users.
+- The Tornado [event queue system](events-system.md)
   processes that data, as well as data about each user's active event
   queues, to (1) push an event to each queue needing that message and
   (2) for notifiable messages, pushing an event onto the
@@ -64,7 +64,7 @@ as follows:
     if a user was present 1 minute before a message was sent, and then
     closed their laptop, the user will not be in
     `presence_idle_user_ids` (because it takes a
-    [few minutes](../subsystems/presence.md) of being idle for Zulip
+    [few minutes](presence.md) of being idle for Zulip
     clients to declare to the server that the user is actually idle),
     and so without an additional mechanism, messages sent shortly after
     a user leaves would never trigger a notification (!).
@@ -72,8 +72,8 @@ as follows:
     `receiver_is_off_zulip` returns `True`, which checks whether the user has any
     current events system clients registered to receive `message`
     events. This check is done immediately (handling soft disconnects,
-    where E.g. the user closes their last Zulip tab and we get the
-    `DELETE /events/{queue_id}` request).
+    for example, where the user closes their last Zulip tab and we get
+    the `DELETE /events/{queue_id}` request).
   - The `receiver_is_off_zulip` check is effectively repeated when
     event queues are garbage-collected (in `missedmessage_hook`) by
     looking for whether the queue being garbage-collected was the only
@@ -89,7 +89,7 @@ as follows:
     notifications in cases like a mention added during message
     editing.
   - The notification sending logic for message edits
-    inside Tornado has extensive automated test suites; e.g.
+    inside Tornado has extensive automated test suites; e.g.,
     `test_message_edit_notifications.py` covers all the cases around
     editing a message to add/remove a mention.
   - We may in the future want to add some sort of system for letting
@@ -97,7 +97,7 @@ as follows:
     debugging this system, since it has so much complexity.
 - Desktop notifications are the simplest; they are implemented
   client-side by the web/desktop app's logic
-  (`static/js/notifications.js`) inspecting the `flags` fields that
+  (`web/src/notifications.js`) inspecting the `flags` fields that
   were spliced into `message` events by the Tornado system, as well as
   the user's notification settings.
 - The queue processors for those queues make the final determination
@@ -141,8 +141,8 @@ structure of the system, when thinking about changes to it:
   details from the database like "which users receiving this message
   are online".
 - **Thousands of users**. Zulip supports thousands of users, and we
-  want to avoid `send_event()` pushing large amounts of per-user data
-  to Tornado via RabbitMQ for scalability reasons.
+  want to avoid `send_event_on_commit()` pushing large amounts of
+  per-user data to Tornado via RabbitMQ for scalability reasons.
 - **Tornado doesn't do database queries**. Because the Tornado system
   is an asynchronous event-driven framework, and our Django database
   library is synchronous, database queries are very expensive. So
@@ -153,7 +153,7 @@ structure of the system, when thinking about changes to it:
 - **Future configuration**. Notification settings are an area that we
   expect to only expand with time, with upcoming features like
   following a topic (to get notifications for messages only within
-  that topic in a stream). There are a lot of different workflows
+  that topic in a channel). There are a lot of different workflows
   possible with Zulip's threading, and it's important to make it easy
   for users to set up Zulip's notification to fit as many of those
   workflows as possible.

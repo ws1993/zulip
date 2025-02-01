@@ -8,9 +8,9 @@ RSS integration!
 
 [1]: ./zapier
 
-1.  {!create-stream.md!}
+1.  {!create-channel.md!}
 
-1.  Next, on your {{ settings_html|safe }}, create an RSS bot.
+1.  {!create-an-incoming-webhook.md!}
 
 1.  {!download-python-bindings.md!}
 

@@ -1,4 +1,3 @@
-from typing import Dict
 from unittest.mock import patch
 
 import orjson
@@ -7,7 +6,7 @@ from zerver.lib.test_classes import WebhookTestCase
 
 
 class TrelloHookTests(WebhookTestCase):
-    STREAM_NAME = "trello"
+    CHANNEL_NAME = "trello"
     URL_TEMPLATE = "/api/v1/external/trello?stream={stream}&api_key={api_key}"
     WEBHOOK_DIR_NAME = "trello"
 
@@ -155,7 +154,7 @@ class TrelloHookTests(WebhookTestCase):
             "pos",
         ]
         for field in fields:
-            card: Dict[str, object] = {}
+            card: dict[str, object] = {}
             old = {}
             old[field] = "should-be-ignored"
             data = dict(

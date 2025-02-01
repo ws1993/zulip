@@ -1,12 +1,14 @@
 import re
-from typing import Any, List, Match
+from re import Match
+from typing import Any
 
 from markdown import Markdown
 from markdown.extensions import Extension
 from markdown.preprocessors import Preprocessor
+from typing_extensions import override
 
 from zerver.lib.emoji import EMOTICON_CONVERSIONS, name_to_codepoint
-from zerver.lib.markdown.preprocessor_priorities import PREPROCESSOR_PRIORITES
+from zerver.lib.markdown.priorities import PREPROCESSOR_PRIORITIES
 
 REGEXP = re.compile(r"\{emoticon_translations\}")
 
@@ -38,18 +40,20 @@ ROW_HTML = """\
 
 
 class EmoticonTranslationsHelpExtension(Extension):
+    @override
     def extendMarkdown(self, md: Markdown) -> None:
         """Add SettingHelpExtension to the Markdown instance."""
         md.registerExtension(self)
         md.preprocessors.register(
             EmoticonTranslation(),
             "emoticon_translations",
-            PREPROCESSOR_PRIORITES["emoticon_translations"],
+            PREPROCESSOR_PRIORITIES["emoticon_translations"],
         )
 
 
 class EmoticonTranslation(Preprocessor):
-    def run(self, lines: List[str]) -> List[str]:
+    @override
+    def run(self, lines: list[str]) -> list[str]:
         for loc, line in enumerate(lines):
             match = REGEXP.search(line)
             if match:
@@ -58,7 +62,7 @@ class EmoticonTranslation(Preprocessor):
                 break
         return lines
 
-    def handleMatch(self, match: Match[str]) -> List[str]:
+    def handleMatch(self, match: Match[str]) -> list[str]:
         rows = [
             ROW_HTML.format(
                 emoticon=emoticon,

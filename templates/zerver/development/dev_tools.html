@@ -1,5 +1,9 @@
 {% extends "zerver/portico.html" %}
 
+{% block title %}
+<title>Tools and data sets | Zulip Dev</title>
+{% endblock %}
+
 {# Login page. #}
 {% block portico_content %}
 
@@ -41,9 +45,6 @@
                 </tr>
                 <tr>
                     <td><a href="/emails">/emails</a></td>
-                    <td><code>./scripts/setup/inline_email_css.py</code><br />
-                        Run the command if you made changes to source.html email templates.
-                    </td>
                     <td>View outgoing and example emails.</td>
                 </tr>
                 <tr>
@@ -55,7 +56,7 @@
                 </tr>
                 <tr>
                     <td><a href="/webpack/5xx.html">/webpack/5xx.html</a></td>
-                    <td><code>./manage.py collectstatic --noinput</code></td>
+                    <td>None needed</td>
                     <td>Error 5xx page served by nginx (used when Django is totally broken)</td>
                 </tr>
                 <tr>
@@ -78,15 +79,27 @@
                     <td>None needed</td>
                     <td>Test incoming webhook integrations</td>
                 </tr>
+                <tr>
+                    <td><a href="/devtools/buttons">/devtools/buttons</a></td>
+                    <td>None needed</td>
+                    <td>Test button styles</td>
+                </tr>
+                <tr>
+                    <td><a href="/devtools/banners">/devtools/banners</a></td>
+                    <td>None needed</td>
+                    <td>Test banner styles</td>
+                </tr>
             </tbody>
         </table>
         <h2>Useful management commands</h2>
-        <p>Development-specific management commands live in <code>zilencer/management/commands</code>.  Highlights include:
+        <p>Development-specific <a href="https://zulip.readthedocs.io/en/latest/production/management-commands.html">management commands</a> live in <code>zilencer/management/commands</code>.  Highlights include:
             <ul>
-                <li><code>./manage.py populate_db</code>: Rebuilds database.  Has options to e.g. create 3K users for testing.</li>
+                <li><code>./manage.py populate_db</code>: Rebuilds database. Has options to, for example, create 3K users for testing.</li>
                 <li><code>./manage.py mark_all_messages_unread</code>: Useful for testing reading messages.</li>
-                <li><code>./manage.py add_new_realm</code>: Add a new realm. Useful for testing onboarding.</li>
-                <li><code>./manage.py add_new_user</code>: Add a new user. Useful for testing onboarding.</li>
+                <li><code>./manage.py create_realm</code>: Add a new realm. Useful for testing onboarding.</li>
+                <li><code>./manage.py create_user</code>: Add a new user. Useful for testing onboarding.</li>
+                <li><code>./manage.py send_zulip_update_announcements</code>: Send <a href="https://zulip.com/help/configure-automated-notices#zulip-update-announcements">Zulip
+                update notices</a> drafted in `zerver/lib/zulip_update_announcements.py`.</li>
                 <li><code>./manage.py add_mock_conversation</code>: Add test messages, streams, images, emoji, etc.
                     into the dev environment. First edit zilencer/management/commands/add_mock_conversation.py
                     to add the data you're testing.
@@ -118,6 +131,43 @@
                     <li>Username: zulip</li>
                     <li>password: stored as <code>local_database_password</code> in <code>zulip/zproject/dev-secrets.conf</code></li>
                 </ul>
+            </li>
+        </ul>
+        <h2>Development instructions for Help Center (Beta)</h2>
+        <p>
+            These commands are to run the project for an ongoing migration for our help center docs to use
+            <a href="https://github.com/withastro/starlight">@astrojs/starlight</a>. You can track the
+            progress for the project at <a href="https://github.com/zulip/zulip/issues/30450">#30450</a>.
+        </p>
+        <ul>
+            <li>
+                <code>./tools/build-help-center</code> will convert the existing help center MD files to MDX,
+                and create a production build for the converted MDX files.
+                <ul>
+                    <li>
+                        You can run <code>./tools/convert-help-center-docs-to-mdx</code> to convert the help
+                        center MD files without the build step; see running a dev server that supports hot
+                        reload below.
+                    </li>
+                    <li>
+                        You can run <code>pnpm build</code> within the <code>help-beta</code> directory to run
+                        the build step separately.
+                    </li>
+                </ul>
+            </li>
+            <li>
+                <code>./tools/run-dev --help-center</code> will host the generated build on
+                <code>/help-beta</code>. Note that search will work in the beta help center docs with
+                this flag. For testing changes related to the migration of the help center docs, using the tool
+                to build the beta help center docs and running the dev server with this flag should be fine.
+            </li>
+            <li>
+                <code>./tools/run-dev --help-center-dev-server</code> will run a dev server at
+                <code>/help-beta</code> that supports hot reload. Note that, with this flag, search will not work
+                in the beta help center docs. This mode is useful when you are editing a help center file, and
+                want to visualize the changes quickly in the beta help center documentation. You will need the
+                converted MDX files to be already generated through
+                <code>./tools/convert-help-center-docs-to-mdx</code> before you run the dev server with this flag.
             </li>
         </ul>
     </div>

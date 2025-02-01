@@ -8,6 +8,8 @@ maxdepth: 3
 dependencies
 settings
 html-css
+icons
+accessibility
 events-system
 sending-messages
 notifications
@@ -21,7 +23,7 @@ management-commands
 schema-migrations
 hashchange-system
 emoji
-hotspots
+onboarding-steps
 full-text-search
 email
 analytics
@@ -37,4 +39,5 @@ unread_messages
 billing
 widgets
 slash-commands
+thumbnailing
 ```

@@ -1,6 +1,8 @@
 # Terms of Service
 
-**Effective date: January 1, 2022**
+**Effective date: February 7, 2022.** View [change history][changes-terms].
+
+[changes-terms]: https://github.com/zulip/zulip/commits/main/templates/corporate/policies/terms.md
 
 Welcome to Zulip. Please read on to learn the rules and restrictions that govern
 your use of our website(s), products, services and applications (the
@@ -16,13 +18,8 @@ the Services in any way means that you agree to all of these Terms,
 and these Terms will remain in effect while you use the
 Services. These Terms include the provisions in this document as well
 as those in the [Privacy Policy](/policies/privacy), [Rules of
-Use](/policies/privacy), and, if applicable, [Data Processing
-Addendum](/static/images/policies/Zulip-Data-Processing-Addendum.pdf). **Your
-use of or participation in certain Services may also be subject to
-additional policies, rules and/or conditions (“Additional Terms”),
-which are incorporated herein by reference, and you understand and
-agree that by using or participating in any such Services, you agree
-to also comply with these Additional Terms.**
+Use](/policies/rules), and, if applicable, [Data Processing
+Addendum](/static/images/policies/Zulip-Data-Processing-Addendum.pdf).
 
 **Please read these Terms carefully.** They cover important information about
 Services provided to you and any charges, taxes, and fees we bill you. **These
@@ -198,7 +195,7 @@ below.
 To provide the Services, we need your permission to do things like storing your
 User Submissions and showing them to the people you send messages to, or who
 otherwise have permission to see them (for example, any member of your Zulip
-Organization for a message you send to a public stream.) Our Services also
+Organization for a message you send to a public channel.) Our Services also
 provide you with features like sharing and searching. To provide these and other
 features, Zulip may access, use, store, copy, process, adapt, distribute,
 perform, export, and display your User Submissions. Note that the following
@@ -224,7 +221,7 @@ For example:
 - Your Zulip Organization Administrators may [export the Zulip Organization’s
   data](/help/export-your-organization) for archival or backup purposes, or to
   import the data into a self-hosted Zulip server.
-- Messages on a web-public stream may be viewed by anyone on the Internet.
+- Messages on a web-public channel may be viewed by anyone on the Internet.
 
 When you delete your Zulip account, we will stop displaying your User
 Submissions in association with your account, if applicable. You understand that

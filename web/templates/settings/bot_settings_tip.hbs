@@ -1,0 +1,7 @@
+{{#unless can_create_any_bots}}
+    {{#if can_create_incoming_webhooks}}
+        <div class='tip'>{{t "You can create bots that can only send messages." }}</div>
+    {{else}}
+        <div class='tip'>{{t "You do not have permission to create bots." }}</div>
+    {{/if}}
+{{/unless}}

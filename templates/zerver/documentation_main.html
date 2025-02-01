@@ -3,7 +3,7 @@
 
 {# Zulip user and API documentation. #}
 {% block title %}
-<title>{{ OPEN_GRAPH_TITLE }}</title>
+<title>{{ PAGE_TITLE }}</title>
 {% endblock %}
 
 {% block portico_content %}
@@ -12,14 +12,9 @@
         <div class="content">
             {% if not page_is_policy_center %}
             <h1><a href="https://zulip.com" class="no-underline">Zulip homepage</a></h1>
-            <h1><a href="{{ doc_root }}" class="no-underline">{{ doc_root_title }} home</a></h1>
             {% endif %}
 
-            {% if page_is_policy_center %}
-            {{ render_markdown_path(sidebar_index, pure_markdown=True) }}
-            {% else %}
-            {{ render_markdown_path(sidebar_index, api_uri_context) }}
-            {% endif %}
+            {{ sidebar_html }}
 
             {% if not page_is_policy_center %}
             <h1 class="home-link"><a href="/" class="no-underline">Back to Zulip</a></h1>
@@ -32,16 +27,26 @@
     </svg>
 
     <div class="markdown">
-        <div class="content">
+        <div class="content" id="main-content">
             {% if page_is_policy_center %}
-            {{ render_markdown_path(article, pure_markdown=True) }}
+            {{ render_markdown_path(article) }}
+            {% elif page_is_help_center %}
+            {{ render_markdown_path(article, context=api_url_context, help_center=True) }}
             {% else %}
-            {{ render_markdown_path(article, api_uri_context) }}
+            {{ render_markdown_path(article, context=api_url_context) }}
             {% endif %}
 
-            <div id="footer" class="documentation-footer">
+            <div class="documentation-footer">
                 <hr />
-                <p>We're here to help! Email us at <a href="mailto:{{ support_email }}">{{ support_email }}</a> with questions, feedback, or feature requests.</p>
+                {% if corporate_enabled %}
+                    {% if page_is_policy_center %}
+                    <p>Please contact {{ support_email_html_tag }} with any questions about Zulip's policies.</p>
+                    {% else %}
+                    <p>Your feedback helps us make Zulip better for everyone! Please <a href="/help/contact-support">contact us</a> with questions, suggestions, and feature requests.</p>
+                    {% endif %}
+                {% else %}
+                    <p>Don't see an answer to your question? <a href="mailto:{{ support_email }}">Contact this Zulip server's administrators</a> for support.</p>
+                {% endif %}
             </div>
         </div>
     </div>
